@@ -9,8 +9,21 @@ from streamlit_folium import st_folium
 import plotly.express as px
 import requests, warnings, time, unicodedata, re
 
-# Configuração da página
-st.set_page_config(page_title="Monitor de Queimadas", page_icon="🔥", layout="wide")
+# --- CONFIGURAÇÃO DA PÁGINA E METADADOS DO LINK ---
+st.set_page_config(
+    page_title="Monitor de Queimadas Brasil",
+    page_icon="🔥",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        'About': """
+        ### 🛰️ Monitor de Queimadas (INPE)
+        Dashboard interativo para monitoramento de focos de calor em tempo real.
+        Desenvolvido por Ana Carolina Andrade.
+        """
+    }
+)
+
 warnings.filterwarnings('ignore')
 requests.packages.urllib3.disable_warnings()
 
@@ -83,10 +96,8 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim):
 # --- INTERFACE (BARRA LATERAL) ---
 st.sidebar.title("⚙️ Filtros da Análise")
 
-# 1. Escala Geográfica
 tipo_analise = st.sidebar.radio('Escala Geográfica:', ['Por Estado', 'Por Bioma', 'Por Município'], index=2)
 
-# 2. Localização com Inativação
 estado_dd = st.sidebar.selectbox('Selecione o Estado:', ["AC","AL","AM","AP","BA","CE","DF","ES","GO","MA","MG","MS","MT","PA","PB","PE","PI","PR","RJ","RN","RO","RR","RS","SC","SE","SP","TO"], index=25, disabled=(tipo_analise == 'Por Bioma'))
 bioma_dd = st.sidebar.selectbox('Selecione o Bioma:', ["Amazônia", "Cerrado", "Mata Atlântica", "Caatinga", "Pampa", "Pantanal"], disabled=(tipo_analise != 'Por Bioma'))
 cidades_lista = buscar_cidades(estado_dd)
@@ -94,36 +105,27 @@ municipio_dd = st.sidebar.selectbox('Selecione a Cidade:', cidades_lista, disabl
 
 st.sidebar.markdown("---")
 
-# 3. Unidade de Tempo (Agora em Selectbox como você gostou)
 unidade_dd = st.sidebar.selectbox("Analisar por:", ["Dias", "Meses", "Anos"], index=1)
 
-# 4. Quantidade (Também em Selectbox para manter o padrão visual)
-if unidade_dd == "Dias": op_qtd = list(range(1, 91)) # Até 90 dias
-elif unidade_dd == "Meses": op_qtd = list(range(1, 61)) # Até 60 meses
-else: op_qtd = list(range(1, 11)) # Até 10 anos
+if unidade_dd == "Dias": op_qtd = list(range(1, 91))
+elif unidade_dd == "Meses": op_qtd = list(range(1, 61))
+else: op_qtd = list(range(1, 11))
 
 quantidade_sel = st.sidebar.selectbox(f"Quantidade de {unidade_dd}:", options=op_qtd, index=1)
 
 gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True)
 
-# --- FONTE COM MAIS INFORMAÇÕES ---
 st.sidebar.markdown("---")
 with st.sidebar.expander("ℹ️ Sobre os Dados"):
     st.markdown("""
     **Fonte Primária:** Programa Queimadas do Instituto Nacional de Pesquisas Espaciais (**INPE**).
     
-    **Satélites Utilizados:**
-    * **AQUA_M-T:** Referência para séries históricas.
-    * **NPP-375:** Alta resolução espacial.
-    
     **Metodologia:**
-    O sistema processa imagens orbitais para identificar anomalias térmicas. Cada ponto no mapa representa uma detecção de calor.
-    
-    **Limites:** Bases do IBGE via `geobr`.
+    O sistema processa imagens orbitais para identificar anomalias térmicas. Cada ponto representa uma detecção de calor vinculada a possíveis queimadas.
     """)
 
 # --- INTERFACE (TELA PRINCIPAL) ---
-st.title("🔥 Dashboard de Queimadas")
+st.title("🔥 Dashboard de Queimadas 🔥")
 
 if gerar:
     hoje = datetime.now()
@@ -147,7 +149,28 @@ if gerar:
         if df_rec.empty: 
             st.error("⚠️ Sem focos registrados dentro do limite geográfico selecionado.")
         else:
-            st.success(f"✅ **Total Confirmado:** {len(df_rec):,} focos detectados nos últimos {quantidade_sel} {unidade_dd.lower()}.")
+            # --- CARD DE RESUMO ESTILIZADO (Baseado na imagem enviada) ---
+            total_focos = len(df_rec)
+            data_limite = hoje.strftime("%d/%m/%Y")
+            
+            card_html = f"""
+            <div style="
+                background-color: #f8f9fa; 
+                padding: 15px; 
+                border-radius: 8px; 
+                border-left: 8px solid #ff4b4b; 
+                margin-bottom: 20px;
+                box-shadow: 1px 1px 4px rgba(0,0,0,0.05);
+            ">
+                <h3 style="color: #c0392b; margin: 0; font-size: 22px; font-weight: bold;">
+                    🔥 Total Confirmado no Mapa: {total_focos:,} focos
+                </h3>
+                <p style="color: #636e72; margin: 4px 0 0 0; font-size: 15px;">
+                    Análise: {val_sel} | Período: {quantidade_sel} {unidade_dd} (até {data_limite})
+                </p>
+            </div>
+            """
+            st.markdown(card_html, unsafe_allow_html=True)
             
             col1, col2 = st.columns([1.3, 1])
             
@@ -157,21 +180,18 @@ if gerar:
                 m = folium.Map(location=[centro.y, centro.x], zoom_start=10 if tipo_analise == "Por Município" else 6, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Satélite')
                 folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}).add_to(m)
                 HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=20).add_to(m)
-                st_folium(m, width=700, height=500, returned_objects=[])
+                st_folium(m, width=700, height=600, returned_objects=[])
             
             with col2:
-                st.subheader("📊 Distribuição por Satélite")
-                fig_sat = px.pie(df_rec, names='satelite', hole=.4, color_discrete_sequence=px.colors.sequential.Reds_r)
-                st.plotly_chart(fig_sat, use_container_width=True)
-                
-                st.subheader("📈 Evolução Temporal")
+                st.subheader("📈 Evolução Temporal dos Focos")
                 data_col = next(c for c in df_rec.columns if 'data' in c)
                 df_rec[data_col] = pd.to_datetime(df_rec[data_col])
-                # Agrupa por dia se for análise curta, ou por mês se for longa
+                
                 freq = 'D' if (hoje - dt_ini).days <= 90 else 'MS'
                 df_g = df_rec.set_index(data_col).resample(freq).size().reset_index(name='focos')
-                fig_line = px.line(df_g, x=data_col, y='focos', markers=True)
-                fig_line.update_traces(line_color='#e64a19')
+                
+                fig_line = px.line(df_g, x=data_col, y='focos', markers=True, height=500)
+                fig_line.update_traces(line_color='#e64a19', line_width=3)
                 fig_line.update_layout(template='plotly_dark', xaxis_title="Tempo", yaxis_title="Nº de Focos")
                 st.plotly_chart(fig_line, use_container_width=True)
 else:
