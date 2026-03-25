@@ -125,7 +125,7 @@ with st.sidebar.expander("ℹ️ Sobre os Dados"):
     """)
 
 # --- INTERFACE (TELA PRINCIPAL) ---
-st.title("🔥 Dashboard de Queimadas")
+st.title("🔥 Dashboard de Queimadas 🔥")
 
 if gerar:
     hoje = datetime.now()
