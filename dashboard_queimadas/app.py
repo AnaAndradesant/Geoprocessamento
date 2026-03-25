@@ -125,7 +125,7 @@ with st.sidebar.expander("ℹ️ Sobre os Dados"):
     """)
 
 # --- INTERFACE (TELA PRINCIPAL) ---
-st.title("🔥 Dashboard de Queimadas 🔥")
+st.title("🔥 Dashboard de Queimadas")
 
 if gerar:
     hoje = datetime.now()
@@ -149,7 +149,7 @@ if gerar:
         if df_rec.empty: 
             st.error("⚠️ Sem focos registrados dentro do limite geográfico selecionado.")
         else:
-            # --- CARD DE RESUMO ESTILIZADO (Baseado na imagem enviada) ---
+            # 1. CARD DE RESUMO ESTILIZADO
             total_focos = len(df_rec)
             data_limite = hoje.strftime("%d/%m/%Y")
             
@@ -172,6 +172,16 @@ if gerar:
             """
             st.markdown(card_html, unsafe_allow_html=True)
             
+            # 2. BOTÃO DE DOWNLOAD (Adicionado na Barra Lateral após gerar dados)
+            csv_dados = df_rec.to_csv(index=False).encode('utf-8')
+            st.sidebar.download_button(
+                label="📥 Baixar Dados (CSV)",
+                data=csv_dados,
+                file_name=f"focos_{val_sel.replace(' ', '_')}_{hoje.strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+            
             col1, col2 = st.columns([1.3, 1])
             
             with col1:
@@ -180,7 +190,7 @@ if gerar:
                 m = folium.Map(location=[centro.y, centro.x], zoom_start=10 if tipo_analise == "Por Município" else 6, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Satélite')
                 folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}).add_to(m)
                 HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=20).add_to(m)
-                st_folium(m, width=700, height=600, returned_objects=[])
+                st_folium(m, width=700, height=750, returned_objects=[]) # Aumentei um pouco a altura para alinhar com os 2 gráficos ao lado
             
             with col2:
                 st.subheader("📈 Evolução Temporal dos Focos")
@@ -190,9 +200,39 @@ if gerar:
                 freq = 'D' if (hoje - dt_ini).days <= 90 else 'MS'
                 df_g = df_rec.set_index(data_col).resample(freq).size().reset_index(name='focos')
                 
-                fig_line = px.line(df_g, x=data_col, y='focos', markers=True, height=500)
+                fig_line = px.line(df_g, x=data_col, y='focos', markers=True, height=350)
                 fig_line.update_traces(line_color='#e64a19', line_width=3)
-                fig_line.update_layout(template='plotly_dark', xaxis_title="Tempo", yaxis_title="Nº de Focos")
+                fig_line.update_layout(template='plotly_dark', xaxis_title="Tempo", yaxis_title="Nº de Focos", margin=dict(t=20, b=20))
                 st.plotly_chart(fig_line, use_container_width=True)
+
+                # 3. NOVO GRÁFICO: TOP 5 MUNICÍPIOS
+                if 'municipio' in df_rec.columns and tipo_analise != "Por Município":
+                    st.subheader("🏆 Top 5 Municípios com Mais Focos")
+                    df_top = df_rec['municipio'].value_counts().reset_index().head(5)
+                    df_top.columns = ['Município', 'Focos']
+                    
+                    fig_bar = px.bar(df_top, x='Focos', y='Município', orientation='h', text='Focos', 
+                                     color='Focos', color_continuous_scale=px.colors.sequential.Reds)
+                    fig_bar.update_layout(
+                        template='plotly_dark', 
+                        yaxis={'categoryorder':'total ascending'}, 
+                        height=320,
+                        margin=dict(t=20, b=20),
+                        coloraxis_showscale=False # Esconde a barra lateral de cor para ficar mais limpo
+                    )
+                    st.plotly_chart(fig_bar, use_container_width=True)
+
 else:
     st.info("👈 Use os filtros ao lado para selecionar o local e o período de análise.")
+
+# --- 4. RODAPÉ PROFISSIONAL NA BARRA LATERAL ---
+# Este bloco fica fora do 'if gerar:' para aparecer sempre
+st.sidebar.markdown("---")
+st.sidebar.markdown("""
+<div style="text-align: center; font-size: 13px; color: #636e72;">
+    Desenvolvido por <br>
+    <b style="font-size: 15px;">Ana Carolina Andrade</b> <br>
+    <a href="https://linkedin.com/in/SEU_LINKEDIN_AQUI" target="_blank" style="text-decoration: none; color: #e64a19; font-weight: bold;">LinkedIn</a> | 
+    <a href="https://github.com/SEU_GITHUB_AQUI" target="_blank" style="text-decoration: none; color: #e64a19; font-weight: bold;">GitHub</a>
+</div>
+""", unsafe_allow_html=True)
