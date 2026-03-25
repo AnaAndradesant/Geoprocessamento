@@ -76,7 +76,7 @@ def carregar_areas_protegidas(tipo_area):
 @st.cache_data(ttl=3600)
 def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satelites):
     url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
-    dic_estados = {"AC": "ACRE", "AL": "ALAGOAS", "AP": "AMAP%", "AM": "AMAZONAS", "BA": "BAHIA", "CE": "CEAR%", "DF": "DISTRITO FEDERAL", "ES": "ESP%RITO SANTO", "GO": "GOI%S", "MA": "MARANH%O", "MT": "MATO GROSSO", "MS": "MATO GROSSO DO SUL", "MG": "MINAS GERAIS", "PA": "PAR%", "PB": "PARA%BA", "PR": "PARAN%", "PE": "PERNAMBUCO", "PI": "PIAU%", "RJ": "RIO DE JANEIRO", "RN": "RIO GRANDE DO NORTE", "RS": "RIO GRANDE DO SUL", "RO": "ROND%NIA", "RR": "RORAIMA", "SC": "SANTA CATARINA", "SP": "S%O PAULO", "SE": "SERGIPE", "TO": "TOCANTINS"}
+    dic_estados = {"AC": "ACRE", "AL": "ALAGOAS", "AP": "AMAP%", "AM": "AMAZONAS", "BA": "BAHIA", "CE": "CEAR%", "DF": "DISTRITO FEDERAL", "ES": "ESP%RITO সংঘSANTO", "GO": "GOI%S", "MA": "MARANH%O", "MT": "MATO GROSSO", "MS": "MATO GROSSO DO SUL", "MG": "MINAS GERAIS", "PA": "PAR%", "PB": "PARA%BA", "PR": "PARAN%", "PE": "PERNAMBUCO", "PI": "PIAU%", "RJ": "RIO DE JANEIRO", "RN": "RIO GRANDE DO NORTE", "RS": "RIO GRANDE DO SUL", "RO": "ROND%NIA", "RR": "RORAIMA", "SC": "SANTA CATARINA", "SP": "S%O PAULO", "SE": "SERGIPE", "TO": "TOCANTINS"}
 
     if tipo == "Por Estado": filtro_base = f"estado ILIKE '{dic_estados.get(val_estado, val_estado)}'"
     elif tipo == "Por Bioma":
@@ -209,7 +209,7 @@ if gerar:
             """
             st.markdown(card_html, unsafe_allow_html=True)
 
-            # --- NOVO BLOCO: ALERTA DE RISCO COM GRÁFICO E TABELA ---
+            # --- ALERTA DE RISCO COM GRÁFICO DINÂMICO ---
             if not focos_em_areas.empty:
                 qtd_risco = len(focos_em_areas)
                 
@@ -219,11 +219,13 @@ if gerar:
                 
                 st.error(f"🚨 **ALERTA CRÍTICO:** {qtd_risco} focos detectados DENTRO de áreas protegidas!")
                 
-                # Cria duas colunas para mostrar o gráfico e a tabela lado a lado
                 col_alerta1, col_alerta2 = st.columns([1.5, 1])
                 
                 with col_alerta1:
-                    # Gráfico de Barras com as 10 áreas mais afetadas
+                    # Título dinâmico baseado na quantidade real de áreas afetadas
+                    qtd_areas = min(10, len(df_ranking_areas))
+                    titulo_dinamico = f"🔥 Top {qtd_areas} Áreas Mais Afetadas" if qtd_areas > 1 else "🔥 Área Mais Afetada"
+                    
                     fig_areas = px.bar(
                         df_ranking_areas.head(10), 
                         x='Focos', 
@@ -232,7 +234,7 @@ if gerar:
                         text='Focos',
                         color='Focos', 
                         color_continuous_scale=px.colors.sequential.Reds,
-                        title="🔥 Top 10 Áreas Mais Afetadas"
+                        title=titulo_dinamico
                     )
                     fig_areas.update_layout(
                         template='plotly_dark', 
@@ -244,7 +246,6 @@ if gerar:
                     st.plotly_chart(fig_areas, use_container_width=True)
                     
                 with col_alerta2:
-                    # Tabela interativa com barra de rolagem para todas as áreas
                     st.markdown("**Lista Completa de Áreas Afetadas**")
                     st.dataframe(
                         df_ranking_areas, 
@@ -255,7 +256,7 @@ if gerar:
             elif area_protegida != "Nenhuma":
                 st.success(f"✅ Nenhum foco detectado dentro de {area_protegida} na região analisada.")
             
-            st.markdown("---") # Linha divisória antes do mapa
+            st.markdown("---") 
             
             # 2. BOTÃO DE DOWNLOAD
             csv_dados = df_rec.to_csv(index=False).encode('utf-8')
@@ -268,10 +269,8 @@ if gerar:
                 centro = limite.geometry.union_all().centroid
                 m = folium.Map(location=[centro.y, centro.x], zoom_start=10 if tipo_analise == "Por Município" else 6, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Satélite')
                 
-                # Borda do Município/Estado/Bioma
                 folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}).add_to(m)
                 
-                # Polígonos das Áreas Protegidas Afetadas (Vermelho Transparente)
                 if not areas_afetadas.empty:
                     folium.GeoJson(
                         areas_afetadas.__geo_interface__, 
@@ -279,7 +278,6 @@ if gerar:
                         tooltip=folium.GeoJsonTooltip(fields=['nome_area'], aliases=['Área Protegida:'])
                     ).add_to(m)
 
-                # Pontos de Calor
                 HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=20).add_to(m)
                 st_folium(m, width=700, height=750, returned_objects=[])
             
@@ -297,11 +295,17 @@ if gerar:
                 st.plotly_chart(fig_line, use_container_width=True)
 
                 if 'municipio' in df_rec.columns and tipo_analise != "Por Município":
-                    st.subheader("🏆 Top 5 Municípios")
-                    df_top = df_rec['municipio'].value_counts().reset_index().head(5)
-                    df_top.columns = ['Município', 'Focos']
+                    df_top_mun = df_rec['municipio'].value_counts().reset_index()
                     
-                    fig_bar = px.bar(df_top, x='Focos', y='Município', orientation='h', text='Focos', color='Focos', color_continuous_scale=px.colors.sequential.Reds)
+                    # Título dinâmico para os municípios também!
+                    qtd_mun = min(5, len(df_top_mun))
+                    titulo_mun = f"🏆 Top {qtd_mun} Municípios" if qtd_mun > 1 else "🏆 Município Afetado"
+                    st.subheader(titulo_mun)
+                    
+                    df_top_mun = df_top_mun.head(5)
+                    df_top_mun.columns = ['Município', 'Focos']
+                    
+                    fig_bar = px.bar(df_top_mun, x='Focos', y='Município', orientation='h', text='Focos', color='Focos', color_continuous_scale=px.colors.sequential.Reds)
                     fig_bar.update_layout(template='plotly_dark', yaxis={'categoryorder':'total ascending'}, height=320, margin=dict(t=20, b=20), coloraxis_showscale=False)
                     st.plotly_chart(fig_bar, use_container_width=True)
 
