@@ -59,15 +59,17 @@ def carregar_fronteira(tipo, estado, bioma, municipio):
 
 @st.cache_data
 def carregar_areas_protegidas(tipo_area):
-    # Carrega a base do IBGE/FUNAI/MMA
+    # Carrega a base do IBGE/FUNAI/MMA (Atualizado: sem o parâmetro year que causava erro)
     if tipo_area == "Terras Indígenas":
-        gdf_areas = read_indigenous_land(year=2019)
-        gdf_areas = gdf_areas.rename(columns={'terrai_nom': 'nome_area'})
+        gdf_areas = read_indigenous_land()
+        if 'terrai_nom' in gdf_areas.columns:
+            gdf_areas = gdf_areas.rename(columns={'terrai_nom': 'nome_area'})
     else:
-        gdf_areas = read_conservation_units(year=2019)
-        gdf_areas = gdf_areas.rename(columns={'name_conservation_unit': 'nome_area'})
+        gdf_areas = read_conservation_units()
+        if 'name_conservation_unit' in gdf_areas.columns:
+            gdf_areas = gdf_areas.rename(columns={'name_conservation_unit': 'nome_area'})
     
-    # CORREÇÃO 1: Conserta problemas de polígonos inválidos
+    # Conserta problemas de polígonos inválidos
     gdf_areas['geometry'] = gdf_areas['geometry'].make_valid()
     
     gdf_areas = gdf_areas.to_crs("EPSG:4326")
@@ -175,7 +177,7 @@ if gerar:
                     try:
                         gdf_areas = carregar_areas_protegidas(area_protegida)
                         
-                        # CORREÇÃO 2: Força alinhamento de CRS (Sistemas de Coordenadas)
+                        # Alinhamento de CRS (Sistemas de Coordenadas)
                         gdf_areas = gdf_areas.to_crs(gdf.crs)
                         
                         # Cruza os pontos de fogo com os polígonos
@@ -186,7 +188,6 @@ if gerar:
                             
                     except Exception as e:
                         st.warning("Não foi possível carregar a base de áreas protegidas no momento.")
-                        # CORREÇÃO 3: Mostra o erro exato se falhar
                         st.error(f"🔍 Detalhe técnico do erro para debug: {e}")
 
             # 1. CARD DE RESUMO ESTILIZADO
@@ -224,7 +225,7 @@ if gerar:
                 centro = limite.geometry.union_all().centroid
                 m = folium.Map(location=[centro.y, centro.x], zoom_start=10 if tipo_analise == "Por Município" else 6, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Satélite')
                 
-                # Borda do Município/Estado
+                # Borda do Município/Estado/Bioma
                 folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}).add_to(m)
                 
                 # Polígonos das Áreas Protegidas Afetadas (Vermelho Transparente)
