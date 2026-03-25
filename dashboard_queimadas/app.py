@@ -86,7 +86,7 @@ st.sidebar.title("⚙️ Filtros da Análise")
 # Escala Geográfica
 tipo_analise = st.sidebar.radio('Escala Geográfica:', ['Por Estado', 'Por Bioma', 'Por Município'], index=2)
 
-# Lógica de Inativação: Estado e Município (Sem números no título)
+# Filtros de Localização (Lógica de inativação aplicada)
 estado_dd = st.sidebar.selectbox('Selecione o Estado:', ["AC","AL","AM","AP","BA","CE","DF","ES","GO","MA","MG","MS","MT","PA","PB","PE","PI","PR","RJ","RN","RO","RR","RS","SC","SE","SP","TO"], index=25, disabled=(tipo_analise == 'Por Bioma'))
 
 bioma_dd = st.sidebar.selectbox('Selecione o Bioma:', ["Amazônia", "Cerrado", "Mata Atlântica", "Caatinga", "Pampa", "Pantanal"], disabled=(tipo_analise != 'Por Bioma'))
@@ -94,68 +94,90 @@ bioma_dd = st.sidebar.selectbox('Selecione o Bioma:', ["Amazônia", "Cerrado", "
 cidades_lista = buscar_cidades(estado_dd)
 municipio_dd = st.sidebar.selectbox('Selecione a Cidade:', cidades_lista, disabled=(tipo_analise != 'Por Município'))
 
-# Filtro de Meses (Substituindo o Slider por Multiselect)
+# Filtro de Mês Único (Visual de selectbox igual ao da cidade)
 st.sidebar.markdown("---")
-meses_selecionados = st.sidebar.multiselect(
-    "Selecione os Meses de Análise:", 
+mes_selecionado = st.sidebar.selectbox(
+    "Selecione o Mês de Análise:", 
     options=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-    default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    index=datetime.now().month - 1 # Sugere o mês atual por padrão
 )
 
 gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True)
+
+# --- FONTE COM MAIS INFORMAÇÕES (SIDEBAR) ---
 st.sidebar.markdown("---")
-st.sidebar.caption("📌 **Fonte Oficial:** BDQueimadas / INPE.")
+with st.sidebar.expander("ℹ️ Sobre os Dados"):
+    st.markdown("""
+    **Fonte Primária:** Programa Queimadas do Instituto Nacional de Pesquisas Espaciais (**INPE**).
+    
+    **Satélites Utilizados:**
+    * **AQUA_M-T:** Referência para séries históricas.
+    * **NPP-375:** Alta resolução espacial.
+    
+    **Metodologia:**
+    Os focos representam detecções de calor na superfície. O sistema processa imagens orbitais para identificar anomalias térmicas vinculadas a possíveis queimadas.
+    
+    **Limites Geoespaciais:**
+    Bases do IBGE via biblioteca `geobr`.
+    """)
 
 # --- INTERFACE (TELA PRINCIPAL) ---
-# Título atualizado conforme solicitado
 st.title("🔥 Dashboard de Queimadas 🔥")
 
 if gerar:
-    # Definindo período (Último ano para filtrar pelos meses selecionados)
+    # Definindo período (Último ano disponível para filtrar pelo mês escolhido)
     hoje = datetime.now()
-    dt_ini = hoje - timedelta(days=365) # Pega o último ano base
+    dt_ini = hoje - timedelta(days=365) 
 
     val_sel = bioma_dd if tipo_analise == "Por Bioma" else (estado_dd if tipo_analise == "Por Estado" else f"{municipio_dd} ({estado_dd})")
 
-    with st.spinner(f"Baixando dados para {val_sel}..."):
+    with st.spinner(f"Consultando base do INPE para {val_sel}..."):
         limite = carregar_fronteira(tipo_analise, estado_dd, bioma_dd, municipio_dd)
         df_bruto = buscar_focos_inpe(tipo_analise, estado_dd, bioma_dd, municipio_dd, dt_ini.strftime("%Y-%m-%d"), hoje.strftime("%Y-%m-%d"))
 
     if df_bruto.empty: 
         st.error("⚠️ Nenhum foco de calor detectado neste período/local pelo INPE.")
     else:
-        # Filtrar pelos meses selecionados no multiselect
+        # Filtragem pelo Mês selecionado
         df_bruto['mes_num'] = pd.to_datetime(df_bruto[next(c for c in df_bruto.columns if 'data' in c)]).dt.month
-        df = df_bruto[df_bruto['mes_num'].isin(meses_selecionados)]
+        df = df_bruto[df_bruto['mes_num'] == mes_selecionado]
 
         if df.empty:
-            st.warning("⚠️ Não existem focos para os meses selecionados.")
+            st.warning(f"⚠️ Não foram detectados focos no mês {mes_selecionado} dentro do período analisado.")
         else:
             gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df["longitude"], df["latitude"]), crs="EPSG:4326")
             gdf = gpd.sjoin(gdf, limite, predicate="within")
             df_rec = pd.DataFrame(gdf.drop(columns="geometry"))
 
             if df_rec.empty: 
-                st.error("⚠️ Sem focos exatamente dentro do limite geográfico.")
+                st.error("⚠️ Os focos detectados estão fora do limite geográfico selecionado.")
             else:
-                st.success(f"🔥 **Total Confirmado:** {len(df_rec):,} focos detectados.")
-                col1, col2 = st.columns([1.2, 1])
+                st.success(f"✅ **Sucesso:** {len(df_rec):,} focos validados em {val_sel} para o mês {mes_selecionado}.")
+                
+                col1, col2 = st.columns([1.3, 1])
                 
                 with col1:
-                    st.subheader("🗺️ Mapa de Calor")
+                    st.subheader("🗺️ Mapa de Calor Espacial")
                     centro = limite.geometry.union_all().centroid
-                    m = folium.Map(location=[centro.y, centro.x], zoom_start=9 if tipo_analise == "Por Município" else 5, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Satélite')
-                    folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#FFFFFF', 'weight': 2.5}).add_to(m)
-                    HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=15).add_to(m)
-                    st_folium(m, width=600, height=500, returned_objects=[])
+                    m = folium.Map(location=[centro.y, centro.x], zoom_start=10 if tipo_analise == "Por Município" else 6, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Satélite')
+                    folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}).add_to(m)
+                    HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=20).add_to(m)
+                    st_folium(m, width=700, height=500, returned_objects=[])
                 
                 with col2:
-                    st.subheader("📊 Evolução nos Meses")
+                    st.subheader("📊 Distribuição por Satélite")
+                    # Gráfico para mostrar quais satélites detectaram mais focos
+                    fig_sat = px.pie(df_rec, names='satelite', hole=.4, color_discrete_sequence=px.colors.sequential.Reds_r)
+                    fig_sat.update_layout(showlegend=True)
+                    st.plotly_chart(fig_sat, use_container_width=True)
+                    
+                    st.subheader("📈 Focos por Dia")
                     data_col = next(c for c in df_rec.columns if 'data' in c)
                     df_rec[data_col] = pd.to_datetime(df_rec[data_col])
-                    df_g = df_rec.set_index(data_col).resample('MS').size().reset_index(name='focos')
-                    fig = px.bar(df_g, x=data_col, y='focos', color_discrete_sequence=['#ff5722'])
-                    fig.update_layout(template='plotly_white', xaxis_title="Mês", yaxis_title="Focos")
-                    st.plotly_chart(fig, use_container_width=True)
+                    df_g = df_rec.set_index(data_col).resample('D').size().reset_index(name='focos')
+                    fig_line = px.line(df_g, x=data_col, y='focos', markers=True, line_shape='spline')
+                    fig_line.update_traces(line_color='#e64a19')
+                    fig_line.update_layout(template='plotly_dark', xaxis_title="Dia do Mês", yaxis_title="Nº de Focos")
+                    st.plotly_chart(fig_line, use_container_width=True)
 else:
-    st.info("👈 Ajuste os filtros e os meses na barra lateral e clique em 'Gerar Dashboard'.")
+    st.info("👈 Configure os parâmetros ao lado e clique em 'Gerar Dashboard' para visualizar os dados geoprocessados.")
