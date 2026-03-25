@@ -1,0 +1,8 @@
+streamlit
+pandas
+geopandas
+geobr
+folium
+streamlit-folium
+plotly
+requests
