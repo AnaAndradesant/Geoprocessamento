@@ -59,7 +59,6 @@ def carregar_fronteira(tipo, estado, bioma, municipio):
 
 @st.cache_data
 def carregar_areas_protegidas(tipo_area):
-    # Carrega a base do IBGE/FUNAI/MMA (Atualizado: sem o parâmetro year que causava erro)
     if tipo_area == "Terras Indígenas":
         gdf_areas = read_indigenous_land()
         if 'terrai_nom' in gdf_areas.columns:
@@ -69,11 +68,8 @@ def carregar_areas_protegidas(tipo_area):
         if 'name_conservation_unit' in gdf_areas.columns:
             gdf_areas = gdf_areas.rename(columns={'name_conservation_unit': 'nome_area'})
     
-    # Conserta problemas de polígonos inválidos
     gdf_areas['geometry'] = gdf_areas['geometry'].make_valid()
-    
     gdf_areas = gdf_areas.to_crs("EPSG:4326")
-    # Simplifica a geometria para poupar memória do servidor
     gdf_areas['geometry'] = gdf_areas['geometry'].simplify(tolerance=0.01, preserve_topology=True)
     return gdf_areas[['nome_area', 'geometry']]
 
@@ -161,6 +157,7 @@ if gerar:
     if df.empty: 
         st.error("⚠️ Nenhum foco de calor detectado neste período/local pelos satélites selecionados.")
     else:
+        # 1º Cruzamento (Pega só os pontos de fogo dentro da fronteira)
         gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df["longitude"], df["latitude"]), crs="EPSG:4326")
         gdf = gpd.sjoin(gdf, limite, predicate="within")
         df_rec = pd.DataFrame(gdf.drop(columns="geometry"))
@@ -180,7 +177,13 @@ if gerar:
                         # Alinhamento de CRS (Sistemas de Coordenadas)
                         gdf_areas = gdf_areas.to_crs(gdf.crs)
                         
-                        # Cruza os pontos de fogo com os polígonos
+                        # CORREÇÃO: Remove a coluna index_right do 1º cruzamento (se existir)
+                        if 'index_right' in gdf.columns:
+                            gdf = gdf.drop(columns=['index_right'])
+                        if 'index_left' in gdf.columns:
+                            gdf = gdf.drop(columns=['index_left'])
+                        
+                        # 2º Cruzamento (Cruza os pontos de fogo com os polígonos)
                         gdf_focos_risco = gpd.sjoin(gdf, gdf_areas, predicate='within')
                         if not gdf_focos_risco.empty:
                             focos_em_areas = pd.DataFrame(gdf_focos_risco.drop(columns="geometry"))
