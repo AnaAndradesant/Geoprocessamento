@@ -59,7 +59,7 @@ def carregar_fronteira(tipo, estado, bioma, municipio):
 
 @st.cache_data
 def carregar_areas_protegidas(tipo_area):
-    # Carrega a base do IBGE/FUNAI/MMA e simplifica para não estourar a memória do Streamlit
+    # Carrega a base do IBGE/FUNAI/MMA
     if tipo_area == "Terras Indígenas":
         gdf_areas = read_indigenous_land(year=2019)
         gdf_areas = gdf_areas.rename(columns={'terrai_nom': 'nome_area'})
@@ -67,7 +67,11 @@ def carregar_areas_protegidas(tipo_area):
         gdf_areas = read_conservation_units(year=2019)
         gdf_areas = gdf_areas.rename(columns={'name_conservation_unit': 'nome_area'})
     
+    # CORREÇÃO 1: Conserta problemas de polígonos inválidos
+    gdf_areas['geometry'] = gdf_areas['geometry'].make_valid()
+    
     gdf_areas = gdf_areas.to_crs("EPSG:4326")
+    # Simplifica a geometria para poupar memória do servidor
     gdf_areas['geometry'] = gdf_areas['geometry'].simplify(tolerance=0.01, preserve_topology=True)
     return gdf_areas[['nome_area', 'geometry']]
 
@@ -124,7 +128,6 @@ elif unidade_dd == "Meses": op_qtd = list(range(1, 61))
 else: op_qtd = list(range(1, 11))
 quantidade_sel = st.sidebar.selectbox(f"Quantidade de {unidade_dd}:", options=op_qtd, index=1)
 
-# --- NOVOS FILTROS AVANÇADOS ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔬 Filtros Avançados")
 satelites_lista = ['AQUA_M-T', 'NPP-375', 'NPP-375D', 'TERRA_M-T', 'NOAA-20', 'MSG-03']
@@ -168,17 +171,23 @@ if gerar:
             areas_afetadas = gpd.GeoDataFrame()
             
             if area_protegida != "Nenhuma":
-                with st.spinner(f"Realizando Spatial Join com {area_protegida}..."):
+                with st.spinner(f"Baixando base de {area_protegida} e cruzando espacialmente (pode levar 1 minuto)..."):
                     try:
                         gdf_areas = carregar_areas_protegidas(area_protegida)
-                        # Cruza os pontos de fogo com os polígonos das áreas protegidas
+                        
+                        # CORREÇÃO 2: Força alinhamento de CRS (Sistemas de Coordenadas)
+                        gdf_areas = gdf_areas.to_crs(gdf.crs)
+                        
+                        # Cruza os pontos de fogo com os polígonos
                         gdf_focos_risco = gpd.sjoin(gdf, gdf_areas, predicate='within')
                         if not gdf_focos_risco.empty:
                             focos_em_areas = pd.DataFrame(gdf_focos_risco.drop(columns="geometry"))
-                            # Pega apenas os polígonos que sofreram intersecção para desenhar no mapa
                             areas_afetadas = gdf_areas[gdf_areas['nome_area'].isin(gdf_focos_risco['nome_area'])]
+                            
                     except Exception as e:
                         st.warning("Não foi possível carregar a base de áreas protegidas no momento.")
+                        # CORREÇÃO 3: Mostra o erro exato se falhar
+                        st.error(f"🔍 Detalhe técnico do erro para debug: {e}")
 
             # 1. CARD DE RESUMO ESTILIZADO
             total_focos = len(df_rec)
