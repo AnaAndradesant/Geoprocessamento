@@ -2,14 +2,14 @@ import streamlit as st
 import pandas as pd
 import geopandas as gpd
 from datetime import datetime, timedelta
-from geobr import read_state, read_biomes, read_municipality 
+from geobr import read_state, read_biomes, read_municipality, read_indigenous_land, read_conservation_units 
 import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 import plotly.express as px
 import requests, warnings, time, unicodedata, re
 
-# --- CONFIGURAÇÃO DA PÁGINA E METADADOS DO LINK ---
+# --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
     page_title="Monitor de Queimadas Brasil",
     page_icon="🔥",
@@ -18,7 +18,7 @@ st.set_page_config(
     menu_items={
         'About': """
         ### 🛰️ Monitor de Queimadas (INPE)
-        Dashboard interativo para monitoramento de focos de calor em tempo real.
+        Dashboard interativo para monitoramento de focos de calor e análise de risco em áreas protegidas.
         Desenvolvido por Ana Carolina Andrade.
         """
     }
@@ -57,8 +57,22 @@ def carregar_fronteira(tipo, estado, bioma, municipio):
     limite['geometry'] = limite['geometry'].simplify(tolerance=0.005, preserve_topology=True)
     return limite
 
+@st.cache_data
+def carregar_areas_protegidas(tipo_area):
+    # Carrega a base do IBGE/FUNAI/MMA e simplifica para não estourar a memória do Streamlit
+    if tipo_area == "Terras Indígenas":
+        gdf_areas = read_indigenous_land(year=2019)
+        gdf_areas = gdf_areas.rename(columns={'terrai_nom': 'nome_area'})
+    else:
+        gdf_areas = read_conservation_units(year=2019)
+        gdf_areas = gdf_areas.rename(columns={'name_conservation_unit': 'nome_area'})
+    
+    gdf_areas = gdf_areas.to_crs("EPSG:4326")
+    gdf_areas['geometry'] = gdf_areas['geometry'].simplify(tolerance=0.01, preserve_topology=True)
+    return gdf_areas[['nome_area', 'geometry']]
+
 @st.cache_data(ttl=3600)
-def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim):
+def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satelites):
     url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
     dic_estados = {"AC": "ACRE", "AL": "ALAGOAS", "AP": "AMAP%", "AM": "AMAZONAS", "BA": "BAHIA", "CE": "CEAR%", "DF": "DISTRITO FEDERAL", "ES": "ESP%RITO SANTO", "GO": "GOI%S", "MA": "MARANH%O", "MT": "MATO GROSSO", "MS": "MATO GROSSO DO SUL", "MG": "MINAS GERAIS", "PA": "PAR%", "PB": "PARA%BA", "PR": "PARAN%", "PE": "PERNAMBUCO", "PI": "PIAU%", "RJ": "RIO DE JANEIRO", "RN": "RIO GRANDE DO NORTE", "RS": "RIO GRANDE DO SUL", "RO": "ROND%NIA", "RR": "RORAIMA", "SC": "SANTA CATARINA", "SP": "S%O PAULO", "SE": "SERGIPE", "TO": "TOCANTINS"}
 
@@ -73,10 +87,11 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim):
     dt_ini = datetime.strptime(d_ini, "%Y-%m-%d")
     dt_fim = datetime.strptime(d_fim, "%Y-%m-%d")
     all_dfs = []
+    sat_str = "','".join(satelites)
     
     while dt_ini <= dt_fim:
         dt_bloco_fim = min(dt_ini + timedelta(days=5), dt_fim)
-        cql = f"data_hora_gmt >= '{dt_ini.strftime('%Y-%m-%d')}T00:00:00' AND data_hora_gmt <= '{dt_bloco_fim.strftime('%Y-%m-%d')}T23:59:59' AND satelite IN ('AQUA_M-T','NPP-375','NPP-375D') AND pais_complete_id=33 AND {filtro_base}"
+        cql = f"data_hora_gmt >= '{dt_ini.strftime('%Y-%m-%d')}T00:00:00' AND data_hora_gmt <= '{dt_bloco_fim.strftime('%Y-%m-%d')}T23:59:59' AND satelite IN ('{sat_str}') AND pais_complete_id=33 AND {filtro_base}"
         try:
             r = requests.get(url, params={"service": "WFS", "version": "1.0.0", "request": "GetFeature", "typeName": "bdqueimadas:focos", "outputFormat": "application/json", "CQL_FILTER": cql, "maxFeatures": 10000}, verify=False, timeout=60)
             if r.status_code == 200:
@@ -103,31 +118,30 @@ bioma_dd = st.sidebar.selectbox('Selecione o Bioma:', ["Amazônia", "Cerrado", "
 cidades_lista = buscar_cidades(estado_dd)
 municipio_dd = st.sidebar.selectbox('Selecione a Cidade:', cidades_lista, disabled=(tipo_analise != 'Por Município'))
 
-st.sidebar.markdown("---")
-
 unidade_dd = st.sidebar.selectbox("Analisar por:", ["Dias", "Meses", "Anos"], index=1)
-
 if unidade_dd == "Dias": op_qtd = list(range(1, 91))
 elif unidade_dd == "Meses": op_qtd = list(range(1, 61))
 else: op_qtd = list(range(1, 11))
-
 quantidade_sel = st.sidebar.selectbox(f"Quantidade de {unidade_dd}:", options=op_qtd, index=1)
+
+# --- NOVOS FILTROS AVANÇADOS ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔬 Filtros Avançados")
+satelites_lista = ['AQUA_M-T', 'NPP-375', 'NPP-375D', 'TERRA_M-T', 'NOAA-20', 'MSG-03']
+satelites_sel = st.sidebar.multiselect("Satélites de Referência:", satelites_lista, default=['AQUA_M-T', 'NPP-375', 'NPP-375D'])
+
+area_protegida = st.sidebar.selectbox("🌳 Análise de Risco (Cruzamento Espacial):", ["Nenhuma", "Terras Indígenas", "Unidades de Conservação"])
 
 gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True)
 
-st.sidebar.markdown("---")
-with st.sidebar.expander("ℹ️ Sobre os Dados"):
-    st.markdown("""
-    **Fonte Primária:** Programa Queimadas do Instituto Nacional de Pesquisas Espaciais (**INPE**).
-    
-    **Metodologia:**
-    O sistema processa imagens orbitais para identificar anomalias térmicas. Cada ponto representa uma detecção de calor vinculada a possíveis queimadas.
-    """)
-
 # --- INTERFACE (TELA PRINCIPAL) ---
-st.title("🔥 Dashboard de Queimadas 🔥")
+st.title("🔥 Dashboard de Queimadas")
 
 if gerar:
+    if not satelites_sel:
+        st.error("⚠️ Você precisa selecionar pelo menos um satélite para realizar a busca.")
+        st.stop()
+
     hoje = datetime.now()
     if unidade_dd == "Dias": dt_ini = hoje - timedelta(days=quantidade_sel)
     elif unidade_dd == "Meses": dt_ini = hoje - timedelta(days=30*quantidade_sel)
@@ -135,12 +149,12 @@ if gerar:
 
     val_sel = bioma_dd if tipo_analise == "Por Bioma" else (estado_dd if tipo_analise == "Por Estado" else f"{municipio_dd} ({estado_dd})")
 
-    with st.spinner(f"Processando dados de {val_sel}..."):
+    with st.spinner(f"Processando dados orbitais de {val_sel}..."):
         limite = carregar_fronteira(tipo_analise, estado_dd, bioma_dd, municipio_dd)
-        df = buscar_focos_inpe(tipo_analise, estado_dd, bioma_dd, municipio_dd, dt_ini.strftime("%Y-%m-%d"), hoje.strftime("%Y-%m-%d"))
+        df = buscar_focos_inpe(tipo_analise, estado_dd, bioma_dd, municipio_dd, dt_ini.strftime("%Y-%m-%d"), hoje.strftime("%Y-%m-%d"), satelites_sel)
 
     if df.empty: 
-        st.error("⚠️ Nenhum foco de calor detectado neste período/local pelo INPE.")
+        st.error("⚠️ Nenhum foco de calor detectado neste período/local pelos satélites selecionados.")
     else:
         gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df["longitude"], df["latitude"]), crs="EPSG:4326")
         gdf = gpd.sjoin(gdf, limite, predicate="within")
@@ -149,19 +163,29 @@ if gerar:
         if df_rec.empty: 
             st.error("⚠️ Sem focos registrados dentro do limite geográfico selecionado.")
         else:
+            # --- ANÁLISE DE RISCO (CRUZAMENTO ESPACIAL) ---
+            focos_em_areas = pd.DataFrame()
+            areas_afetadas = gpd.GeoDataFrame()
+            
+            if area_protegida != "Nenhuma":
+                with st.spinner(f"Realizando Spatial Join com {area_protegida}..."):
+                    try:
+                        gdf_areas = carregar_areas_protegidas(area_protegida)
+                        # Cruza os pontos de fogo com os polígonos das áreas protegidas
+                        gdf_focos_risco = gpd.sjoin(gdf, gdf_areas, predicate='within')
+                        if not gdf_focos_risco.empty:
+                            focos_em_areas = pd.DataFrame(gdf_focos_risco.drop(columns="geometry"))
+                            # Pega apenas os polígonos que sofreram intersecção para desenhar no mapa
+                            areas_afetadas = gdf_areas[gdf_areas['nome_area'].isin(gdf_focos_risco['nome_area'])]
+                    except Exception as e:
+                        st.warning("Não foi possível carregar a base de áreas protegidas no momento.")
+
             # 1. CARD DE RESUMO ESTILIZADO
             total_focos = len(df_rec)
             data_limite = hoje.strftime("%d/%m/%Y")
             
             card_html = f"""
-            <div style="
-                background-color: #f8f9fa; 
-                padding: 15px; 
-                border-radius: 8px; 
-                border-left: 8px solid #ff4b4b; 
-                margin-bottom: 20px;
-                box-shadow: 1px 1px 4px rgba(0,0,0,0.05);
-            ">
+            <div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; border-left: 8px solid #ff4b4b; margin-bottom: 15px; box-shadow: 1px 1px 4px rgba(0,0,0,0.05);">
                 <h3 style="color: #c0392b; margin: 0; font-size: 22px; font-weight: bold;">
                     🔥 Total Confirmado no Mapa: {total_focos:,} focos
                 </h3>
@@ -171,16 +195,18 @@ if gerar:
             </div>
             """
             st.markdown(card_html, unsafe_allow_html=True)
+
+            # ALERTA DE RISCO SE HOUVER FOCOS EM ÁREAS PROTEGIDAS
+            if not focos_em_areas.empty:
+                qtd_risco = len(focos_em_areas)
+                nomes_areas = ", ".join(focos_em_areas['nome_area'].unique())
+                st.error(f"🚨 **ALERTA CRÍTICO:** {qtd_risco} focos detectados DENTRO de áreas protegidas! \n\n **Áreas afetadas:** {nomes_areas}")
+            elif area_protegida != "Nenhuma":
+                st.success(f"✅ Nenhum foco detectado dentro de {area_protegida} na região analisada.")
             
-            # 2. BOTÃO DE DOWNLOAD (Adicionado na Barra Lateral após gerar dados)
+            # 2. BOTÃO DE DOWNLOAD
             csv_dados = df_rec.to_csv(index=False).encode('utf-8')
-            st.sidebar.download_button(
-                label="📥 Baixar Dados (CSV)",
-                data=csv_dados,
-                file_name=f"focos_{val_sel.replace(' ', '_')}_{hoje.strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+            st.sidebar.download_button("📥 Baixar Dados (CSV)", data=csv_dados, file_name=f"focos_{val_sel.replace(' ', '_')}.csv", mime="text/csv", use_container_width=True)
             
             col1, col2 = st.columns([1.3, 1])
             
@@ -188,7 +214,19 @@ if gerar:
                 st.subheader("🗺️ Mapa de Calor Espacial")
                 centro = limite.geometry.union_all().centroid
                 m = folium.Map(location=[centro.y, centro.x], zoom_start=10 if tipo_analise == "Por Município" else 6, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Satélite')
+                
+                # Borda do Município/Estado
                 folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}).add_to(m)
+                
+                # Polígonos das Áreas Protegidas Afetadas (Vermelho Transparente)
+                if not areas_afetadas.empty:
+                    folium.GeoJson(
+                        areas_afetadas.__geo_interface__, 
+                        style_function=lambda x: {'fillColor': '#e74c3c', 'color': '#c0392b', 'weight': 2, 'fillOpacity': 0.4},
+                        tooltip=folium.GeoJsonTooltip(fields=['nome_area'], aliases=['Área Protegida:'])
+                    ).add_to(m)
+
+                # Pontos de Calor
                 HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=20).add_to(m)
                 st_folium(m, width=700, height=750, returned_objects=[])
             
@@ -205,27 +243,19 @@ if gerar:
                 fig_line.update_layout(template='plotly_dark', xaxis_title="Tempo", yaxis_title="Nº de Focos", margin=dict(t=20, b=20))
                 st.plotly_chart(fig_line, use_container_width=True)
 
-                # 3. NOVO GRÁFICO: TOP 5 MUNICÍPIOS
                 if 'municipio' in df_rec.columns and tipo_analise != "Por Município":
-                    st.subheader("🏆 Top 5 Municípios com Mais Focos")
+                    st.subheader("🏆 Top 5 Municípios")
                     df_top = df_rec['municipio'].value_counts().reset_index().head(5)
                     df_top.columns = ['Município', 'Focos']
                     
-                    fig_bar = px.bar(df_top, x='Focos', y='Município', orientation='h', text='Focos', 
-                                     color='Focos', color_continuous_scale=px.colors.sequential.Reds)
-                    fig_bar.update_layout(
-                        template='plotly_dark', 
-                        yaxis={'categoryorder':'total ascending'}, 
-                        height=320,
-                        margin=dict(t=20, b=20),
-                        coloraxis_showscale=False
-                    )
+                    fig_bar = px.bar(df_top, x='Focos', y='Município', orientation='h', text='Focos', color='Focos', color_continuous_scale=px.colors.sequential.Reds)
+                    fig_bar.update_layout(template='plotly_dark', yaxis={'categoryorder':'total ascending'}, height=320, margin=dict(t=20, b=20), coloraxis_showscale=False)
                     st.plotly_chart(fig_bar, use_container_width=True)
 
 else:
     st.info("👈 Use os filtros ao lado para selecionar o local e o período de análise.")
 
-# --- 4. RODAPÉ PROFISSIONAL NA BARRA LATERAL ---
+# --- RODAPÉ ---
 st.sidebar.markdown("---")
 st.sidebar.markdown("""
 <div style="text-align: center; font-size: 13px; color: #636e72;">
