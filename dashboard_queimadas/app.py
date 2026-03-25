@@ -27,8 +27,8 @@ st.set_page_config(
 warnings.filterwarnings('ignore')
 requests.packages.urllib3.disable_warnings()
 
-# --- FUNÇÕES COM CACHE ---
-@st.cache_data(ttl=86400)
+# --- FUNÇÕES COM CACHE (AGORA COM show_spinner=False PARA ESCONDER A MENSAGEM FEIA) ---
+@st.cache_data(ttl=86400, show_spinner=False)
 def buscar_cidades(uf):
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
     try:
@@ -41,7 +41,7 @@ def normalizar_texto(txt):
     if pd.isna(txt): return ""
     return ''.join(c for c in unicodedata.normalize('NFD', str(txt)) if unicodedata.category(c) != 'Mn').lower()
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def carregar_fronteira(tipo, estado, bioma, municipio):
     if tipo == "Por Estado": limite = read_state(code_state=estado, year=2020)
     elif tipo == "Por Bioma":
@@ -57,7 +57,7 @@ def carregar_fronteira(tipo, estado, bioma, municipio):
     limite['geometry'] = limite['geometry'].simplify(tolerance=0.005, preserve_topology=True)
     return limite
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def carregar_areas_protegidas(tipo_area):
     if tipo_area == "Terras Indígenas":
         gdf_areas = read_indigenous_land()
@@ -73,10 +73,10 @@ def carregar_areas_protegidas(tipo_area):
     gdf_areas['geometry'] = gdf_areas['geometry'].simplify(tolerance=0.01, preserve_topology=True)
     return gdf_areas[['nome_area', 'geometry']]
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satelites):
     url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
-    dic_estados = {"AC": "ACRE", "AL": "ALAGOAS", "AP": "AMAP%", "AM": "AMAZONAS", "BA": "BAHIA", "CE": "CEAR%", "DF": "DISTRITO FEDERAL", "ES": "ESP%RITO সংঘSANTO", "GO": "GOI%S", "MA": "MARANH%O", "MT": "MATO GROSSO", "MS": "MATO GROSSO DO SUL", "MG": "MINAS GERAIS", "PA": "PAR%", "PB": "PARA%BA", "PR": "PARAN%", "PE": "PERNAMBUCO", "PI": "PIAU%", "RJ": "RIO DE JANEIRO", "RN": "RIO GRANDE DO NORTE", "RS": "RIO GRANDE DO SUL", "RO": "ROND%NIA", "RR": "RORAIMA", "SC": "SANTA CATARINA", "SP": "S%O PAULO", "SE": "SERGIPE", "TO": "TOCANTINS"}
+    dic_estados = {"AC": "ACRE", "AL": "ALAGOAS", "AP": "AMAP%", "AM": "AMAZONAS", "BA": "BAHIA", "CE": "CEAR%", "DF": "DISTRITO FEDERAL", "ES": "ESP%RITO SANTO", "GO": "GOI%S", "MA": "MARANH%O", "MT": "MATO GROSSO", "MS": "MATO GROSSO DO SUL", "MG": "MINAS GERAIS", "PA": "PAR%", "PB": "PARA%BA", "PR": "PARAN%", "PE": "PERNAMBUCO", "PI": "PIAU%", "RJ": "RIO DE JANEIRO", "RN": "RIO GRANDE DO NORTE", "RS": "RIO GRANDE DO SUL", "RO": "ROND%NIA", "RR": "RORAIMA", "SC": "SANTA CATARINA", "SP": "S%O PAULO", "SE": "SERGIPE", "TO": "TOCANTINS"}
 
     if tipo == "Por Estado": filtro_base = f"estado ILIKE '{dic_estados.get(val_estado, val_estado)}'"
     elif tipo == "Por Bioma":
@@ -136,7 +136,7 @@ area_protegida = st.sidebar.selectbox("🌳 Análise de Risco (Cruzamento Espaci
 gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True)
 
 # --- INTERFACE (TELA PRINCIPAL) ---
-st.title("🔥 Dashboard de Queimadas 🔥")
+st.title("🔥 Dashboard de Queimadas")
 
 if gerar:
     if not satelites_sel:
@@ -150,9 +150,15 @@ if gerar:
 
     val_sel = bioma_dd if tipo_analise == "Por Bioma" else (estado_dd if tipo_analise == "Por Estado" else f"{municipio_dd} ({estado_dd})")
 
-    with st.spinner(f"Processando dados orbitais de {val_sel}..."):
+    # --- NOVO ESTILO DE CARREGAMENTO PROFISSIONAL ---
+    with st.status(f"🛰️ Processando dados para: **{val_sel}**", expanded=True) as status:
+        st.write("🌍 Carregando fronteiras geográficas...")
         limite = carregar_fronteira(tipo_analise, estado_dd, bioma_dd, municipio_dd)
+        
+        st.write("📡 Consultando satélites do INPE...")
         df = buscar_focos_inpe(tipo_analise, estado_dd, bioma_dd, municipio_dd, dt_ini.strftime("%Y-%m-%d"), hoje.strftime("%Y-%m-%d"), satelites_sel)
+        
+        status.update(label="✅ Consulta finalizada com sucesso!", state="complete", expanded=False)
 
     if df.empty: 
         st.error("⚠️ Nenhum foco de calor detectado neste período/local pelos satélites selecionados.")
@@ -170,27 +176,26 @@ if gerar:
             areas_afetadas = gpd.GeoDataFrame()
             
             if area_protegida != "Nenhuma":
-                with st.spinner(f"Baixando base de {area_protegida} e cruzando espacialmente (pode levar 1 minuto)..."):
+                # Carregamento da área protegida também ganha visual moderno
+                with st.status(f"🌳 Cruzando dados com {area_protegida}...", expanded=True) as status_area:
                     try:
+                        st.write("Baixando polígonos oficiais...")
                         gdf_areas = carregar_areas_protegidas(area_protegida)
                         
-                        # Alinhamento de CRS (Sistemas de Coordenadas)
+                        st.write("Realizando interseção espacial...")
                         gdf_areas = gdf_areas.to_crs(gdf.crs)
                         
-                        # CORREÇÃO: Remove a coluna index_right do 1º cruzamento (se existir)
-                        if 'index_right' in gdf.columns:
-                            gdf = gdf.drop(columns=['index_right'])
-                        if 'index_left' in gdf.columns:
-                            gdf = gdf.drop(columns=['index_left'])
+                        if 'index_right' in gdf.columns: gdf = gdf.drop(columns=['index_right'])
+                        if 'index_left' in gdf.columns: gdf = gdf.drop(columns=['index_left'])
                         
-                        # 2º Cruzamento (Cruza os pontos de fogo com os polígonos)
                         gdf_focos_risco = gpd.sjoin(gdf, gdf_areas, predicate='within')
                         if not gdf_focos_risco.empty:
                             focos_em_areas = pd.DataFrame(gdf_focos_risco.drop(columns="geometry"))
                             areas_afetadas = gdf_areas[gdf_areas['nome_area'].isin(gdf_focos_risco['nome_area'])]
                             
+                        status_area.update(label="✅ Análise de risco concluída!", state="complete", expanded=False)
                     except Exception as e:
-                        st.warning("Não foi possível carregar a base de áreas protegidas no momento.")
+                        status_area.update(label="❌ Falha no cruzamento de dados.", state="error", expanded=False)
                         st.error(f"🔍 Detalhe técnico do erro para debug: {e}")
 
             # 1. CARD DE RESUMO ESTILIZADO
@@ -212,8 +217,6 @@ if gerar:
             # --- ALERTA DE RISCO COM GRÁFICO DINÂMICO ---
             if not focos_em_areas.empty:
                 qtd_risco = len(focos_em_areas)
-                
-                # Agrupa e conta os focos por área protegida
                 df_ranking_areas = focos_em_areas['nome_area'].value_counts().reset_index()
                 df_ranking_areas.columns = ['Área Protegida', 'Focos']
                 
@@ -222,7 +225,6 @@ if gerar:
                 col_alerta1, col_alerta2 = st.columns([1.5, 1])
                 
                 with col_alerta1:
-                    # Título dinâmico baseado na quantidade real de áreas afetadas
                     qtd_areas = min(10, len(df_ranking_areas))
                     titulo_dinamico = f"🔥 Top {qtd_areas} Áreas Mais Afetadas" if qtd_areas > 1 else "🔥 Área Mais Afetada"
                     
@@ -247,12 +249,8 @@ if gerar:
                     
                 with col_alerta2:
                     st.markdown("**Lista Completa de Áreas Afetadas**")
-                    st.dataframe(
-                        df_ranking_areas, 
-                        hide_index=True, 
-                        height=350,
-                        use_container_width=True
-                    )
+                    st.dataframe(df_ranking_areas, hide_index=True, height=350, use_container_width=True)
+                    
             elif area_protegida != "Nenhuma":
                 st.success(f"✅ Nenhum foco detectado dentro de {area_protegida} na região analisada.")
             
@@ -272,10 +270,17 @@ if gerar:
                 folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}).add_to(m)
                 
                 if not areas_afetadas.empty:
+                    # --- CSS INJETADO NO TOOLTIP PARA CORRIGIR TEXTO GRANDE/CORTADO ---
+                    estilo_tooltip = "font-size: 12px; max-width: 250px; white-space: normal; background-color: white; color: black; border-radius: 4px; box-shadow: 2px 2px 5px rgba(0,0,0,0.3);"
+                    
                     folium.GeoJson(
                         areas_afetadas.__geo_interface__, 
                         style_function=lambda x: {'fillColor': '#e74c3c', 'color': '#c0392b', 'weight': 2, 'fillOpacity': 0.4},
-                        tooltip=folium.GeoJsonTooltip(fields=['nome_area'], aliases=['Área Protegida:'])
+                        tooltip=folium.GeoJsonTooltip(
+                            fields=['nome_area'], 
+                            aliases=['Área Protegida:'],
+                            style=estilo_tooltip
+                        )
                     ).add_to(m)
 
                 HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=20).add_to(m)
@@ -296,8 +301,6 @@ if gerar:
 
                 if 'municipio' in df_rec.columns and tipo_analise != "Por Município":
                     df_top_mun = df_rec['municipio'].value_counts().reset_index()
-                    
-                    # Título dinâmico para os municípios também!
                     qtd_mun = min(5, len(df_top_mun))
                     titulo_mun = f"🏆 Top {qtd_mun} Municípios" if qtd_mun > 1 else "🏆 Município Afetado"
                     st.subheader(titulo_mun)
