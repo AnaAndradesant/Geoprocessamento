@@ -190,7 +190,7 @@ if gerar:
                 m = folium.Map(location=[centro.y, centro.x], zoom_start=10 if tipo_analise == "Por Município" else 6, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Satélite')
                 folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}).add_to(m)
                 HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=20).add_to(m)
-                st_folium(m, width=700, height=750, returned_objects=[]) # Aumentei um pouco a altura para alinhar com os 2 gráficos ao lado
+                st_folium(m, width=700, height=750, returned_objects=[])
             
             with col2:
                 st.subheader("📈 Evolução Temporal dos Focos")
@@ -218,7 +218,7 @@ if gerar:
                         yaxis={'categoryorder':'total ascending'}, 
                         height=320,
                         margin=dict(t=20, b=20),
-                        coloraxis_showscale=False # Esconde a barra lateral de cor para ficar mais limpo
+                        coloraxis_showscale=False
                     )
                     st.plotly_chart(fig_bar, use_container_width=True)
 
@@ -226,13 +226,12 @@ else:
     st.info("👈 Use os filtros ao lado para selecionar o local e o período de análise.")
 
 # --- 4. RODAPÉ PROFISSIONAL NA BARRA LATERAL ---
-# Este bloco fica fora do 'if gerar:' para aparecer sempre
 st.sidebar.markdown("---")
 st.sidebar.markdown("""
 <div style="text-align: center; font-size: 13px; color: #636e72;">
     Desenvolvido por <br>
     <b style="font-size: 15px;">Ana Carolina Andrade</b> <br>
-    <a href="https://linkedin.com/in/SEU_LINKEDIN_AQUI" target="_blank" style="text-decoration: none; color: #e64a19; font-weight: bold;">LinkedIn</a> | 
-    <a href="https://github.com/SEU_GITHUB_AQUI" target="_blank" style="text-decoration: none; color: #e64a19; font-weight: bold;">GitHub</a>
+    <a href="https://www.linkedin.com/in/ana-carolina-santos-3920931b3" target="_blank" style="text-decoration: none; color: #e64a19; font-weight: bold;">LinkedIn</a> | 
+    <a href="https://github.com/AnaAndradesant" target="_blank" style="text-decoration: none; color: #e64a19; font-weight: bold;">GitHub</a>
 </div>
 """, unsafe_allow_html=True)
