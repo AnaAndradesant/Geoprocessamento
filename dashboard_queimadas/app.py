@@ -209,13 +209,53 @@ if gerar:
             """
             st.markdown(card_html, unsafe_allow_html=True)
 
-            # ALERTA DE RISCO SE HOUVER FOCOS EM ÁREAS PROTEGIDAS
+            # --- NOVO BLOCO: ALERTA DE RISCO COM GRÁFICO E TABELA ---
             if not focos_em_areas.empty:
                 qtd_risco = len(focos_em_areas)
-                nomes_areas = ", ".join(focos_em_areas['nome_area'].unique())
-                st.error(f"🚨 **ALERTA CRÍTICO:** {qtd_risco} focos detectados DENTRO de áreas protegidas! \n\n **Áreas afetadas:** {nomes_areas}")
+                
+                # Agrupa e conta os focos por área protegida
+                df_ranking_areas = focos_em_areas['nome_area'].value_counts().reset_index()
+                df_ranking_areas.columns = ['Área Protegida', 'Focos']
+                
+                st.error(f"🚨 **ALERTA CRÍTICO:** {qtd_risco} focos detectados DENTRO de áreas protegidas!")
+                
+                # Cria duas colunas para mostrar o gráfico e a tabela lado a lado
+                col_alerta1, col_alerta2 = st.columns([1.5, 1])
+                
+                with col_alerta1:
+                    # Gráfico de Barras com as 10 áreas mais afetadas
+                    fig_areas = px.bar(
+                        df_ranking_areas.head(10), 
+                        x='Focos', 
+                        y='Área Protegida', 
+                        orientation='h', 
+                        text='Focos',
+                        color='Focos', 
+                        color_continuous_scale=px.colors.sequential.Reds,
+                        title="🔥 Top 10 Áreas Mais Afetadas"
+                    )
+                    fig_areas.update_layout(
+                        template='plotly_dark', 
+                        yaxis={'categoryorder':'total ascending'}, 
+                        height=350, 
+                        margin=dict(t=40, b=20), 
+                        coloraxis_showscale=False
+                    )
+                    st.plotly_chart(fig_areas, use_container_width=True)
+                    
+                with col_alerta2:
+                    # Tabela interativa com barra de rolagem para todas as áreas
+                    st.markdown("**Lista Completa de Áreas Afetadas**")
+                    st.dataframe(
+                        df_ranking_areas, 
+                        hide_index=True, 
+                        height=350,
+                        use_container_width=True
+                    )
             elif area_protegida != "Nenhuma":
                 st.success(f"✅ Nenhum foco detectado dentro de {area_protegida} na região analisada.")
+            
+            st.markdown("---") # Linha divisória antes do mapa
             
             # 2. BOTÃO DE DOWNLOAD
             csv_dados = df_rec.to_csv(index=False).encode('utf-8')
