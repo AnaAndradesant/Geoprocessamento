@@ -136,7 +136,7 @@ area_protegida = st.sidebar.selectbox("🌳 Análise de Risco (Cruzamento Espaci
 gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True)
 
 # --- INTERFACE (TELA PRINCIPAL) ---
-st.title("🔥 Dashboard de Queimadas")
+st.title("🔥 Dashboard de Queimadas 🔥")
 
 if gerar:
     if not satelites_sel:
