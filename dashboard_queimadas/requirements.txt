@@ -6,3 +6,4 @@ folium
 streamlit-folium
 plotly
 requests
+earthengine-api
