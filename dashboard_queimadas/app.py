@@ -120,4 +120,14 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
         dt_bloco_fim = min(dt_ini + timedelta(days=5), dt_fim)
         cql = f"data_hora_gmt >= '{dt_ini.strftime('%Y-%m-%d')}T00:00:00' AND data_hora_gmt <= '{dt_bloco_fim.strftime('%Y-%m-%d')}T23:59:59' AND satelite IN ('{sat_str}') AND pais_complete_id=33 AND {filtro_base}"
         try:
-            r = requests.get(url, params={"service": "WFS", "version": "1.0.0", "request": "GetFeature", "typeName": "bdqueimadas:focos", "outputFormat": "application/json
+            r = requests.get(url, params={"service": "WFS", "version": "1.0.0", "request": "GetFeature", "typeName": "bdqueimadas:focos", "outputFormat": "application/json", "CQL_FILTER": cql, "maxFeatures": 10000}, verify=False, timeout=60)
+            if r.status_code == 200:
+                features = r.json().get("features", [])
+                if features:
+                    registros = []
+                    for f in features:
+                        props = f["properties"]
+                        props["longitude"], props["latitude"] = f["geometry"]["coordinates"]
+                        registros.append(props)
+                    all_dfs.append(pd.DataFrame(registros))
+        except: pass
