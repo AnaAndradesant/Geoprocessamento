@@ -285,7 +285,9 @@ if gerar:
 
         # --- ANÁLISE DE ÁREAS PROTEGIDAS ---
         focos_em_areas = pd.DataFrame()
-        areas_afetadas_final = gpd.GeoDataFrame(crs="EPSG:4326")  # FIX: define CRS desde o início
+        areas_afetadas_final = gpd.GeoDataFrame({'nome_area': pd.Series(dtype=str), 'geometry': pd.Series(dtype=object)})
+        areas_afetadas_final = areas_afetadas_final.set_geometry('geometry')
+        areas_afetadas_final.crs = None  # será definido no primeiro concat
 
         if area_protegida != "Nenhuma":
             st.write(f"🌳 Cruzando com {area_protegida}...")
@@ -310,7 +312,10 @@ if gerar:
                     if not focos_em_areas.empty:
                         nomes_afetados = focos_em_areas['nome_area'].unique()
                         novas_areas = gdf_areas[gdf_areas['nome_area'].isin(nomes_afetados)].copy()
-                        areas_afetadas_final = pd.concat([areas_afetadas_final, novas_areas], ignore_index=True)
+                        areas_afetadas_final = gpd.GeoDataFrame(
+                            pd.concat([areas_afetadas_final, novas_areas], ignore_index=True),
+                            geometry='geometry', crs="EPSG:4326"
+                        )
 
                 # Hectares MODIS nas áreas protegidas
                 if ativar_modis and total_km2_modis > 0 and img_area_km2 is not None:
@@ -333,8 +338,9 @@ if gerar:
                         if not df_modis_areas.empty:
                             nomes_modis = df_modis_areas['Área Protegida'].unique()
                             novas_areas_modis = gdf_areas[gdf_areas['nome_area'].isin(nomes_modis)].copy()
-                            areas_afetadas_final = pd.concat(
-                                [areas_afetadas_final, novas_areas_modis], ignore_index=True
+                            areas_afetadas_final = gpd.GeoDataFrame(
+                                pd.concat([areas_afetadas_final, novas_areas_modis], ignore_index=True),
+                                geometry='geometry', crs="EPSG:4326"
                             )
                     except Exception as e:
                         st.warning(f"⚠️ Erro MODIS em áreas protegidas: {e}")
