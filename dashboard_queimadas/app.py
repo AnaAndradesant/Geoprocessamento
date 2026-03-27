@@ -241,6 +241,7 @@ if gerar:
 
         total_km2_modis = 0
         df_modis_areas = pd.DataFrame()
+        total_km2_areas_protegidas = 0  # será calculado após o bloco de áreas protegidas
         df_evolucao_modis = pd.DataFrame()
         area_queimada_img = None
         img_area_km2 = None  # FIX: inicializa fora do bloco para evitar NameError
@@ -353,8 +354,14 @@ if gerar:
 
     # --- DISPLAYS ---
     res = []
-    if ativar_inpe: res.append(f"🔥 {len(df_inpe_rec):,} Focos (INPE)")
-    if ativar_modis: res.append(f"🗺️ {total_km2_modis:,.2f} km² Queimados (MODIS)")
+    # FIX: quando área protegida está ativa, o total exibido reflete só as TIs/UCs, não o estado inteiro
+    total_km2_exibir = total_km2_modis
+    if area_protegida != "Nenhuma" and not df_modis_areas.empty:
+        total_km2_exibir = round(df_modis_areas['km²'].sum(), 2)
+
+    rotulo = f" — somente {area_protegida}" if area_protegida != "Nenhuma" else ""
+    if ativar_inpe: res.append(f"🔥 {len(df_inpe_rec) if area_protegida == 'Nenhuma' else len(focos_em_areas):,} Focos (INPE{rotulo})")
+    if ativar_modis: res.append(f"🗺️ {total_km2_exibir:,.2f} km² Queimados (MODIS{rotulo})")
     st.markdown(
         f"<div style='background:#f8f9fa;padding:15px;border-radius:8px;border-left:8px solid #ff4b4b;margin-bottom:15px;'>"
         f"<h3 style='color:#c0392b;margin:0;'>{' | '.join(res)}</h3></div>",
