@@ -5,15 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ana Carolina - Portfólio GIS</title>
     <style>
-        /* Estilos Base com Fundo de Mapa Desfocado */
+        /* Estilos Base SEM mapa (Padrão para a Aba 1 do Streamlit) */
         body { 
             margin: 0; 
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
             display: flex; 
             height: 100vh; 
             overflow: hidden; 
-            background-color: #1e1e1e;
-            /* Imagem de fundo com gradiente escuro por cima */
+            background-color: #0e1117; /* Cor que combina com o fundo do Streamlit */
+            transition: background 0.4s ease; /* Transição suave de fundo */
+        }
+        
+        /* Classe que o JavaScript vai ativar apenas na Aba 2 */
+        body.map-bg {
             background-image: 
                 linear-gradient(rgba(26, 31, 36, 0.85), rgba(26, 31, 36, 0.95)), 
                 url('https://images.unsplash.com/photo-1451187580459-43490279c0fa?q=80&w=2000&auto=format&fit=crop'); 
@@ -21,7 +25,7 @@
             background-position: center; 
         }
         
-        /* BARRA LATERAL (Agora com leve transparência para ver o mapa no fundo) */
+        /* BARRA LATERAL */
         .sidebar { width: 320px; background-color: rgba(26, 44, 63, 0.90); color: #fff; padding: 25px; overflow-y: auto; box-shadow: 3px 0 10px rgba(0,0,0,0.5); z-index: 10; display: flex; flex-direction: column; }
         .sidebar h1 { font-size: 1.6rem; color: #eef2f5; border-bottom: 2px solid #3b6998; padding-bottom: 10px; margin-top: 0; }
         .sidebar p { font-size: 0.9rem; color: #a8c1d9; line-height: 1.5; }
@@ -31,12 +35,27 @@
         .btn { display: block; width: 100%; background-color: rgba(44, 82, 119, 0.8); color: white; text-align: left; padding: 12px 15px; margin-bottom: 10px; text-decoration: none; border-radius: 4px; font-weight: bold; cursor: pointer; border: 1px solid #3b6998; transition: 0.2s; }
         .btn:hover { background-color: #3b6998; }
         .active-tab { background-color: #3b6998 !important; border-left: 5px solid #4caf50 !important; }
-        .btn-tech { background-color: rgba(43, 43, 43, 0.8); border: 1px solid #4caf50; color: #4caf50; cursor: default; margin-bottom: 5px; text-align: center; }
         
-        /* ÁREA PRINCIPAL (Fundo transparente para o mapa global aparecer) */
+        /* BOTÃO LINKEDIN (Menor e centralizado) */
+        .btn-linkedin {
+            background-color: #0077b5;
+            color: white;
+            text-align: center;
+            padding: 8px 25px;
+            text-decoration: none;
+            border-radius: 20px; /* Bordas mais redondinhas */
+            font-weight: bold;
+            font-size: 0.9rem;
+            transition: 0.2s;
+            align-self: center; /* Isso impede que ele ocupe 100% da largura */
+            margin-bottom: 10px;
+        }
+        .btn-linkedin:hover { background-color: #005a87; }
+        
+        /* ÁREA PRINCIPAL */
         .content { flex-grow: 1; display: flex; flex-direction: column; background-color: transparent; position: relative; }
         
-        /* SEÇÕES (Escondidas por padrão) */
+        /* SEÇÕES */
         .section { display: none; width: 100%; height: 100%; }
         .active-section { display: block; }
         
@@ -55,12 +74,12 @@
 <body>
 
     <div class="sidebar">
-        <h1>🌍 Ana Carolina</h1>
-        <p>Especialista em Geoprocessamento. Transformando coordenadas brutas em inteligência espacial.</p>
+        <h1>🌍 Ana Andrade</h1>
+        <p>Especialista em Geoprocessamento.</p>
         
         <h2>📁 Projetos (Abas)</h2>
-        <button onclick="openTab('app1', this)" class="btn active-tab">🔥 1. Monitor de Queimadas</button>
-        <button onclick="openTab('app2', this)" class="btn">🔌 2. Plugin Connect QGIS</button>
+        <button onclick="openTab('app1', this)" class="btn active-tab">🔥Monitor de Queimadas</button>
+        <button onclick="openTab('app2', this)" class="btn">🔌Plugin Connect QGIS</button>
         
         <h2>👩‍💻 Sobre meu Trabalho</h2>
         <p style="font-size: 0.95rem; color: #a8c1d9; line-height: 1.6; text-align: justify; background-color: rgba(0,0,0,0.2); padding: 15px; border-radius: 6px; border-left: 3px solid #4caf50;">
@@ -70,7 +89,7 @@
         <div style="flex-grow: 1;"></div>
         
         <h2>📬 Conexões</h2>
-        <a href="https://www.linkedin.com/in/ana-carolina-santos-3920931b3" target="_blank" class="btn" style="text-align: center; background-color: #0077b5; border: none;">LinkedIn</a>
+        <a href="https://www.linkedin.com/in/ana-carolina-santos-3920931b3" target="_blank" class="btn-linkedin">LinkedIn</a>
     </div>
 
     <div class="content">
@@ -84,7 +103,7 @@
                 <p style="font-size: 1.2rem; color: #a8c1d9;">Navegação ágil e inteligente entre grupos de camadas.</p>
                 
                 <div class="gif-container">
-                    <video width="100%" autoplay loop muted playsinline controls style="border-radius: 2px;">
+                    <video width="100%" autoplay loop muted playsinline controls style="border-radius: 4px;">
                         <source src="./Connect_GIS/connect_qgis.mp4" type="video/mp4">
                         Seu navegador não suporta a tag de vídeo.
                     </video>
@@ -103,9 +122,9 @@
                     </ul>
                     
                     <div style="margin-top: 25px; border-top: 1px solid #3b6998; padding-top: 15px;">
-                        <span class="btn-tech" style="display: inline-block; padding: 5px 10px; font-size: 0.8rem; border-color: #a8c1d9; color: #a8c1d9; background: transparent;">Python</span>
-                        <span class="btn-tech" style="display: inline-block; padding: 5px 10px; font-size: 0.8rem; border-color: #a8c1d9; color: #a8c1d9; background: transparent;">PyQGIS</span>
-                        <span class="btn-tech" style="display: inline-block; padding: 5px 10px; font-size: 0.8rem; border-color: #a8c1d9; color: #a8c1d9; background: transparent;">PyQt</span>
+                        <span class="btn" style="display: inline-block; width: auto; padding: 5px 10px; font-size: 0.8rem; border: 1px solid #4caf50; color: #4caf50; background: transparent; cursor: default;">Python</span>
+                        <span class="btn" style="display: inline-block; width: auto; padding: 5px 10px; font-size: 0.8rem; border: 1px solid #4caf50; color: #4caf50; background: transparent; cursor: default;">PyQGIS</span>
+                        <span class="btn" style="display: inline-block; width: auto; padding: 5px 10px; font-size: 0.8rem; border: 1px solid #4caf50; color: #4caf50; background: transparent; cursor: default;">PyQt</span>
                         
                         <a href="https://github.com/AnaAndradesant/Geoprocessamento/tree/main/Connect_GIS" target="_blank" style="float: right; padding: 8px 15px; background-color: #4caf50; color: white; text-decoration: none; border-radius: 4px; font-weight: bold; font-size: 0.9rem;">📁 Ver Código-Fonte</a>
                     </div>
@@ -115,7 +134,7 @@
 
         <div class="status-bar">
             <span>Sistema Web GIS Portfólio</span>
-            <span>Desenvolvido por Ana Carolina Andrade</span>
+            <span>Desenvolvido por Ana Andrade</span>
         </div>
     </div>
 
@@ -131,11 +150,20 @@
             
             // Remove a marcação de ativo de todos os botões
             var btns = document.getElementsByClassName('btn');
+            // Como o botão linkedin não tem mais a classe .btn, não haverá conflito aqui!
             for (var j = 0; j < btns.length; j++) {
                 btns[j].classList.remove('active-tab');
             }
             // Marca o botão clicado como ativo
             element.classList.add('active-tab');
+
+            // --- A MÁGICA DO MAPA ACONTECE AQUI ---
+            // Se a aba clicada for a 2 (Plugin), adicionamos o fundo do mapa. Se não, tiramos!
+            if (tabId === 'app2') {
+                document.body.classList.add('map-bg');
+            } else {
+                document.body.classList.remove('map-bg');
+            }
         }
     </script>
 </body>
