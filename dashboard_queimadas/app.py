@@ -18,8 +18,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
     menu_items={
         'About': """
-        ### 🛰️ Monitor de Queimadas (INPE)
-        Dashboard interativo para monitoramento de focos de calor e análise de risco em áreas protegidas.
+        ### 🛰️ Monitor de Queimadas Integrado
+        Dashboard interativo para monitoramento de focos de calor e análise de cicatrizes.
         Desenvolvido por Ana Carolina Andrade.
         """
     }
@@ -37,22 +37,19 @@ try:
     )
     ee.Initialize(credentials, project='ee-anacarolinasantos580')
 except Exception as e:
-    st.error(f"⚠️ Erro ao conectar com o Google Earth Engine.")
+    st.error(f"⚠️ Erro ao conectar com o Google Earth Engine. Verifique seus Secrets.")
 
-# Método para o Folium renderizar GEE com aviso de erro
-# Método para o Folium renderizar GEE com suporte a múltiplas versões da API
+# Método à prova de falhas para o Folium renderizar GEE
 def add_ee_layer(self, ee_image_object, vis_params, name, show=True, opacity=0.7):
-    import streamlit as st # Importado aqui para garantir que o aviso saia na tela
     try:
         map_id_dict = ee.Image(ee_image_object).getMapId(vis_params)
         
-        # O Pulo do Gato: Compatibilidade com diferentes versões do earthengine-api
+        # Compatibilidade com diferentes versões do earthengine-api
         if 'tile_fetcher' in map_id_dict:
             tiles_url = map_id_dict['tile_fetcher'].url_format
         elif 'urlFormat' in map_id_dict:
             tiles_url = map_id_dict['urlFormat']
         else:
-            # Se a API mudar de novo no futuro, tentamos pegar de forma genérica
             tiles_url = map_id_dict.get('url_format', '')
             
         folium.raster_layers.TileLayer(
@@ -65,7 +62,7 @@ def add_ee_layer(self, ee_image_object, vis_params, name, show=True, opacity=0.7
             opacity=opacity
         ).add_to(self)
     except Exception as e:
-        # Agora, se der erro, ele VAI aparecer na interface do Streamlit!
+        import streamlit as st
         st.error(f"🚨 Erro crítico ao desenhar a camada do Earth Engine: {e}")
 
 folium.Map.add_ee_layer = add_ee_layer
@@ -163,28 +160,36 @@ bioma_dd = st.sidebar.selectbox('Selecione o Bioma:', ["Amazônia", "Cerrado", "
 cidades_lista = buscar_cidades(estado_dd)
 municipio_dd = st.sidebar.selectbox('Selecione a Cidade:', cidades_lista, disabled=(tipo_analise != 'Por Município'))
 
-unidade_dd = st.sidebar.selectbox("Analisar por:", ["Dias", "Meses", "Anos"], index=1)
-if unidade_dd == "Dias": op_qtd = list(range(1, 91))
-elif unidade_dd == "Meses": op_qtd = list(range(1, 61))
-else: op_qtd = list(range(1, 11))
-quantidade_sel = st.sidebar.selectbox(f"Quantidade de {unidade_dd}:", options=op_qtd, index=1)
-
 # --- FONTES DE DADOS DINÂMICAS ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("📁 Fontes de Dados")
 
-ativar_inpe = st.sidebar.checkbox("🔥 Focos de Calor (INPE)", value=True)
+# Variáveis padrão para evitar erros
+unidade_dd = "Meses" 
+quantidade_sel = 1
 satelites_sel = []
+
+ativar_inpe = st.sidebar.checkbox("🔥 Focos de Calor (INPE)", value=True)
+
 if ativar_inpe:
-    satelites_lista = ['AQUA_M-T', 'NPP-375', 'NPP-375D', 'TERRA_M-T', 'NOAA-20', 'MSG-03']
-    satelites_sel = st.sidebar.multiselect("Satélites de Referência:", satelites_lista, default=['AQUA_M-T', 'NPP-375', 'NPP-375D'])
+    with st.sidebar.expander("⏱️ Filtros de Tempo e Satélite (INPE)", expanded=True):
+        unidade_dd = st.selectbox("Analisar por:", ["Dias", "Meses", "Anos"], index=1)
+        if unidade_dd == "Dias": op_qtd = list(range(1, 91))
+        elif unidade_dd == "Meses": op_qtd = list(range(1, 61))
+        else: op_qtd = list(range(1, 11))
+        quantidade_sel = st.selectbox(f"Quantidade de {unidade_dd}:", options=op_qtd, index=1)
+        
+        satelites_lista = ['AQUA_M-T', 'NPP-375', 'NPP-375D', 'TERRA_M-T', 'NOAA-20', 'MSG-03']
+        satelites_sel = st.multiselect("Satélites de Referência:", satelites_lista, default=['AQUA_M-T', 'NPP-375', 'NPP-375D'])
 
 st.sidebar.markdown("")
 
 ativar_modis = st.sidebar.checkbox("🗺️ Cicatrizes (NASA MODIS)", value=True)
+
 if ativar_modis:
-    ano_modis = st.sidebar.selectbox("Ano (MODIS):", list(range(2001, datetime.now().year + 1)), index=datetime.now().year - 2002)
-    mes_modis = st.sidebar.selectbox("Mês (MODIS):", list(range(1, 13)), index=7)
+    with st.sidebar.expander("📅 Filtros de Data (MODIS)", expanded=True):
+        ano_modis = st.selectbox("Ano:", list(range(2001, datetime.now().year + 1)), index=datetime.now().year - 2002)
+        mes_modis = st.selectbox("Mês:", list(range(1, 13)), index=7)
 
 st.sidebar.markdown("---")
 area_protegida = st.sidebar.selectbox("🌳 Análise de Risco (Cruzamento Espacial):", ["Nenhuma", "Terras Indígenas", "Unidades de Conservação"])
@@ -192,7 +197,7 @@ area_protegida = st.sidebar.selectbox("🌳 Análise de Risco (Cruzamento Espaci
 gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True)
 
 # --- INTERFACE (TELA PRINCIPAL) ---
-st.title("🔥 Dashboard de Queimadas 🔥")
+st.title("🔥 Dashboard Integrado 🔥")
 
 if gerar:
     if not ativar_inpe and not ativar_modis:
@@ -224,12 +229,11 @@ if gerar:
                 gdf = gpd.sjoin(gdf, limite, predicate="within")
                 df_rec = pd.DataFrame(gdf.drop(columns="geometry"))
 
-        status.update(label="✅ Consulta finalizada com sucesso!", state="complete", expanded=False)
+        status.update(label="✅ Consultas finalizadas!", state="complete", expanded=False)
 
     if ativar_inpe and df_rec.empty:
         st.warning("⚠️ Nenhum foco de calor detectado pelo INPE dentro do limite geográfico neste período.")
 
-    # Só para de rodar se não tiver INPE E também não tiver MODIS selecionado
     if not ativar_modis and df_rec.empty:
         st.stop()
 
@@ -240,10 +244,7 @@ if gerar:
     if ativar_inpe and not df_rec.empty and area_protegida != "Nenhuma":
         with st.status(f"🌳 Cruzando dados do INPE com {area_protegida}...", expanded=True) as status_area:
             try:
-                st.write("Baixando polígonos oficiais...")
                 gdf_areas = carregar_areas_protegidas(area_protegida)
-                
-                st.write("Realizando interseção espacial...")
                 gdf_areas = gdf_areas.to_crs(gdf.crs)
                 
                 if 'index_right' in gdf.columns: gdf = gdf.drop(columns=['index_right'])
@@ -260,11 +261,8 @@ if gerar:
                 st.error(f"🔍 Detalhe técnico do erro para debug: {e}")
 
     # --- CARD DE RESUMO ESTILIZADO ---
-    total_focos = len(df_rec) if ativar_inpe else 0
     data_limite = hoje.strftime("%d/%m/%Y")
-    
-    # Monta o texto do card de forma dinâmica
-    texto_resumo = f"🔥 Total INPE Confirmado: {total_focos:,} focos" if ativar_inpe else "🛰️ Exibindo apenas a camada do NASA MODIS"
+    texto_resumo = f"🔥 Total INPE Confirmado: {len(df_rec):,} focos" if ativar_inpe else "🛰️ Exibindo apenas a camada do NASA MODIS"
     
     card_html = f"""
     <div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; border-left: 8px solid #ff4b4b; margin-bottom: 15px; box-shadow: 1px 1px 4px rgba(0,0,0,0.05);">
@@ -278,14 +276,13 @@ if gerar:
     """
     st.markdown(card_html, unsafe_allow_html=True)
 
-    # --- ALERTAS DE RISCO (Apenas se tiver INPE ativo e cruzamento feito) ---
+    # --- ALERTAS DE RISCO (INPE) ---
     if ativar_inpe and not df_rec.empty:
         if not focos_em_areas.empty:
-            qtd_risco = len(focos_em_areas)
             df_ranking_areas = focos_em_areas['nome_area'].value_counts().reset_index()
             df_ranking_areas.columns = ['Área Protegida', 'Focos']
             
-            st.error(f"🚨 **ALERTA CRÍTICO:** {qtd_risco} focos detectados DENTRO de áreas protegidas!")
+            st.error(f"🚨 **ALERTA CRÍTICO:** {len(focos_em_areas)} focos detectados DENTRO de áreas protegidas!")
             
             col_alerta1, col_alerta2 = st.columns([1.5, 1])
             with col_alerta1:
@@ -293,14 +290,8 @@ if gerar:
                 titulo_dinamico = f"🔥 Top {qtd_areas} Áreas Mais Afetadas" if qtd_areas > 1 else "🔥 Área Mais Afetada"
                 
                 fig_areas = px.bar(
-                    df_ranking_areas.head(10), 
-                    x='Focos', 
-                    y='Área Protegida', 
-                    orientation='h', 
-                    text='Focos',
-                    color='Focos', 
-                    color_continuous_scale=px.colors.sequential.Reds,
-                    title=titulo_dinamico
+                    df_ranking_areas.head(10), x='Focos', y='Área Protegida', orientation='h', text='Focos',
+                    color='Focos', color_continuous_scale=px.colors.sequential.Reds, title=titulo_dinamico
                 )
                 fig_areas.update_layout(template='plotly_dark', yaxis={'categoryorder':'total ascending'}, height=350, margin=dict(t=40, b=20), coloraxis_showscale=False)
                 st.plotly_chart(fig_areas, use_container_width=True)
@@ -314,7 +305,6 @@ if gerar:
     
     st.markdown("---") 
     
-    # 2. BOTÃO DE DOWNLOAD (SÓ APARECE SE TIVER DADOS DO INPE)
     if ativar_inpe and not df_rec.empty:
         csv_dados = df_rec.to_csv(index=False).encode('utf-8')
         st.sidebar.download_button("📥 Baixar Dados INPE (CSV)", data=csv_dados, file_name=f"focos_{val_sel.replace(' ', '_')}.csv", mime="text/csv", use_container_width=True)
@@ -328,27 +318,26 @@ if gerar:
         
         folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}).add_to(m)
         
-        # --- CAMADA MODIS ---
+        # --- CAMADA MODIS COM RECORTE EXATO ---
         if ativar_modis:
             try:
-                bounds = limite.total_bounds
-                ee_geom = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
+                geom_unida = limite.geometry.union_all()
+                geojson_geom = geom_unida.__geo_interface__
+                ee_geom_complex = ee.Geometry(geojson_geom)
                 
                 data_ini = ee.Date.fromYMD(ano_modis, mes_modis, 1)
                 data_fim = data_ini.advance(1, 'month')
                 
-                # Filtra a coleção
                 colecao_modis = ee.ImageCollection('MODIS/061/MCD64A1') \
                     .filterDate(data_ini, data_fim) \
-                    .filterBounds(ee_geom)
+                    .filterBounds(ee_geom_complex)
                 
-                # VERIFICAÇÃO CRÍTICA: Checa se a NASA já tem dados para este mês
                 qtd_imagens = colecao_modis.size().getInfo()
                 
                 if qtd_imagens == 0:
-                    st.warning(f"⚠️ A imagem de cicatrizes do MODIS para **{mes_modis}/{ano_modis}** ainda não está disponível no servidor ou não há dados para esta região.")
+                    st.warning(f"⚠️ A imagem de cicatrizes do MODIS para **{mes_modis}/{ano_modis}** ainda não está disponível.")
                 else:
-                    area_queimada = colecao_modis.select('BurnDate').max().clip(ee_geom)
+                    area_queimada = colecao_modis.select('BurnDate').max().clip(ee_geom_complex)
                     area_queimada = area_queimada.updateMask(area_queimada.gt(0))
                     
                     m.add_ee_layer(area_queimada, {'min': 1, 'max': 366, 'palette': ['orange', 'red', 'darkred']}, 'Cicatrizes MODIS')
