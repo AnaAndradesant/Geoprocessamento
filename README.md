@@ -1,51 +1,57 @@
-# 🌍 Geo-Tools & Monitoramento Ambiental
+<p align="center">
+  <img src="https://images.unsplash.com/photo-1508614589041-895b88991e3e?q=80&w=2000&auto=format&fit=crop" alt="Geospatial Data Banner" width="100%" style="border-radius: 10px;">
+</p>
 
-Bem-vindo ao meu repositório de ferramentas geoespaciais! Aqui você encontrará soluções desenvolvidas para otimizar fluxos de trabalho no QGIS e monitorar dados ambientais críticos em tempo real.
+<h1 align="center">🌍 Ana Carolina Andrade | Portfólio de Geoprocessamento & Dados</h1>
 
-## 🛰️ 1. Dashboard de Queimadas (Web App)
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/QGIS-589632?style=for-the-badge&logo=qgis&logoColor=white" alt="QGIS">
+  <img src="https://img.shields.io/badge/GeoPandas-139C5A?style=for-the-badge&logo=pandas&logoColor=white" alt="GeoPandas">
+  <img src="https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white" alt="Streamlit">
+  <img src="https://img.shields.io/badge/PostGIS-336791?style=for-the-badge&logo=postgresql&logoColor=white" alt="PostGIS">
+</p>
 
-Um painel interativo e de alta performance para monitoramento de focos de calor em todo o território brasileiro, utilizando dados oficiais do INPE (BDQueimadas).
-
-🔗 **[Acesse o Dashboard Online Aqui](https://monitor-focos-queimadas.streamlit.app/)**
-
-### 📌 Funcionalidades
-* **Filtro Geográfico:** Análise por Estado, Município ou Bioma.
-* **Escala Temporal:** Consulta customizada por Dias, Meses ou Anos.
-* **Mapa de Calor:** Visualização espacial utilizando satélites de referência (AQUA e NPP).
-* **Análise de Dados:** Gráficos de evolução temporal e estatísticas confirmadas.
-
-### 🛠️ Tecnologias Utilizadas
-* **Python** (Streamlit, Pandas, Geopandas)
-* **Mapas:** Folium e Leaflet
-* **Dados:** API TerraBrasilis / INPE
+> *"Transformando coordenadas brutas e dados orbitais em inteligência espacial e ferramentas para tomada de decisão estratégica."*
 
 ---
 
-## 🔌 2. Plugin Connect (Para QGIS)
+## 🔥 PROJETO 1: Geo-Focos | Monitor de Queimadas Brasil
 
-O **Connect** é um plugin desenvolvido para o QGIS 3 que permite navegar entre grupos de camadas de forma rápida e prática, ideal para quem trabalha com projetos complexos e muitas camadas.
+Um Web App interativo que consome dados da API oficial do INPE (BDQueimadas) em tempo real para monitorar anomalias térmicas. O diferencial é o motor de análise espacial (**Spatial Join**), que cruza coordenadas de satélite com polígonos de Terras Indígenas e Unidades de Conservação, emitindo alertas críticos automatizados.
 
-### 📌 O que ele faz
-O Connect permite alternar entre grupos da árvore de camadas, ativando apenas um grupo por vez. Isso facilita comparações visuais, análises de cenários e organização geral do projeto.
+### 🗺️ Dashboard Interativo
+*Navegue pelo mapa e pelos filtros diretamente aqui no portfólio:*
 
-### 🚀 Funcionalidades Principais
+<p align="center">
+  <iframe src="https://monitor-focos-queimadas.streamlit.app/?embedded=true" width="100%" height="650" style="border: 2px solid #333; border-radius: 8px;"></iframe>
+</p>
+
+* **Tecnologias:** `Python`, `GeoPandas`, `Folium`, `Streamlit`, `API REST`
+* 🔗 **[Acessar o Web App em Tela Cheia](https://monitor-focos-queimadas.streamlit.app/)** | 📁 **[Ver Código-Fonte](./dashboard_queimadas)**
+
+---
+
+## 🔌 PROJETO 2: Plugin Connect (Para QGIS 3)
+
+O **Connect** é um plugin desenvolvido nativamente para o QGIS 3. Ele foi criado para otimizar o fluxo de trabalho de quem lida com projetos complexos, permitindo navegar entre grupos de camadas de forma rápida e prática.
+
+**🚀 Funcionalidades Principais:**
 * **Integração Nativa:** Adicione grupos ao Connect diretamente pelo menu de contexto (botão direito).
-* **Navegação Ágil:** Use as teclas `↑` e `↓` para alternar entre grupos.
+* **Navegação Ágil:** Use as teclas `↑` e `↓` para alternar entre grupos (o plugin oculta o grupo atual e ativa o próximo automaticamente).
 * **Atalho Inteligente:** Tecla `F9` para abrir/fechar o painel rapidamente.
 * **Organização Flexível:** Reordene grupos por *drag-and-drop* (arrastar e soltar).
-* **Persistência:** Salva automaticamente o estado das listas dentro do seu projeto `.qgs` / `.qgz`.
+* **Persistência de Dados:** Salva automaticamente o estado das listas dentro do seu arquivo de projeto `.qgs` / `.qgz`.
 
-### 🎮 Como Usar
-1. Clique com o botão direito em um grupo na árvore de camadas do QGIS.
-2. Selecione *"Connect: Adicionar grupo"*.
-3. No painel do Connect, use as setas ou botões para navegar. O plugin ocultará o grupo atual e ativará o próximo automaticamente.
-
-### ⚙️ Compatibilidade
-* **QGIS 3.22** ou superior.
+**⚙️ Tecnologias e Compatibilidade:** * `Python`, `PyQGIS` (API do QGIS), `PyQt`
+* Compatível com **QGIS 3.22** ou superior.
+* 📁 **[Ver Código-Fonte do Plugin](./Connect_GIS)**
 
 ---
 
-## 👤 Autora
-**Ana Carolina Andrade** Especialista em geoprocessamento e desenvolvimento de soluções geoespaciais.
+## 📬 Vamos nos conectar?
 
-💡 *Este repositório é atualizado constantemente com novas melhorias e ferramentas.*
+Se você busca soluções em inteligência geográfica, automação de mapas, desenvolvimento de plugins QGIS ou monitoramento ambiental, sinta-se à vontade para entrar em contato:
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/ana-carolina-santos-3920931b3)
+[![GitHub](https://img.shields.io/badge/GitHub-100000?style=for-the-badge&logo=github&logoColor=white)](https://github.com/AnaAndradesant)
