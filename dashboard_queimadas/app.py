@@ -40,11 +40,23 @@ except Exception as e:
     st.error(f"⚠️ Erro ao conectar com o Google Earth Engine.")
 
 # Método para o Folium renderizar GEE com aviso de erro
+# Método para o Folium renderizar GEE com suporte a múltiplas versões da API
 def add_ee_layer(self, ee_image_object, vis_params, name, show=True, opacity=0.7):
+    import streamlit as st # Importado aqui para garantir que o aviso saia na tela
     try:
         map_id_dict = ee.Image(ee_image_object).getMapId(vis_params)
+        
+        # O Pulo do Gato: Compatibilidade com diferentes versões do earthengine-api
+        if 'tile_fetcher' in map_id_dict:
+            tiles_url = map_id_dict['tile_fetcher'].url_format
+        elif 'urlFormat' in map_id_dict:
+            tiles_url = map_id_dict['urlFormat']
+        else:
+            # Se a API mudar de novo no futuro, tentamos pegar de forma genérica
+            tiles_url = map_id_dict.get('url_format', '')
+            
         folium.raster_layers.TileLayer(
-            tiles=map_id_dict['tile_fetcher'].url_format,
+            tiles=tiles_url,
             attr='Map Data © Google Earth Engine',
             name=name,
             overlay=True,
@@ -53,8 +65,9 @@ def add_ee_layer(self, ee_image_object, vis_params, name, show=True, opacity=0.7
             opacity=opacity
         ).add_to(self)
     except Exception as e:
-        print(f"Erro ao adicionar camada EE no mapa: {e}") # Mostra o erro no terminal para ajudar no debug
-        
+        # Agora, se der erro, ele VAI aparecer na interface do Streamlit!
+        st.error(f"🚨 Erro crítico ao desenhar a camada do Earth Engine: {e}")
+
 folium.Map.add_ee_layer = add_ee_layer
 
 # --- FUNÇÕES COM CACHE ---
