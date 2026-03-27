@@ -181,13 +181,24 @@ if gerar:
         df_modis_areas = pd.DataFrame()
         area_queimada_img = None
         if ativar_modis:
-            st.write("☁️ Analisando satélite MODIS no GEE...")
-            data_ini_ee = ee.Date.fromYMD(ano_modis, mes_modis, 1)
-            colecao = ee.ImageCollection('MODIS/061/MCD64A1').filterDate(data_ini_ee, data_ini_ee.advance(1, 'month')).filterBounds(ee_geom_complex)
-            if colecao.size().getInfo() > 0:
-                area_queimada_img = colecao.select('BurnDate').max().clip(ee_geom_complex)
-                img_area_ha = ee.Image.pixelArea().divide(10000).updateMask(area_queimada_img.gt(0)).rename('area_ha')
-                total_ha_modis = round(img_area_ha.reduceRegion(reducer=ee.Reducer.sum(), geometry=ee_geom_complex, scale=500).getInfo().get('area_ha', 0), 2)
+            st.write("☁️ Analisando satélite MODIS no GEE (pode demorar em áreas grandes)...")
+            try:
+                data_ini_ee = ee.Date.fromYMD(ano_modis, mes_modis, 1)
+                colecao = ee.ImageCollection('MODIS/061/MCD64A1').filterDate(data_ini_ee, data_ini_ee.advance(1, 'month')).filterBounds(ee_geom_complex)
+                if colecao.size().getInfo() > 0:
+                    area_queimada_img = colecao.select('BurnDate').max().clip(ee_geom_complex)
+                    img_area_ha = ee.Image.pixelArea().divide(10000).updateMask(area_queimada_img.gt(0)).rename('area_ha')
+                    
+                    stats_total = img_area_ha.reduceRegion(
+                        reducer=ee.Reducer.sum(), 
+                        geometry=ee_geom_complex, 
+                        scale=500, 
+                        maxPixels=1e13,
+                        bestEffort=True 
+                    ).getInfo()
+                    total_ha_modis = round(stats_total.get('area_ha', 0) if stats_total.get('area_ha') else 0, 2)
+            except Exception as e:
+                st.warning("⚠️ Escala muito grande para cálculo total de hectares. O mapa visual continuará carregando.")
 
         focos_em_areas = pd.DataFrame()
         areas_afetadas = gpd.GeoDataFrame()
@@ -204,14 +215,17 @@ if gerar:
                     areas_afetadas = gdf_areas[gdf_areas['nome_area'].isin(focos_em_areas['nome_area'])]
 
                 if ativar_modis and total_ha_modis > 0:
-                    features_ee = [ee.Feature(ee.Geometry(row['geometry'].__geo_interface__), {'nome_area': row['nome_area']}) for _, row in gdf_areas.iterrows()]
-                    fc_areas = ee.FeatureCollection(features_ee)
-                    stats = img_area_ha.reduceRegions(collection=fc_areas, reducer=ee.Reducer.sum(), scale=500).getInfo()
-                    recs = [{'Área Protegida': f['properties']['nome_area'], 'Hectares': round(f['properties'].get('sum', 0), 2)} for f in stats['features'] if f['properties'].get('sum', 0) > 0]
-                    df_modis_areas = pd.DataFrame(recs).sort_values(by='Hectares', ascending=False)
-                    if not df_modis_areas.empty:
-                        areas_modis = gdf_areas[gdf_areas['nome_area'].isin(df_modis_areas['Área Protegida'])]
-                        areas_afetadas = pd.concat([areas_afetadas, areas_modis]).drop_duplicates(subset=['nome_area'])
+                    try:
+                        features_ee = [ee.Feature(ee.Geometry(row['geometry'].__geo_interface__), {'nome_area': row['nome_area']}) for _, row in gdf_areas.iterrows()]
+                        fc_areas = ee.FeatureCollection(features_ee)
+                        stats = img_area_ha.reduceRegions(collection=fc_areas, reducer=ee.Reducer.sum(), scale=500).getInfo()
+                        recs = [{'Área Protegida': f['properties']['nome_area'], 'Hectares': round(f['properties'].get('sum', 0), 2)} for f in stats['features'] if f['properties'].get('sum', 0) > 0]
+                        df_modis_areas = pd.DataFrame(recs).sort_values(by='Hectares', ascending=False)
+                        if not df_modis_areas.empty:
+                            areas_modis = gdf_areas[gdf_areas['nome_area'].isin(df_modis_areas['Área Protegida'])]
+                            areas_afetadas = pd.concat([areas_afetadas, areas_modis]).drop_duplicates(subset=['nome_area'])
+                    except:
+                        st.warning("⚠️ Falha ao cruzar hectares do MODIS com áreas protegidas nesta escala.")
 
         status.update(label="✅ Dashboard pronto!", state="complete", expanded=False)
 
