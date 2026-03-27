@@ -39,7 +39,7 @@ try:
 except Exception as e:
     st.error(f"⚠️ Erro ao conectar com o Google Earth Engine.")
 
-# Método para o Folium renderizar GEE
+# Método para o Folium renderizar GEE com aviso de erro
 def add_ee_layer(self, ee_image_object, vis_params, name, show=True, opacity=0.7):
     try:
         map_id_dict = ee.Image(ee_image_object).getMapId(vis_params)
@@ -52,7 +52,9 @@ def add_ee_layer(self, ee_image_object, vis_params, name, show=True, opacity=0.7
             show=show,
             opacity=opacity
         ).add_to(self)
-    except: pass
+    except Exception as e:
+        print(f"Erro ao adicionar camada EE no mapa: {e}") # Mostra o erro no terminal para ajudar no debug
+        
 folium.Map.add_ee_layer = add_ee_layer
 
 # --- FUNÇÕES COM CACHE ---
@@ -322,15 +324,22 @@ if gerar:
                 data_ini = ee.Date.fromYMD(ano_modis, mes_modis, 1)
                 data_fim = data_ini.advance(1, 'month')
                 
-                area_queimada = ee.ImageCollection('MODIS/061/MCD64A1') \
+                # Filtra a coleção
+                colecao_modis = ee.ImageCollection('MODIS/061/MCD64A1') \
                     .filterDate(data_ini, data_fim) \
-                    .filterBounds(ee_geom) \
-                    .select('BurnDate') \
-                    .max() \
-                    .clip(ee_geom)
+                    .filterBounds(ee_geom)
                 
-                area_queimada = area_queimada.updateMask(area_queimada.gt(0))
-                m.add_ee_layer(area_queimada, {'min': 1, 'max': 366, 'palette': ['orange', 'red', 'darkred']}, 'MODIS')
+                # VERIFICAÇÃO CRÍTICA: Checa se a NASA já tem dados para este mês
+                qtd_imagens = colecao_modis.size().getInfo()
+                
+                if qtd_imagens == 0:
+                    st.warning(f"⚠️ A imagem de cicatrizes do MODIS para **{mes_modis}/{ano_modis}** ainda não está disponível no servidor ou não há dados para esta região.")
+                else:
+                    area_queimada = colecao_modis.select('BurnDate').max().clip(ee_geom)
+                    area_queimada = area_queimada.updateMask(area_queimada.gt(0))
+                    
+                    m.add_ee_layer(area_queimada, {'min': 1, 'max': 366, 'palette': ['orange', 'red', 'darkred']}, 'Cicatrizes MODIS')
+                    
             except Exception as e:
                 st.error(f"❌ Erro ao processar MODIS: {e}")
 
