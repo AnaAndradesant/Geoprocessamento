@@ -285,6 +285,7 @@ if gerar:
 
         # --- ANÁLISE DE ÁREAS PROTEGIDAS ---
         focos_em_areas = pd.DataFrame()
+        gdf_areas = None  # será populado se área protegida estiver ativa
         areas_afetadas_final = gpd.GeoDataFrame({'nome_area': pd.Series(dtype=str), 'geometry': pd.Series(dtype=object)})
         areas_afetadas_final = areas_afetadas_final.set_geometry('geometry')
         areas_afetadas_final.crs = None  # será definido no primeiro concat
@@ -405,8 +406,9 @@ if gerar:
                 st.plotly_chart(fig_modis, use_container_width=True)
 
     # --- MAPA E GRÁFICOS DE EVOLUÇÃO ---
-    # FIX: layout melhorado — mapa ocupa linha inteira, gráficos de evolução em linha separada
     st.subheader("🗺️ Mapa de Calor e Cicatrizes")
+    if area_protegida != "Nenhuma":
+        st.caption(f"🔎 Exibindo somente focos e cicatrizes **dentro das {area_protegida}** com registro de fogo.")
     centro = limite.geometry.unary_union.centroid
     m = folium.Map(
         location=[centro.y, centro.x],
@@ -420,8 +422,22 @@ if gerar:
     ).add_to(m)
 
     if area_queimada_img:
+        # FIX: recorta MODIS pela geometria de TODAS as áreas protegidas do limite (não só afetadas)
+        # Isso garante que o clip acontece mesmo se areas_afetadas_final estiver vazio
+        if area_protegida != "Nenhuma" and gdf_areas is not None and not gdf_areas.empty:
+            try:
+                geom_areas = gdf_areas.geometry.unary_union
+                # simplifica para reduzir payload enviado ao Earth Engine
+                geom_areas = geom_areas.simplify(tolerance=0.01, preserve_topology=True)
+                ee_geom_areas = ee.Geometry(geom_areas.__geo_interface__)
+                img_exibir = area_queimada_img.clip(ee_geom_areas).updateMask(area_queimada_img.gt(0))
+            except Exception:
+                # fallback: usa limite completo se geometria for inválida para o EE
+                img_exibir = area_queimada_img.clip(ee_geom_complex).updateMask(area_queimada_img.gt(0))
+        else:
+            img_exibir = area_queimada_img.clip(ee_geom_complex).updateMask(area_queimada_img.gt(0))
         m.add_ee_layer(
-            area_queimada_img.updateMask(area_queimada_img.gt(0)),
+            img_exibir,
             {'min': 1, 'max': 366, 'palette': ['orange', 'red', 'darkred']},
             'MODIS'
         )
@@ -437,8 +453,16 @@ if gerar:
             tooltip=folium.GeoJsonTooltip(fields=['nome_area'], aliases=[area_protegida + ':'])
         ).add_to(m)
 
-    if ativar_inpe and not df_inpe_rec.empty:
-        HeatMap(df_inpe_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15).add_to(m)
+    # FIX: heatmap mostra apenas focos dentro das áreas protegidas quando selecionado
+    if ativar_inpe:
+        if area_protegida != "Nenhuma" and not focos_em_areas.empty:
+            df_heatmap = focos_em_areas[["latitude", "longitude"]].dropna()
+        elif not df_inpe_rec.empty:
+            df_heatmap = df_inpe_rec[["latitude", "longitude"]].dropna()
+        else:
+            df_heatmap = pd.DataFrame()
+        if not df_heatmap.empty:
+            HeatMap(df_heatmap.values.tolist(), radius=15).add_to(m)
 
     st_folium(m, width="100%", height=520, returned_objects=[])
 
@@ -447,9 +471,12 @@ if gerar:
     col_ev1, col_ev2 = st.columns(2)
 
     with col_ev1:
-        if ativar_inpe and not df_inpe_rec.empty:
-            df_inpe_rec['data_hora_gmt'] = pd.to_datetime(df_inpe_rec['data_hora_gmt'])
-            df_t = (df_inpe_rec
+        # FIX: gráfico de evolução filtra pelos focos da área protegida quando selecionada
+        df_evolucao_inpe = focos_em_areas if (area_protegida != "Nenhuma" and not focos_em_areas.empty) else df_inpe_rec
+        if ativar_inpe and not df_evolucao_inpe.empty:
+            df_evolucao_inpe = df_evolucao_inpe.copy()
+            df_evolucao_inpe['data_hora_gmt'] = pd.to_datetime(df_evolucao_inpe['data_hora_gmt'])
+            df_t = (df_evolucao_inpe
                     .set_index('data_hora_gmt')
                     .resample('D').size()
                     .reset_index(name='Focos'))
