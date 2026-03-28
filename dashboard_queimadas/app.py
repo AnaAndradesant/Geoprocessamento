@@ -152,26 +152,22 @@ area_protegida = st.sidebar.selectbox("🌳 Análise de Risco (Cruzamento Espaci
 
 gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True)
 
-# --- SEÇÃO DE CONTATO INSERIDA AQUI ---
 # --- SEÇÃO DE CONTATO ---
 st.sidebar.markdown("---")
+st.sidebar.markdown("**Desenvolvido por:**")
 
-contato_html = """
-<div style="text-align: center; margin-top: 10px;">
-    <p style="margin-bottom: 10px; font-size: 14px; font-weight: bold; color: #b2bec3;">Desenvolvido por:</p>
-    
-    <a href="https://www.linkedin.com/in/ana-carolina-santos-3920931b3" target="_blank" rel="noopener noreferrer" style="display: block; background-color: #0A66C2; color: white; text-decoration: none; padding: 10px; border-radius: 8px; font-weight: bold; margin-bottom: 10px; text-align: center;">
-        🔗 LinkedIn
-    </a>
+# Botões nativos do Streamlit (sem depender de HTML)
+st.sidebar.link_button(
+    "🔗 LinkedIn", 
+    "https://www.linkedin.com/in/ana-carolina-santos-3920931b3", 
+    use_container_width=True
+)
 
-    <a href="mailto:anacarolinasantos580@gmail.com" style="display: block; background-color: #2b2b2b; color: white; text-decoration: none; padding: 10px; border-radius: 8px; font-weight: bold; text-align: center;">
-        ✉️ E-mail
-    </a>
-</div>
-"""
-
-# O parâmetro unsafe_allow_html=True é o que "libera" os botões aparecerem!
-st.sidebar.markdown(contato_html, unsafe_allow_html=True)
+st.sidebar.link_button(
+    "✉️ E-mail", 
+    "mailto:anacarolinasantos580@gmail.com", 
+    use_container_width=True
+)
 # -------------------------------------
 
 
