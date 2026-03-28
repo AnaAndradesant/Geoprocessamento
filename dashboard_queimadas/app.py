@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import geopandas as gpd
 from datetime import datetime, timedelta
-from geobr import read_state, read_biomes, read_municipality, read_indigenous_land, read_conservation_units 
+from geobr import read_state, read_biomes, read_municipality, read_indigenous_land, read_conservation_units
 import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
@@ -227,7 +227,6 @@ if gerar:
                     gdf_areas = carregar_areas_protegidas(area_protegida)
                     gdf_areas = gdf_areas.to_crs(gdf.crs)
                     
-                    # CORREÇÃO: Remover 'index_right' do sjoin anterior
                     if 'index_right' in gdf.columns:
                         gdf = gdf.drop(columns=['index_right'])
                         
@@ -239,7 +238,6 @@ if gerar:
                         df_ranking_areas = focos_em_areas['nome_area'].value_counts().reset_index()
                         df_ranking_areas.columns = ['Área Protegida', 'Valor']
                         
-                        # Filtra o DataFrame principal (Deixa só os focos nas TIs/UCs)
                         df_rec = focos_em_areas
                         total_valor = len(df_rec)
                     else:
@@ -252,7 +250,7 @@ if gerar:
         else:
             st.write("☁️ Analisando satélite MODIS no GEE...")
             try:
-                # 1. Carrega imagem base do mês selecionado para o mapa principal
+                # 1. Carrega imagem base
                 data_ini_ee = ee.Date.fromYMD(ano_modis, mes_modis, 1)
                 colecao = ee.ImageCollection('MODIS/061/MCD64A1').filterDate(data_ini_ee, data_ini_ee.advance(1, 'month')).filterBounds(ee_geom_complex)
                 
@@ -265,7 +263,7 @@ if gerar:
                     ).getInfo()
                     total_valor = round(stats_total.get('area_km2', 0) if stats_total.get('area_km2') else 0, 2)
 
-                    # 2. Cruzamento Espacial MODIS (Recorte da Imagem e Tabela de Áreas)
+                    # 2. Cruzamento Espacial MODIS
                     if area_protegida != "Nenhuma" and total_valor > 0:
                         st.write(f"🌳 Isolando km² afetados em {area_protegida}...")
                         gdf_areas_br = carregar_areas_protegidas(area_protegida)
@@ -281,8 +279,6 @@ if gerar:
                             df_ranking_areas = pd.DataFrame(recs).sort_values(by='Valor', ascending=False)
                             if not df_ranking_areas.empty:
                                 areas_afetadas = gdf_areas[gdf_areas['nome_area'].isin(df_ranking_areas['Área Protegida'])]
-                                
-                                # Atualiza total_valor e recorta a imagem para as TIs/UCs afetadas
                                 total_valor = round(df_ranking_areas['Valor'].sum(), 2)
                                 ee_geom_afetadas = ee.Geometry(areas_afetadas.geometry.union_all().__geo_interface__)
                                 area_queimada_img = area_queimada_img.clip(ee_geom_afetadas)
@@ -290,21 +286,19 @@ if gerar:
                             else:
                                 total_valor = 0
 
-                    # 3. Ranking de Municípios MODIS (Calculado sempre que não for análise por município)
+                    # 3. Ranking de Municípios MODIS
                     if tipo_analise != "Por Município" and total_valor > 0:
                         st.write("🏙️ Calculando ranking de municípios (MODIS)...")
                         muns_ee = ee.FeatureCollection("FAO/GAUL/2015/level2").filterBounds(ee_geom_complex)
-                        # O img_area_km2 já está recortado pela TI se o filtro estiver ativo!
                         stats_mun = img_area_km2.reduceRegions(collection=muns_ee, reducer=ee.Reducer.sum(), scale=1000).getInfo()
                         
                         recs_mun = [{'Município': f['properties']['ADM2_NAME'], 'Valor': round(f['properties'].get('sum', 0), 2)} for f in stats_mun['features'] if f['properties'].get('sum', 0) > 0]
                         if recs_mun:
                             df_top_mun_modis = pd.DataFrame(recs_mun).sort_values(by='Valor', ascending=False).head(5)
 
-                    # 4. Evolução Temporal MODIS (12 meses do ano selecionado)
+                    # 4. Evolução Temporal MODIS
                     if total_valor > 0:
                         st.write("📊 Calculando série temporal anual (MODIS)...")
-                        # Define qual geometria usar para a série temporal
                         geom_temporal = ee_geom_afetadas if (area_protegida != "Nenhuma" and not areas_afetadas.empty) else ee_geom_complex
                         
                         def calc_mes(m):
@@ -316,7 +310,6 @@ if gerar:
                             val = area_calc.reduceRegion(reducer=ee.Reducer.sum(), geometry=geom_temporal, scale=1000, maxPixels=1e10).get('area')
                             return ee.Feature(None, {'mes': m_num, 'area': val})
                         
-                        # Mapeia a função sobre os 12 meses do ano
                         meses_list = ee.List.sequence(1, 12)
                         fc_meses = ee.FeatureCollection(meses_list.map(calc_mes)).getInfo()
                         
@@ -331,7 +324,7 @@ if gerar:
         status.update(label="✅ Análise concluída!", state="complete", expanded=False)
 
     # ==========================================
-    # RENDERIZAÇÃO VISUAL (Serve para INPE e MODIS)
+    # RENDERIZAÇÃO VISUAL 
     # ==========================================
     if total_valor == 0:
         st.error("⚠️ Nenhum registro detectado nos limites selecionados.")
@@ -382,22 +375,42 @@ if gerar:
         with col1:
             st.subheader("🗺️ Mapa Espacial")
             centro = limite.geometry.union_all().centroid
-            m = folium.Map(location=[centro.y, centro.x], zoom_start=10 if tipo_analise == "Por Município" else 6, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Satélite')
             
-            folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}).add_to(m)
+            # MAPA INICIAL: ESTILO CLEAN (Positron) COMO PADRÃO
+            m = folium.Map(
+                location=[centro.y, centro.x], 
+                zoom_start=10 if tipo_analise == "Por Município" else 6, 
+                tiles='CartoDB positron',
+                name='Estilo Claro (Clean)'
+            )
+            
+            # ADICIONA AS OUTRAS OPÇÕES DE ESTILO NO MENU
+            folium.TileLayer('CartoDB dark_matter', name='Estilo Escuro').add_to(m)
+            folium.TileLayer('OpenStreetMap', name='Padrão (Ruas)').add_to(m)
+            folium.TileLayer(
+                tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', 
+                attr='Google Satélite', 
+                name='Satélite (Google)'
+            ).add_to(m)
+            
+            folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}, name='Limites Geográficos').add_to(m)
             
             if not areas_afetadas.empty:
                 estilo_tooltip = "font-size: 12px; max-width: 250px; white-space: normal; background-color: white; color: black; border-radius: 4px; box-shadow: 2px 2px 5px rgba(0,0,0,0.3);"
                 folium.GeoJson(
                     areas_afetadas.__geo_interface__, 
                     style_function=lambda x: {'fillColor': 'transparent', 'color': '#c0392b', 'weight': 3},
-                    tooltip=folium.GeoJsonTooltip(fields=['nome_area'], aliases=['Área Protegida:'], style=estilo_tooltip)
+                    tooltip=folium.GeoJsonTooltip(fields=['nome_area'], aliases=['Área Protegida:'], style=estilo_tooltip),
+                    name='Áreas de Risco'
                 ).add_to(m)
 
             if "INPE" in fonte_escolhida and not df_rec.empty:
-                HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=20).add_to(m)
+                HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=20, name='Focos de Calor (Calor)').add_to(m)
             elif "MODIS" in fonte_escolhida and area_queimada_img:
-                m.add_ee_layer(area_queimada_img.updateMask(area_queimada_img.gt(0)), {'min': 1, 'max': 366, 'palette': ['orange', 'red', 'darkred']}, 'MODIS Burned Area')
+                m.add_ee_layer(area_queimada_img.updateMask(area_queimada_img.gt(0)), {'min': 1, 'max': 366, 'palette': ['orange', 'red', 'darkred']}, 'MODIS Área Queimada')
+
+            # CONTROLE DE CAMADAS (O BOTÃO MÁGICO) ADICIONADO AQUI NO FINAL
+            folium.LayerControl(collapsed=True).add_to(m)
 
             st_folium(m, width=700, height=750, returned_objects=[])
         
@@ -416,7 +429,6 @@ if gerar:
                 fig_line.update_layout(template='plotly_dark', xaxis_title="Tempo", yaxis_title="Nº de Focos", margin=dict(t=20, b=20))
                 st.plotly_chart(fig_line, use_container_width=True)
 
-                # Gráfico de Municípios INPE (Aparece mesmo com filtro de área protegida)
                 if 'municipio' in df_rec.columns and tipo_analise != "Por Município":
                     df_top_mun = df_rec['municipio'].value_counts().reset_index()
                     qtd_mun = min(5, len(df_top_mun))
@@ -438,7 +450,6 @@ if gerar:
                     fig_line.update_layout(template='plotly_dark', xaxis_title="Mês", yaxis_title="Área Afetada (km²)", margin=dict(t=20, b=20))
                     st.plotly_chart(fig_line, use_container_width=True)
 
-                # Gráfico de Municípios MODIS (Aparece mesmo com filtro de área protegida)
                 if tipo_analise != "Por Município" and not df_top_mun_modis.empty:
                     st.subheader("🏆 Top 5 Municípios Afetados")
                     fig_bar = px.bar(df_top_mun_modis, x='Valor', y='Município', orientation='h', text='Valor', color='Valor', color_continuous_scale=px.colors.sequential.Reds)
