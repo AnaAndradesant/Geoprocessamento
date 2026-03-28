@@ -158,18 +158,20 @@ st.sidebar.markdown("---")
 # Título centralizado
 st.sidebar.markdown("<h3 style='text-align: center; margin-bottom: 5px;'>Contatos</h3>", unsafe_allow_html=True)
 
-# Botão nativo para o LinkedIn (nunca vai bugar ou mostrar código)
+# Botão nativo para o LinkedIn
 st.sidebar.link_button(
     "🔗 LinkedIn", 
     "https://www.linkedin.com/in/ana-carolina-santos-3920931b3", 
     use_container_width=True
 )
 
-# E-mail usando formatação limpa e clicável
+# Link direto que força a abertura do Gmail no navegador
+gmail_link = "https://mail.google.com/mail/?view=cm&fs=1&to=anacarolinasantos580@gmail.com"
+
 st.sidebar.markdown(
-    "<div style='text-align: center; margin-top: 10px;'>"
-    "<a href='mailto:anacarolinasantos580@gmail.com' style='color: #ff4b4b; text-decoration: none; font-size: 15px;'>✉️ anacarolinasantos580@gmail.com</a>"
-    "</div>", 
+    f"<div style='text-align: center; margin-top: 10px;'>"
+    f"<a href='{gmail_link}' target='_blank' style='color: #ff4b4b; text-decoration: none; font-size: 15px;'>✉️ anacarolinasantos580@gmail.com</a>"
+    f"</div>", 
     unsafe_allow_html=True
 )
 # -------------------------------------
