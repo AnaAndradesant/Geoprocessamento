@@ -152,24 +152,22 @@ area_protegida = st.sidebar.selectbox("🌳 Análise de Risco (Cruzamento Espaci
 
 gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True)
 
-# --- SEÇÃO DE CONTATO ATUALIZADA ---
+# --- SEÇÃO DE CONTATO ---
 st.sidebar.markdown("---")
 
-# URLs de imagens para logotipos oficiais (Wikipedia é geralmente estável)
-gmail_logo_url = "https://upload.wikimedia.org/wikipedia/commons/7/7e/Gmail_icon_%282020%29.svg" # Novo logo M colorido
-linkedin_logo_url = "https://upload.wikimedia.org/wikipedia/commons/c/ca/LinkedIn_logo_initials.png" # Logo 'in' branco
+gmail_logo_url = "https://upload.wikimedia.org/wikipedia/commons/7/7e/Gmail_icon_%282020%29.svg"
+linkedin_logo_url = "https://upload.wikimedia.org/wikipedia/commons/c/ca/LinkedIn_logo_initials.png"
 
-# Código HTML e CSS atualizado (COM INDENTAÇÃO ZERADA NO CANTO ESQUERDO)
 html_contato_novo = f"""
 <div style="text-align: center;">
-<h2 style="font-family: serif; font-size: 26px; margin-top: 10px; margin-bottom: 15px; color: white;">ANA ANDRADE</h2>
-<hr style="border: 0; border-top: 1px solid #e0e0e0; margin-bottom: 20px;">
+<h2 style="font-family: serif; font-size: 24px; margin-top: 10px; margin-bottom: 15px; color: inherit;">ANA ANDRADE</h2>
+<hr style="border: 0; border-top: 1px solid #e0e0e0; margin-bottom: 15px;">
 <div style="display: flex; justify-content: space-between; gap: 10px;">
-<a href="https://mail.google.com/mail/?view=cm&fs=1&to=anacarolinasantos580@gmail.com" target="_blank" style="flex: 1; text-decoration: none; background-color: #ffffff; border: 1px solid #e0e0e0; border-radius: 10px; padding: 20px; color: #333; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
-<img src="{gmail_logo_url}" alt="Gmail Logo" style="width: 40px; height: auto; display: block; margin: 0 auto;">
+<a href="https://mail.google.com/mail/?view=cm&fs=1&to=anacarolinasantos580@gmail.com" target="_blank" style="flex: 1; text-decoration: none; background-color: #ffffff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); display: flex; justify-content: center; align-items: center;">
+<img src="{gmail_logo_url}" alt="Gmail Logo" style="width: 26px; height: auto; display: block; margin: 0 auto;">
 </a>
-<a href="https://www.linkedin.com/in/ana-carolina-santos-3920931b3" target="_blank" style="flex: 1; text-decoration: none; background-color: #0077B5; border-radius: 10px; padding: 20px; color: white; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">
-<img src="{linkedin_logo_url}" alt="LinkedIn Logo" style="width: 32px; height: auto; display: block; margin: 0 auto;">
+<a href="https://www.linkedin.com/in/ana-carolina-santos-3920931b3" target="_blank" style="flex: 1; text-decoration: none; background-color: #0077B5; border-radius: 8px; padding: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); display: flex; justify-content: center; align-items: center;">
+<img src="{linkedin_logo_url}" alt="LinkedIn Logo" style="width: 22px; height: auto; display: block; margin: 0 auto;">
 </a>
 </div>
 </div>
