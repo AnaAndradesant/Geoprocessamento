@@ -152,6 +152,54 @@ area_protegida = st.sidebar.selectbox("🌳 Análise de Risco (Cruzamento Espaci
 
 gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True)
 
+# --- SEÇÃO DE CONTATO INSERIDA AQUI ---
+st.sidebar.markdown("---")
+contato_html = """
+<style>
+.contact-container {
+    text-align: center;
+    margin-top: 10px;
+}
+.btn-contact {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
+    padding: 10px;
+    border-radius: 8px;
+    font-weight: bold;
+    font-size: 14px;
+    color: white !important;
+    margin-bottom: 10px;
+    transition: all 0.3s ease;
+}
+.btn-contact:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+}
+.btn-linkedin {
+    background-color: #0A66C2;
+}
+.btn-email {
+    background-color: #2b2b2b;
+}
+</style>
+<div class="contact-container">
+    <p style="margin-bottom: 10px; font-size: 14px; font-weight: bold; color: #555;">Desenvolvido por:</p>
+    
+    <a href="www.linkedin.com/in/ana-carolina-santos-3920931b3" target="_blank" class="btn-contact btn-linkedin">
+        🔗 LinkedIn
+    </a>
+
+    <a href="mailto:anacarolinasantos580@gmail.com" class="btn-contact btn-email">
+        ✉️ E-mail
+    </a>
+</div>
+"""
+st.sidebar.markdown(contato_html, unsafe_allow_html=True)
+# -------------------------------------
+
+
 # --- INTERFACE (TELA PRINCIPAL) ---
 st.title("🔥 Dashboard de Queimadas 🔥")
 
