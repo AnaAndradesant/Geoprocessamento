@@ -15,14 +15,7 @@ st.set_page_config(
     page_title="Monitor de Queimadas Brasil",
     page_icon="🔥",
     layout="wide",
-    initial_sidebar_state="expanded",
-    menu_items={
-        'About': """
-        ### 🛰️ Monitor de Queimadas
-        Dashboard interativo para monitoramento de focos de calor e área queimada.
-        Desenvolvido por Ana Carolina Andrade.
-        """
-    }
+    initial_sidebar_state="expanded"
 )
 
 warnings.filterwarnings('ignore')
@@ -48,7 +41,7 @@ def add_ee_layer(self, ee_image_object, vis_params, name, show=True, opacity=0.7
             overlay=True, control=True, show=show, opacity=opacity
         ).add_to(self)
     except Exception as e:
-        st.error(f"🚨 Erro crítico ao desenhar a camada do Earth Engine: {e}")
+        st.error(f"🚨 Erro crítico ao desenhar a camada: {e}")
 
 folium.Map.add_ee_layer = add_ee_layer
 
@@ -152,7 +145,7 @@ if "INPE" in fonte_escolhida:
 else:
     st.sidebar.markdown("**Filtros do MODIS**")
     ano_modis = st.sidebar.selectbox("Ano de Referência:", list(range(2001, datetime.now().year + 1)), index=datetime.now().year - 2002)
-    mes_modis = st.sidebar.selectbox("Mês de Referência:", list(range(1, 13)), index=7)
+    mes_modis = st.sidebar.selectbox("Mês do Mapa Principal:", list(range(1, 13)), index=7)
 
 st.sidebar.markdown("---")
 area_protegida = st.sidebar.selectbox("🌳 Análise de Risco (Cruzamento Espacial):", ["Nenhuma", "Terras Indígenas", "Unidades de Conservação"])
@@ -177,7 +170,8 @@ if gerar:
         total_valor = 0
         df_rec = pd.DataFrame() 
         area_queimada_img = None 
-        df_top_mun_modis = pd.DataFrame() # Para salvar os Top Municípios do MODIS
+        df_top_mun_modis = pd.DataFrame()
+        df_modis_temporal = pd.DataFrame()
 
         # ==========================================
         # RAMIFICAÇÃO: INPE
@@ -205,6 +199,11 @@ if gerar:
                     st.write(f"🌳 Isolando focos em {area_protegida}...")
                     gdf_areas = carregar_areas_protegidas(area_protegida)
                     gdf_areas = gdf_areas.to_crs(gdf.crs)
+                    
+                    # CORREÇÃO: Remover 'index_right' do sjoin anterior
+                    if 'index_right' in gdf.columns:
+                        gdf = gdf.drop(columns=['index_right'])
+                        
                     gdf_focos_risco = gpd.sjoin(gdf, gdf_areas, predicate='within')
                     
                     if not gdf_focos_risco.empty:
@@ -213,7 +212,7 @@ if gerar:
                         df_ranking_areas = focos_em_areas['nome_area'].value_counts().reset_index()
                         df_ranking_areas.columns = ['Área Protegida', 'Valor']
                         
-                        # FILTRA O DATAFRAME PRINCIPAL (Calcula SÓ os dados das Áreas Protegidas)
+                        # Filtra o DataFrame principal (Deixa só os focos nas TIs/UCs)
                         df_rec = focos_em_areas
                         total_valor = len(df_rec)
                     else:
@@ -226,6 +225,7 @@ if gerar:
         else:
             st.write("☁️ Analisando satélite MODIS no GEE...")
             try:
+                # 1. Carrega imagem base do mês selecionado para o mapa principal
                 data_ini_ee = ee.Date.fromYMD(ano_modis, mes_modis, 1)
                 colecao = ee.ImageCollection('MODIS/061/MCD64A1').filterDate(data_ini_ee, data_ini_ee.advance(1, 'month')).filterBounds(ee_geom_complex)
                 
@@ -238,7 +238,7 @@ if gerar:
                     ).getInfo()
                     total_valor = round(stats_total.get('area_km2', 0) if stats_total.get('area_km2') else 0, 2)
 
-                    # Cruzamento Espacial MODIS
+                    # 2. Cruzamento Espacial MODIS (Recorte da Imagem e Tabela de Áreas)
                     if area_protegida != "Nenhuma" and total_valor > 0:
                         st.write(f"🌳 Isolando km² afetados em {area_protegida}...")
                         gdf_areas_br = carregar_areas_protegidas(area_protegida)
@@ -255,23 +255,48 @@ if gerar:
                             if not df_ranking_areas.empty:
                                 areas_afetadas = gdf_areas[gdf_areas['nome_area'].isin(df_ranking_areas['Área Protegida'])]
                                 
-                                # FILTRA O VALOR E A IMAGEM DO MAPA (Somente Áreas Protegidas)
+                                # Atualiza total_valor e recorta a imagem para as TIs/UCs afetadas
                                 total_valor = round(df_ranking_areas['Valor'].sum(), 2)
                                 ee_geom_afetadas = ee.Geometry(areas_afetadas.geometry.union_all().__geo_interface__)
                                 area_queimada_img = area_queimada_img.clip(ee_geom_afetadas)
+                                img_area_km2 = ee.Image.pixelArea().divide(1000000).updateMask(area_queimada_img.gt(0))
                             else:
                                 total_valor = 0
 
-                    # RANKING DE MUNICÍPIOS PARA MODIS (Só roda se NÃO tiver filtro de áreas e NÃO for análise por município)
-                    elif area_protegida == "Nenhuma" and tipo_analise != "Por Município" and total_valor > 0:
+                    # 3. Ranking de Municípios MODIS (Calculado sempre que não for análise por município)
+                    if tipo_analise != "Por Município" and total_valor > 0:
                         st.write("🏙️ Calculando ranking de municípios (MODIS)...")
-                        # Usa a base nativa de municípios da FAO dentro do GEE
                         muns_ee = ee.FeatureCollection("FAO/GAUL/2015/level2").filterBounds(ee_geom_complex)
-                        stats_mun = img_area_km2.reduceRegions(collection=muns_ee, reducer=ee.Reducer.sum(), scale=500).getInfo()
+                        # O img_area_km2 já está recortado pela TI se o filtro estiver ativo!
+                        stats_mun = img_area_km2.reduceRegions(collection=muns_ee, reducer=ee.Reducer.sum(), scale=1000).getInfo()
                         
                         recs_mun = [{'Município': f['properties']['ADM2_NAME'], 'Valor': round(f['properties'].get('sum', 0), 2)} for f in stats_mun['features'] if f['properties'].get('sum', 0) > 0]
                         if recs_mun:
                             df_top_mun_modis = pd.DataFrame(recs_mun).sort_values(by='Valor', ascending=False).head(5)
+
+                    # 4. Evolução Temporal MODIS (12 meses do ano selecionado)
+                    if total_valor > 0:
+                        st.write("📊 Calculando série temporal anual (MODIS)...")
+                        # Define qual geometria usar para a série temporal
+                        geom_temporal = ee_geom_afetadas if (area_protegida != "Nenhuma" and not areas_afetadas.empty) else ee_geom_complex
+                        
+                        def calc_mes(m):
+                            m_num = ee.Number(m)
+                            ini = ee.Date.fromYMD(ano_modis, m_num, 1)
+                            fim = ini.advance(1, 'month')
+                            img_mes = ee.ImageCollection('MODIS/061/MCD64A1').filterDate(ini, fim).select('BurnDate').max().clip(geom_temporal)
+                            area_calc = ee.Image.pixelArea().divide(1000000).updateMask(img_mes.gt(0))
+                            val = area_calc.reduceRegion(reducer=ee.Reducer.sum(), geometry=geom_temporal, scale=1000, maxPixels=1e10).get('area')
+                            return ee.Feature(None, {'mes': m_num, 'area': val})
+                        
+                        # Mapeia a função sobre os 12 meses do ano
+                        meses_list = ee.List.sequence(1, 12)
+                        fc_meses = ee.FeatureCollection(meses_list.map(calc_mes)).getInfo()
+                        
+                        dados_temp = [{'Mês': f['properties']['mes'], 'Área (km²)': round(f['properties'].get('area') or 0, 2)} for f in fc_meses['features']]
+                        df_modis_temporal = pd.DataFrame(dados_temp)
+                        meses_map = {1:'Jan', 2:'Fev', 3:'Mar', 4:'Abr', 5:'Mai', 6:'Jun', 7:'Jul', 8:'Ago', 9:'Set', 10:'Out', 11:'Nov', 12:'Dez'}
+                        df_modis_temporal['Mês Nome'] = df_modis_temporal['Mês'].map(meses_map)
 
             except Exception as e:
                 st.warning(f"⚠️ Erro ao processar MODIS: {e}")
@@ -286,7 +311,7 @@ if gerar:
     else:
         # 1. CARD DE RESUMO ESTILIZADO
         texto_titulo = f"Total Confirmado: {total_valor:,} focos" if "INPE" in fonte_escolhida else f"Área Queimada Total: {total_valor:,.2f} km²"
-        texto_sub = f"Período: {quantidade_sel} {unidade_dd}" if "INPE" in fonte_escolhida else f"Período: Mês {mes_modis} do Ano {ano_modis}"
+        texto_sub = f"Período: {quantidade_sel} {unidade_dd}" if "INPE" in fonte_escolhida else f"Período: Mês {mes_modis} de {ano_modis} (Mapa) / Ano {ano_modis} (Evolução)"
         
         card_html = f"""
         <div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; border-left: 8px solid #ff4b4b; margin-bottom: 15px; box-shadow: 1px 1px 4px rgba(0,0,0,0.05);">
@@ -323,11 +348,6 @@ if gerar:
                 st.dataframe(df_ranking_areas, hide_index=True, height=350, use_container_width=True)
         
         st.markdown("---") 
-        
-        # Botão de Download (Apenas INPE tem CSV de Focos Ponto a Ponto)
-        if "INPE" in fonte_escolhida and not df_rec.empty:
-            csv_dados = df_rec.to_csv(index=False).encode('utf-8')
-            st.sidebar.download_button("📥 Baixar Dados Focos (CSV)", data=csv_dados, file_name=f"focos_{val_sel.replace(' ', '_')}.csv", mime="text/csv", use_container_width=True)
 
         # 3. CONSTRUÇÃO DO MAPA E GRÁFICOS INFERIORES
         col1, col2 = st.columns([1.3, 1])
@@ -347,7 +367,6 @@ if gerar:
                     tooltip=folium.GeoJsonTooltip(fields=['nome_area'], aliases=['Área Protegida:'], style=estilo_tooltip)
                 ).add_to(m)
 
-            # O Mapa vai exibir apenas os dados que sobraram na variável respectiva (Já recortada se o filtro estiver ativo)
             if "INPE" in fonte_escolhida and not df_rec.empty:
                 HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=20).add_to(m)
             elif "MODIS" in fonte_escolhida and area_queimada_img:
@@ -356,6 +375,7 @@ if gerar:
             st_folium(m, width=700, height=750, returned_objects=[])
         
         with col2:
+            # --- SEÇÃO DE GRÁFICOS: INPE ---
             if "INPE" in fonte_escolhida:
                 st.subheader("📈 Evolução Temporal dos Focos")
                 data_col = next(c for c in df_rec.columns if 'data' in c)
@@ -369,10 +389,11 @@ if gerar:
                 fig_line.update_layout(template='plotly_dark', xaxis_title="Tempo", yaxis_title="Nº de Focos", margin=dict(t=20, b=20))
                 st.plotly_chart(fig_line, use_container_width=True)
 
-                if 'municipio' in df_rec.columns and tipo_analise != "Por Município" and area_protegida == "Nenhuma":
+                # Gráfico de Municípios INPE (Aparece mesmo com filtro de área protegida)
+                if 'municipio' in df_rec.columns and tipo_analise != "Por Município":
                     df_top_mun = df_rec['municipio'].value_counts().reset_index()
                     qtd_mun = min(5, len(df_top_mun))
-                    st.subheader(f"🏆 Top {qtd_mun} Municípios" if qtd_mun > 1 else "🏆 Município Afetado")
+                    st.subheader(f"🏆 Top {qtd_mun} Municípios Afetados")
                     
                     df_top_mun = df_top_mun.head(5)
                     df_top_mun.columns = ['Município', 'Focos']
@@ -380,25 +401,22 @@ if gerar:
                     fig_bar = px.bar(df_top_mun, x='Focos', y='Município', orientation='h', text='Focos', color='Focos', color_continuous_scale=px.colors.sequential.Reds)
                     fig_bar.update_layout(template='plotly_dark', yaxis={'categoryorder':'total ascending'}, height=320, margin=dict(t=20, b=20), coloraxis_showscale=False)
                     st.plotly_chart(fig_bar, use_container_width=True)
+
+            # --- SEÇÃO DE GRÁFICOS: MODIS ---
             else:
-                if area_protegida == "Nenhuma" and tipo_analise != "Por Município" and not df_top_mun_modis.empty:
-                    st.subheader("🏆 Top 5 Municípios Afetados (MODIS)")
+                if not df_modis_temporal.empty:
+                    st.subheader(f"📈 Evolução Temporal ({ano_modis})")
+                    fig_line = px.line(df_modis_temporal, x='Mês Nome', y='Área (km²)', markers=True, height=350)
+                    fig_line.update_traces(line_color='#e64a19', line_width=3)
+                    fig_line.update_layout(template='plotly_dark', xaxis_title="Mês", yaxis_title="Área Afetada (km²)", margin=dict(t=20, b=20))
+                    st.plotly_chart(fig_line, use_container_width=True)
+
+                # Gráfico de Municípios MODIS (Aparece mesmo com filtro de área protegida)
+                if tipo_analise != "Por Município" and not df_top_mun_modis.empty:
+                    st.subheader("🏆 Top 5 Municípios Afetados")
                     fig_bar = px.bar(df_top_mun_modis, x='Valor', y='Município', orientation='h', text='Valor', color='Valor', color_continuous_scale=px.colors.sequential.Reds)
                     fig_bar.update_layout(template='plotly_dark', xaxis_title="Área Afetada (km²)", yaxis={'categoryorder':'total ascending'}, height=350, margin=dict(t=20, b=20), coloraxis_showscale=False)
                     st.plotly_chart(fig_bar, use_container_width=True)
-                else:
-                    st.info("ℹ️ Mapa focado nos registros espaciais de fogo. Utilize os filtros laterais para realizar novas seleções.")
 
 else:
     st.info("👈 Use os filtros ao lado para selecionar a Fonte de Dados, o local e o período de análise.")
-
-# --- RODAPÉ ---
-st.sidebar.markdown("---")
-st.sidebar.markdown("""
-<div style="text-align: center; font-size: 13px; color: #636e72;">
-    Desenvolvido por <br>
-    <b style="font-size: 15px;">Ana Carolina Andrade</b> <br>
-    <a href="https://www.linkedin.com/in/ana-carolina-santos-3920931b3" target="_blank" style="text-decoration: none; color: #e64a19; font-weight: bold;">LinkedIn</a> | 
-    <a href="https://github.com/AnaAndradesant" target="_blank" style="text-decoration: none; color: #e64a19; font-weight: bold;">GitHub</a>
-</div>
-""", unsafe_allow_html=True)
