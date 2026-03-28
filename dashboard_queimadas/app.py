@@ -372,17 +372,39 @@ if gerar:
         # 3. CONSTRUÇÃO DO MAPA E GRÁFICOS INFERIORES
         col1, col2 = st.columns([1.3, 1])
         
-        with col1:
+       with col1:
             st.subheader("🗺️ Mapa Espacial")
             centro = limite.geometry.union_all().centroid
             
-            # MAPA INICIAL: ESTILO CLEAN (Positron) COMO PADRÃO
+            # Forçando o mapa claro e profissional como base única
             m = folium.Map(
                 location=[centro.y, centro.x], 
                 zoom_start=10 if tipo_analise == "Por Município" else 6, 
-                tiles='CartoDB positron',
-                name='Estilo Claro (Clean)'
+                tiles='cartodbpositron' # Nome interno exato do Folium para o mapa clean
             )
+            
+            # Adiciona os limites geográficos em azul
+            folium.GeoJson(
+                limite.__geo_interface__, 
+                style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}
+            ).add_to(m)
+            
+            # Adiciona as áreas de risco (se houver)
+            if not areas_afetadas.empty:
+                estilo_tooltip = "font-size: 12px; max-width: 250px; white-space: normal; background-color: white; color: black; border-radius: 4px; box-shadow: 2px 2px 5px rgba(0,0,0,0.3);"
+                folium.GeoJson(
+                    areas_afetadas.__geo_interface__, 
+                    style_function=lambda x: {'fillColor': 'transparent', 'color': '#c0392b', 'weight': 3},
+                    tooltip=folium.GeoJsonTooltip(fields=['nome_area'], aliases=['Área Protegida:'], style=estilo_tooltip)
+                ).add_to(m)
+
+            # Adiciona o mapa de calor ou as imagens de satélite
+            if "INPE" in fonte_escolhida and not df_rec.empty:
+                HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=20).add_to(m)
+            elif "MODIS" in fonte_escolhida and area_queimada_img:
+                m.add_ee_layer(area_queimada_img.updateMask(area_queimada_img.gt(0)), {'min': 1, 'max': 366, 'palette': ['orange', 'red', 'darkred']}, 'MODIS Área Queimada')
+
+            st_folium(m, width=700, height=750, returned_objects=[])
             
             # ADICIONA AS OUTRAS OPÇÕES DE ESTILO NO MENU
             folium.TileLayer('CartoDB dark_matter', name='Estilo Escuro').add_to(m)
