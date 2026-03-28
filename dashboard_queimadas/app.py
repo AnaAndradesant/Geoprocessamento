@@ -160,7 +160,8 @@ linkedin_logo_url = "https://upload.wikimedia.org/wikipedia/commons/c/ca/LinkedI
 
 html_contato_novo = f"""
 <div style="text-align: center;">
-<h2 style="font-family: serif; font-size: 24px; margin-top: 10px; margin-bottom: 15px; color: inherit;">ANA ANDRADE</h2>
+<h2 style="font-family: serif; font-size: 24px; margin-top: 10px; margin-bottom: 2px; color: inherit;">ANA ANDRADE</h2>
+<p style="font-size: 13px; color: #777; margin-top: 0px; margin-bottom: 15px;">Especialista em Geoprocessamento</p>
 <hr style="border: 0; border-top: 1px solid #e0e0e0; margin-bottom: 15px;">
 <div style="display: flex; justify-content: space-between; gap: 10px;">
 <a href="https://mail.google.com/mail/?view=cm&fs=1&to=anacarolinasantos580@gmail.com" target="_blank" style="flex: 1; text-decoration: none; background-color: #ffffff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); display: flex; justify-content: center; align-items: center;">
