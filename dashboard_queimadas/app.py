@@ -154,19 +154,23 @@ gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_containe
 
 # --- SEÇÃO DE CONTATO ---
 st.sidebar.markdown("---")
-st.sidebar.markdown("**Desenvolvido por:**")
 
-# Botões nativos do Streamlit (sem depender de HTML)
+# Título centralizado
+st.sidebar.markdown("<h3 style='text-align: center; margin-bottom: 5px;'>Contatos</h3>", unsafe_allow_html=True)
+
+# Botão nativo para o LinkedIn (nunca vai bugar ou mostrar código)
 st.sidebar.link_button(
     "🔗 LinkedIn", 
     "https://www.linkedin.com/in/ana-carolina-santos-3920931b3", 
     use_container_width=True
 )
 
-st.sidebar.link_button(
-    "✉️ E-mail", 
-    "mailto:anacarolinasantos580@gmail.com", 
-    use_container_width=True
+# E-mail usando formatação limpa e clicável
+st.sidebar.markdown(
+    "<div style='text-align: center; margin-top: 10px;'>"
+    "<a href='mailto:anacarolinasantos580@gmail.com' style='color: #ff4b4b; text-decoration: none; font-size: 15px;'>✉️ anacarolinasantos580@gmail.com</a>"
+    "</div>", 
+    unsafe_allow_html=True
 )
 # -------------------------------------
 
