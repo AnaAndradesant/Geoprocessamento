@@ -155,25 +155,33 @@ gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_containe
 # --- SEÇÃO DE CONTATO ---
 st.sidebar.markdown("---")
 
-# Título centralizado
-st.sidebar.markdown("<h3 style='text-align: center; margin-bottom: 5px;'>Contatos</h3>", unsafe_allow_html=True)
+# Código HTML e CSS para criar o layout idêntico ao da imagem
+html_contato = """
+<div style="text-align: center;">
+    <p style="font-size: 11px; letter-spacing: 1.5px; color: #888; margin-bottom: 5px; text-transform: uppercase;">Vamos Conversar</p>
+    <h2 style="font-family: serif; font-size: 26px; margin-top: 0px; margin-bottom: 15px; color: inherit;">ANA ANDRADE</h2>
+    
+    <hr style="border: 0; border-top: 1px solid #e0e0e0; margin-bottom: 20px;">
+    
+    <div style="display: flex; justify-content: space-between; gap: 10px;">
+        <a href="https://mail.google.com/mail/?view=cm&fs=1&to=anacarolinasantos580@gmail.com" target="_blank" style="flex: 1; text-decoration: none; background-color: #ffffff; border: 1px solid #e0e0e0; border-radius: 10px; padding: 15px 5px; color: #333; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
+            <div style="font-size: 28px; margin-bottom: 5px;">📧</div>
+            <div style="font-size: 10px; word-wrap: break-word; color: #555;">anacarolinasantos580<br>@gmail.com</div>
+        </a>
+        
+        <a href="https://www.linkedin.com/in/ana-carolina-santos-3920931b3" target="_blank" style="flex: 1; text-decoration: none; background-color: #3b71ca; border-radius: 10px; padding: 15px 5px; color: white; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">
+            <div style="font-size: 26px; font-weight: bold; margin-bottom: 7px; font-family: sans-serif;">in</div>
+            <div style="font-size: 10px; word-wrap: break-word; color: #f0f0f0;">linkedin.com/in/<br>ana-carolina</div>
+        </a>
+    </div>
+    
+    <p style="font-size: 12px; color: #888; margin-top: 20px;">Para projetos, colaborações ou apenas para dizer olá!</p>
+</div>
+"""
 
-# Botão nativo para o LinkedIn
-st.sidebar.link_button(
-    "🔗 LinkedIn", 
-    "https://www.linkedin.com/in/ana-carolina-santos-3920931b3", 
-    use_container_width=True
-)
+# Renderizando o visual na barra lateral
+st.sidebar.markdown(html_contato, unsafe_allow_html=True)
 
-# Link direto que força a abertura do Gmail no navegador
-gmail_link = "https://mail.google.com/mail/?view=cm&fs=1&to=anacarolinasantos580@gmail.com"
-
-st.sidebar.markdown(
-    f"<div style='text-align: center; margin-top: 10px;'>"
-    f"<a href='{gmail_link}' target='_blank' style='color: #ff4b4b; text-decoration: none; font-size: 15px;'>✉️ anacarolinasantos580@gmail.com</a>"
-    f"</div>", 
-    unsafe_allow_html=True
-)
 # -------------------------------------
 
 
