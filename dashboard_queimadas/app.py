@@ -342,11 +342,7 @@ if st.session_state.gerar_dashboard:
         st.error("⚠️ Nenhum registro detectado nos limites selecionados.")
     else:
         texto_titulo = f"Total Confirmado: {total_valor:,} focos" if "INPE" in fonte_escolhida else f"Área Queimada Total: {total_valor:,.2f} km²"
-        
-        if "INPE" in fonte_escolhida:
-            texto_sub = f"Período: {quantidade_sel} {unidade_dd} até {hoje.strftime('%d/%m/%Y')}"
-        else:
-            texto_sub = f"Período: Mês {mes_modis} de {ano_modis} (Mapa) / Ano {ano_modis} (Evolução)"
+        texto_sub = f"Período: {quantidade_sel} {unidade_dd}" if "INPE" in fonte_escolhida else f"Período: Mês {mes_modis} de {ano_modis} (Mapa) / Ano {ano_modis} (Evolução)"
         
         card_html = f"""
         <div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; border-left: 8px solid #ff4b4b; margin-bottom: 15px; box-shadow: 1px 1px 4px rgba(0,0,0,0.05);">
@@ -436,15 +432,13 @@ if st.session_state.gerar_dashboard:
                 ).add_to(m)
 
             if "INPE" in fonte_escolhida and not df_rec.empty:
-                # --- A CORREÇÃO DO HEATMAP ESTÁ AQUI ---
-                focos_heat = df_rec[['latitude', 'longitude']].dropna().values.tolist()
-                
+                # O MEIO-TERMO IDEAL
                 HeatMap(
-                    focos_heat,
-                    name="Mancha de Calor",
-                    radius=9,         # Menor para não estourar
-                    blur=15,          # Maior para deixar mais esfumaçado e misturar melhor
-                    min_opacity=0.1   # Mais transparente para focos isolados não parecerem gigantes
+                    df_rec[["latitude", "longitude"]].dropna().values.tolist(), 
+                    radius=15,        # Aumentado para dar mais presença
+                    blur=10,          # Diminuído para marcar mais o centro quente
+                    max_zoom=12,      # Trava visual boa pro zoom
+                    min_opacity=0.3   # Equilibrio para não desaparecer nem manchar tudo
                 ).add_to(m)
             
             elif "MODIS" in fonte_escolhida and area_queimada_img:
