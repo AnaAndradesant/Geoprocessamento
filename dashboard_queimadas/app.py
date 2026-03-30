@@ -288,7 +288,7 @@ if gerar:
                     # 2. Cruzamento Espacial MODIS (Recorte da Imagem e Tabela de Áreas)
                     if area_protegida != "Nenhuma" and total_valor > 0:
                         st.write(f"🌳 Isolando km² afetados em {area_protegida}...")
-                        gdf_areas_br = carregar_areas_protegidas(area_protegida)
+                        gdf_areas_br = carregar_areas_protegidas(tipo_area=area_protegida) # Chamada corrigida
                         gdf_areas = gpd.sjoin(gdf_areas_br, limite, predicate='intersects').drop(columns=['index_right'])
                         
                         if not gdf_areas.empty:
@@ -406,11 +406,13 @@ if gerar:
             
             folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}).add_to(m)
             
+            # --- DESENHO DAS ÁREAS PROTEGIDAS NO MAPA ---
             if not areas_afetadas.empty:
                 estilo_tooltip = "font-size: 12px; max-width: 250px; white-space: normal; background-color: white; color: black; border-radius: 4px; box-shadow: 2px 2px 5px rgba(0,0,0,0.3);"
                 folium.GeoJson(
                     areas_afetadas.__geo_interface__, 
-                    style_function=lambda x: {'fillColor': 'transparent', 'color': '#c0392b', 'weight': 3},
+                    # MUDANÇA AQUI: 'weight' alterado de 3 para 1 para linhas mais finas
+                    style_function=lambda x: {'fillColor': 'transparent', 'color': '#c0392b', 'weight': 1},
                     tooltip=folium.GeoJsonTooltip(fields=['nome_area'], aliases=['Área Protegida:'], style=estilo_tooltip)
                 ).add_to(m)
 
