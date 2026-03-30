@@ -26,7 +26,6 @@ if 'last_heartbeat' not in st.session_state:
 if (datetime.now() - st.session_state.last_heartbeat).seconds > 60:
     st.session_state.last_heartbeat = datetime.now()
 
-# CORREÇÃO 1: Memória para o botão Gerar não resetar o app
 if 'gerar_dashboard' not in st.session_state:
     st.session_state.gerar_dashboard = False
 # ==========================================
@@ -172,7 +171,6 @@ modo_debug = False
 if "qa" in st.query_params and st.query_params["qa"].lower() == "true":
     modo_debug = st.sidebar.toggle("🐛 Modo de Validação (QA)", value=True)
 
-# Lógica atualizada do botão: Ao clicar, salvamos na memória que o dashboard deve ser exibido.
 if st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True):
     st.session_state.gerar_dashboard = True
 
@@ -206,7 +204,6 @@ st.title("🔥 Dashboard de Queimadas 🔥")
 total_valor = 0
 dados_indisponiveis = False 
 
-# Agora usamos a variável da memória em vez do botão diretamente
 if st.session_state.gerar_dashboard:
     hoje = datetime.now()
     val_sel = bioma_dd if tipo_analise == "Por Bioma" else (estado_dd if tipo_analise == "Por Estado" else f"{municipio_dd} ({estado_dd})")
@@ -388,8 +385,8 @@ if st.session_state.gerar_dashboard:
             
             col_controles1, col_controles2 = st.columns([1, 1.2])
             with col_controles1:
-                # CORREÇÃO DA COR: Atualizado para refletir o cinza do ArcGIS
-                estilo_mapa = st.radio("🎨 Estilo de Fundo:", ["🌑 Cinza Escuro (ArcGIS)", "🛰️ Satélite (Google)"], horizontal=False)
+                # NOME CORRIGIDO E SIMPLIFICADO
+                estilo_mapa = st.radio("🎨 Estilo de Fundo:", ["🌑 Mapa Dark", "🛰️ Satélite (Google)"], horizontal=False)
             
             focar_area = "Visão Geral"
             with col_controles2:
@@ -406,14 +403,21 @@ if st.session_state.gerar_dashboard:
                 bounds = limite.geometry.total_bounds
                 zoom_inicio = 10 if tipo_analise == "Por Município" else 6
 
-            # Aplicação do Fundo Cinza ESRI ou Satélite
-            if "Cinza" in estilo_mapa:
+            if "Dark" in estilo_mapa:
+                # MAPA BASE: O fundo escuro liso
                 m = folium.Map(
                     location=[centro.y, centro.x], 
                     zoom_start=zoom_inicio, 
                     tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
-                    attr='Esri, HERE, Garmin, © OpenStreetMap contributors, and the GIS user community'
+                    attr='Esri Base'
                 )
+                # MAPA DE REFERÊNCIA: As bordas de estado, nomes e estradas fininhas desenhadas por cima
+                folium.TileLayer(
+                    tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
+                    attr='Esri Reference',
+                    overlay=True,
+                    control=False
+                ).add_to(m)
             else:
                 m = folium.Map(location=[centro.y, centro.x], zoom_start=zoom_inicio, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Satélite')
             
@@ -431,12 +435,13 @@ if st.session_state.gerar_dashboard:
                 ).add_to(m)
 
             if "INPE" in fonte_escolhida and not df_rec.empty:
-                # CORREÇÃO DA ESCALA DO MAPA DE CALOR: Raio e Borrão reduzidos e limite de zoom adicionado
+                # ESCALA TRAVADA: O `max_zoom=14` segura a explosão visual.
                 HeatMap(
                     df_rec[["latitude", "longitude"]].dropna().values.tolist(), 
-                    radius=8, 
-                    blur=6, 
-                    max_zoom=10
+                    radius=10, 
+                    blur=8, 
+                    max_zoom=14, 
+                    min_opacity=0.4
                 ).add_to(m)
             
             elif "MODIS" in fonte_escolhida and area_queimada_img:
