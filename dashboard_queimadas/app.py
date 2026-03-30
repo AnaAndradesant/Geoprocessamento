@@ -4,6 +4,7 @@ import geopandas as gpd
 from datetime import datetime, timedelta
 from geobr import read_state, read_biomes, read_municipality, read_indigenous_land, read_conservation_units 
 import folium
+from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 import plotly.express as px
 import requests, warnings, time, unicodedata, re, json
@@ -384,6 +385,7 @@ if st.session_state.gerar_dashboard:
             
             col_controles1, col_controles2 = st.columns([1, 1.2])
             with col_controles1:
+                # NOME CORRIGIDO E SIMPLIFICADO
                 estilo_mapa = st.radio("🎨 Estilo de Fundo:", ["🌑 Mapa Dark", "🛰️ Satélite (Google)"], horizontal=False)
             
             focar_area = "Visão Geral"
@@ -433,20 +435,14 @@ if st.session_state.gerar_dashboard:
                 ).add_to(m)
 
             if "INPE" in fonte_escolhida and not df_rec.empty:
-                # Efeito de Calor Travado Geograficamente (Raio em metros reais)
-                focos_layer = folium.FeatureGroup(name="Focos de Calor")
-                
-                for _, row in df_rec[['latitude', 'longitude']].dropna().iterrows():
-                    folium.Circle(
-                        location=[row['latitude'], row['longitude']],
-                        radius=2500, # 2.500 metros (2,5 km) travados no chão.
-                        stroke=False, # Remove a linha de borda
-                        fill=True,
-                        fill_color='#ff3300', # Cor do fogo (Laranja escuro/Vermelho)
-                        fill_opacity=0.08 # Opacidade baixa para simular o calor
-                    ).add_to(focos_layer)
-                
-                focos_layer.add_to(m)
+                # ESCALA TRAVADA: O `max_zoom=14` segura a explosão visual.
+                HeatMap(
+                    df_rec[["latitude", "longitude"]].dropna().values.tolist(), 
+                    radius=10, 
+                    blur=8, 
+                    max_zoom=14, 
+                    min_opacity=0.4
+                ).add_to(m)
             
             elif "MODIS" in fonte_escolhida and area_queimada_img:
                 vis_params_quente = {
