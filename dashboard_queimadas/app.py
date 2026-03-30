@@ -19,12 +19,16 @@ st.set_page_config(
 )
 
 # ==========================================
-# 🛠️ TRUQUE DE SOBREVIVÊNCIA (KEEP-ALIVE)
+# 🛠️ TRUQUE DE SOBREVIVÊNCIA (KEEP-ALIVE E ESTADO)
 if 'last_heartbeat' not in st.session_state:
     st.session_state.last_heartbeat = datetime.now()
 
 if (datetime.now() - st.session_state.last_heartbeat).seconds > 60:
     st.session_state.last_heartbeat = datetime.now()
+
+# CORREÇÃO 1: Memória para o botão Gerar não resetar o app
+if 'gerar_dashboard' not in st.session_state:
+    st.session_state.gerar_dashboard = False
 # ==========================================
 
 warnings.filterwarnings('ignore')
@@ -41,7 +45,6 @@ try:
 except Exception as e:
     st.error("⚠️ Erro ao conectar com o Google Earth Engine. Verifique seus Secrets.")
 
-# Modificação 1: Opacidade ajustada para 1.0 (100%) para dar mais destaque
 def add_ee_layer(self, ee_image_object, vis_params, name, show=True, opacity=1.0):
     try:
         map_id_dict = ee.Image(ee_image_object).getMapId(vis_params)
@@ -169,7 +172,9 @@ modo_debug = False
 if "qa" in st.query_params and st.query_params["qa"].lower() == "true":
     modo_debug = st.sidebar.toggle("🐛 Modo de Validação (QA)", value=True)
 
-gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True)
+# Lógica atualizada do botão: Ao clicar, salvamos na memória que o dashboard deve ser exibido.
+if st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True):
+    st.session_state.gerar_dashboard = True
 
 # --- SEÇÃO DE CONTATO ---
 st.sidebar.markdown("---")
@@ -199,9 +204,10 @@ st.title("🔥 Dashboard de Queimadas 🔥")
 
 # Variáveis globais de estado
 total_valor = 0
-dados_indisponiveis = False # Controle para MODIS não processado
+dados_indisponiveis = False 
 
-if gerar:
+# Agora usamos a variável da memória em vez do botão diretamente
+if st.session_state.gerar_dashboard:
     hoje = datetime.now()
     val_sel = bioma_dd if tipo_analise == "Por Bioma" else (estado_dd if tipo_analise == "Por Estado" else f"{municipio_dd} ({estado_dd})")
 
@@ -218,9 +224,6 @@ if gerar:
         df_top_mun_modis = pd.DataFrame()
         df_modis_temporal = pd.DataFrame()
 
-        # ==========================================
-        # RAMIFICAÇÃO: INPE
-        # ==========================================
         if "INPE" in fonte_escolhida:
             if not satelites_sel:
                 st.error("⚠️ Você precisa selecionar pelo menos um satélite.")
@@ -260,16 +263,12 @@ if gerar:
                         df_rec = pd.DataFrame()
                         total_valor = 0
 
-        # ==========================================
-        # RAMIFICAÇÃO: MODIS
-        # ==========================================
         else:
             st.write("☁️ Analisando satélite MODIS no GEE...")
             try:
                 data_ini_ee = ee.Date.fromYMD(ano_modis, mes_modis, 1)
                 colecao = ee.ImageCollection('MODIS/061/MCD64A1').filterDate(data_ini_ee, data_ini_ee.advance(1, 'month')).filterBounds(ee_geom_complex)
                 
-                # Modificação 3: Alerta de dados não processados pela NASA
                 if colecao.size().getInfo() == 0:
                     dados_indisponiveis = True
                     total_valor = 0
@@ -339,9 +338,6 @@ if gerar:
 
         status.update(label="✅ Análise concluída!", state="complete", expanded=False)
 
-    # ==========================================
-    # RENDERIZAÇÃO VISUAL (Seção Final)
-    # ==========================================
     if dados_indisponiveis:
         mes_nome = {1:'Jan', 2:'Fev', 3:'Mar', 4:'Abr', 5:'Mai', 6:'Jun', 7:'Jul', 8:'Ago', 9:'Set', 10:'Out', 11:'Nov', 12:'Dez'}[mes_modis]
         st.warning(f"⏳ **Aviso de Processamento NASA:** Os dados do satélite MODIS para **{mes_nome} de {ano_modis}** ainda não foram publicados. (Geralmente há um atraso de 1 a 2 meses na disponibilização oficial). Por favor, tente selecionar um mês anterior.")
@@ -390,34 +386,37 @@ if gerar:
         with col1:
             st.subheader("🗺️ Mapa Espacial")
             
-            # Modificação 2A: Controles interativos em cima do mapa
             col_controles1, col_controles2 = st.columns([1, 1.2])
             with col_controles1:
-                estilo_mapa = st.radio("🎨 Estilo de Fundo:", ["🌑 Escuro (Melhor Contraste)", "🛰️ Satélite (Google)"], horizontal=False)
+                # CORREÇÃO DA COR: Atualizado para refletir o cinza do ArcGIS
+                estilo_mapa = st.radio("🎨 Estilo de Fundo:", ["🌑 Cinza Escuro (ArcGIS)", "🛰️ Satélite (Google)"], horizontal=False)
             
             focar_area = "Visão Geral"
             with col_controles2:
                 if not areas_afetadas.empty:
                     focar_area = st.selectbox("🔍 Zoom direto para:", ["Visão Geral"] + df_ranking_areas['Área Protegida'].tolist())
             
-            # Modificação 2B: Lógica de teletransporte (Zoom e Limites)
             if focar_area != "Visão Geral" and not areas_afetadas.empty:
                 area_especifica = areas_afetadas[areas_afetadas['nome_area'] == focar_area]
                 centro = area_especifica.geometry.union_all().centroid
                 bounds = area_especifica.geometry.total_bounds
-                zoom_inicio = 11 # Aproxima bem
+                zoom_inicio = 11 
             else:
                 centro = limite.geometry.union_all().centroid
                 bounds = limite.geometry.total_bounds
                 zoom_inicio = 10 if tipo_analise == "Por Município" else 6
 
-            # Aplicação do Fundo Escuro
-            if "Escuro" in estilo_mapa:
-                m = folium.Map(location=[centro.y, centro.x], zoom_start=zoom_inicio, tiles='CartoDB dark_matter')
+            # Aplicação do Fundo Cinza ESRI ou Satélite
+            if "Cinza" in estilo_mapa:
+                m = folium.Map(
+                    location=[centro.y, centro.x], 
+                    zoom_start=zoom_inicio, 
+                    tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+                    attr='Esri, HERE, Garmin, © OpenStreetMap contributors, and the GIS user community'
+                )
             else:
                 m = folium.Map(location=[centro.y, centro.x], zoom_start=zoom_inicio, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Satélite')
             
-            # Força o mapa a se ajustar exatamente ao quadrado da área selecionada
             if focar_area != "Visão Geral":
                 m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
             
@@ -432,7 +431,13 @@ if gerar:
                 ).add_to(m)
 
             if "INPE" in fonte_escolhida and not df_rec.empty:
-                HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=20).add_to(m)
+                # CORREÇÃO DA ESCALA DO MAPA DE CALOR: Raio e Borrão reduzidos e limite de zoom adicionado
+                HeatMap(
+                    df_rec[["latitude", "longitude"]].dropna().values.tolist(), 
+                    radius=8, 
+                    blur=6, 
+                    max_zoom=10
+                ).add_to(m)
             
             elif "MODIS" in fonte_escolhida and area_queimada_img:
                 vis_params_quente = {
@@ -482,26 +487,5 @@ if gerar:
                     fig_bar.update_layout(template='plotly_dark', xaxis_title="Área Afetada (km²)", yaxis={'categoryorder':'total ascending'}, height=350, margin=dict(t=20, b=20), coloraxis_showscale=False)
                     st.plotly_chart(fig_bar, use_container_width=True)
 
-        # ==========================================
-        # 🐛 MODO DEBUG (QA) 
-        # ==========================================
-        if modo_debug:
-            st.markdown("---")
-            st.header("🐛 Painel Secreto de Validação")
-            with st.expander("🔍 Abrir Raio-X dos Dados", expanded=True):
-                col_db1, col_db2 = st.columns(2)
-                with col_db1:
-                    st.markdown("**1. Verificação de Matemática (SJOIN)**")
-                    if "INPE" in fonte_escolhida:
-                        qtd_bruta = len(df) if 'df' in locals() else 0
-                        qtd_limite = len(df_rec)
-                        st.write(f"- Focos totais descarregados da API (Bruto): **{qtd_bruta}**")
-                        st.write(f"- Focos na área final exibida: **{qtd_limite}**")
-                    else:
-                        st.write(f"- Área Queimada Calculada Total (MODIS): **{total_valor} km²**")
-                with col_db2:
-                    st.markdown("**2. Dados para o Teste do Espelho**")
-                    st.info(f"Use estes parâmetros no site oficial:\n- **Local:** {val_sel}\n- **Fonte:** {fonte_escolhida}\n- **Área Protegida:** {area_protegida}")
-
 else:
-    st.info("👈 Use os filtros ao lado para selecionar a Fonte de Dados, o local e o período de análise.")
+    st.info("👈 Use os filtros ao lado para selecionar a Fonte de Dados, o local e o período de análise. Depois clique em 'Gerar Dashboard'.")
