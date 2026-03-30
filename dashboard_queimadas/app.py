@@ -343,7 +343,6 @@ if st.session_state.gerar_dashboard:
     else:
         texto_titulo = f"Total Confirmado: {total_valor:,} focos" if "INPE" in fonte_escolhida else f"Área Queimada Total: {total_valor:,.2f} km²"
         
-        # --- A CORREÇÃO DA DATA ESTÁ AQUI NESTA LINHA: ---
         if "INPE" in fonte_escolhida:
             texto_sub = f"Período: {quantidade_sel} {unidade_dd} até {hoje.strftime('%d/%m/%Y')}"
         else:
@@ -437,17 +436,15 @@ if st.session_state.gerar_dashboard:
                 ).add_to(m)
 
             if "INPE" in fonte_escolhida and not df_rec.empty:
-                # HeatMap Clássico, como definido na resposta anterior
+                # --- A CORREÇÃO DO HEATMAP ESTÁ AQUI ---
                 focos_heat = df_rec[['latitude', 'longitude']].dropna().values.tolist()
                 
                 HeatMap(
                     focos_heat,
                     name="Mancha de Calor",
-                    radius=12,        
-                    blur=10,          
-                    min_opacity=0.4,  
-                    max_zoom=10,      
-                    gradient={0.2: 'blue', 0.4: 'lime', 0.6: 'yellow', 0.8: 'orange', 1.0: 'red'}
+                    radius=9,         # Menor para não estourar
+                    blur=15,          # Maior para deixar mais esfumaçado e misturar melhor
+                    min_opacity=0.1   # Mais transparente para focos isolados não parecerem gigantes
                 ).add_to(m)
             
             elif "MODIS" in fonte_escolhida and area_queimada_img:
