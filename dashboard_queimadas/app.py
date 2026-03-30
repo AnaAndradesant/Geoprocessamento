@@ -18,6 +18,16 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# ==========================================
+# 🛠️ TRUQUE DE SOBREVIVÊNCIA (KEEP-ALIVE)
+# Força o Streamlit a manter a conexão ativa
+if 'last_heartbeat' not in st.session_state:
+    st.session_state.last_heartbeat = datetime.now()
+
+if (datetime.now() - st.session_state.last_heartbeat).seconds > 60:
+    st.session_state.last_heartbeat = datetime.now()
+# ==========================================
+
 warnings.filterwarnings('ignore')
 requests.packages.urllib3.disable_warnings()
 
@@ -149,6 +159,12 @@ else:
 
 st.sidebar.markdown("---")
 area_protegida = st.sidebar.selectbox("🌳 Análise de Risco (Cruzamento Espacial):", ["Nenhuma", "Terras Indígenas", "Unidades de Conservação"])
+
+st.sidebar.markdown("---")
+# ==========================================
+# 🐛 BOTÃO DO MODO DE VALIDAÇÃO (QA)
+# ==========================================
+modo_debug = st.sidebar.toggle("🐛 Modo de Validação (QA)", value=False, help="Mostra os dados brutos e cálculos por trás dos panos")
 
 gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True)
 
@@ -444,6 +460,45 @@ if gerar:
                     fig_bar = px.bar(df_top_mun_modis, x='Valor', y='Município', orientation='h', text='Valor', color='Valor', color_continuous_scale=px.colors.sequential.Reds)
                     fig_bar.update_layout(template='plotly_dark', xaxis_title="Área Afetada (km²)", yaxis={'categoryorder':'total ascending'}, height=350, margin=dict(t=20, b=20), coloraxis_showscale=False)
                     st.plotly_chart(fig_bar, use_container_width=True)
+
+        # ==========================================
+        # 🐛 MODO DEBUG (QA - QUALITY ASSURANCE)
+        # ==========================================
+        if modo_debug:
+            st.markdown("---")
+            st.header("🐛 Painel de Validação")
+            
+            with st.expander("🔍 Abrir Raio-X dos Dados", expanded=True):
+                col_db1, col_db2 = st.columns(2)
+                
+                with col_db1:
+                    st.markdown("**1. Verificação de Matemática (SJOIN)**")
+                    if "INPE" in fonte_escolhida:
+                        qtd_bruta = len(df) if 'df' in locals() else 0
+                        qtd_limite = len(df_rec)
+                        
+                        st.write(f"- Focos totais baixados da API (Bruto): **{qtd_bruta}**")
+                        st.write(f"- Focos na área final exibida: **{qtd_limite}**")
+                        
+                        if area_protegida != "Nenhuma" and 'focos_em_areas' in locals():
+                            qtd_risco = len(focos_em_areas)
+                            st.write(f"- Focos originais que caíram em {area_protegida}: **{qtd_risco}**")
+                            
+                            # Alerta de possível duplicação
+                            if qtd_risco > qtd_bruta:
+                                st.warning("⚠️ ALERTA: Você tem mais focos cruzados do que baixados no total. Isso significa que há polígonos sobrepostos na base de áreas protegidas gerando dados duplicados!")
+                    else:
+                        st.write(f"- Área Queimada Calculada Total (MODIS): **{total_valor} km²**")
+
+                with col_db2:
+                    st.markdown("**2. Dados para o Teste do Espelho**")
+                    st.info(f"Use estes parâmetros no site oficial:\n- **Local:** {val_sel}\n- **Fonte:** {fonte_escolhida}\n- **Área Protegida:** {area_protegida}")
+                
+                st.markdown("**3. Tabela Bruta (Amostra para inspeção)**")
+                if "INPE" in fonte_escolhida and not df_rec.empty:
+                    st.dataframe(df_rec.head(100), use_container_width=True)
+                elif "MODIS" in fonte_escolhida and not df_modis_temporal.empty:
+                    st.dataframe(df_modis_temporal, use_container_width=True)
 
 else:
     st.info("👈 Use os filtros ao lado para selecionar a Fonte de Dados, o local e o período de análise.")
