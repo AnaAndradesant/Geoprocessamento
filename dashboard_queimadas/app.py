@@ -342,7 +342,12 @@ if st.session_state.gerar_dashboard:
         st.error("⚠️ Nenhum registro detectado nos limites selecionados.")
     else:
         texto_titulo = f"Total Confirmado: {total_valor:,} focos" if "INPE" in fonte_escolhida else f"Área Queimada Total: {total_valor:,.2f} km²"
-        texto_sub = f"Período: {quantidade_sel} {unidade_dd}" if "INPE" in fonte_escolhida else f"Período: Mês {mes_modis} de {ano_modis} (Mapa) / Ano {ano_modis} (Evolução)"
+        
+        # --- A CORREÇÃO DA DATA ESTÁ AQUI NESTA LINHA: ---
+        if "INPE" in fonte_escolhida:
+            texto_sub = f"Período: {quantidade_sel} {unidade_dd} até {hoje.strftime('%d/%m/%Y')}"
+        else:
+            texto_sub = f"Período: Mês {mes_modis} de {ano_modis} (Mapa) / Ano {ano_modis} (Evolução)"
         
         card_html = f"""
         <div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; border-left: 8px solid #ff4b4b; margin-bottom: 15px; box-shadow: 1px 1px 4px rgba(0,0,0,0.05);">
@@ -385,7 +390,6 @@ if st.session_state.gerar_dashboard:
             
             col_controles1, col_controles2 = st.columns([1, 1.2])
             with col_controles1:
-                # NOME CORRIGIDO E SIMPLIFICADO
                 estilo_mapa = st.radio("🎨 Estilo de Fundo:", ["🌑 Mapa Dark", "🛰️ Satélite (Google)"], horizontal=False)
             
             focar_area = "Visão Geral"
@@ -404,14 +408,12 @@ if st.session_state.gerar_dashboard:
                 zoom_inicio = 10 if tipo_analise == "Por Município" else 6
 
             if "Dark" in estilo_mapa:
-                # MAPA BASE: O fundo escuro liso
                 m = folium.Map(
                     location=[centro.y, centro.x], 
                     zoom_start=zoom_inicio, 
                     tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
                     attr='Esri Base'
                 )
-                # MAPA DE REFERÊNCIA: As bordas de estado, nomes e estradas fininhas desenhadas por cima
                 folium.TileLayer(
                     tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
                     attr='Esri Reference',
@@ -435,13 +437,17 @@ if st.session_state.gerar_dashboard:
                 ).add_to(m)
 
             if "INPE" in fonte_escolhida and not df_rec.empty:
-                # ESCALA TRAVADA: O `max_zoom=14` segura a explosão visual.
+                # HeatMap Clássico, como definido na resposta anterior
+                focos_heat = df_rec[['latitude', 'longitude']].dropna().values.tolist()
+                
                 HeatMap(
-                    df_rec[["latitude", "longitude"]].dropna().values.tolist(), 
-                    radius=10, 
-                    blur=8, 
-                    max_zoom=14, 
-                    min_opacity=0.4
+                    focos_heat,
+                    name="Mancha de Calor",
+                    radius=12,        
+                    blur=10,          
+                    min_opacity=0.4,  
+                    max_zoom=10,      
+                    gradient={0.2: 'blue', 0.4: 'lime', 0.6: 'yellow', 0.8: 'orange', 1.0: 'red'}
                 ).add_to(m)
             
             elif "MODIS" in fonte_escolhida and area_queimada_img:
