@@ -20,7 +20,6 @@ st.set_page_config(
 
 # ==========================================
 # 🛠️ TRUQUE DE SOBREVIVÊNCIA (KEEP-ALIVE)
-# Força o Streamlit a manter a conexão ativa
 if 'last_heartbeat' not in st.session_state:
     st.session_state.last_heartbeat = datetime.now()
 
@@ -42,7 +41,8 @@ try:
 except Exception as e:
     st.error("⚠️ Erro ao conectar com o Google Earth Engine. Verifique seus Secrets.")
 
-def add_ee_layer(self, ee_image_object, vis_params, name, show=True, opacity=0.7):
+# Modificação 1: Opacidade ajustada para 1.0 (100%) para dar mais destaque
+def add_ee_layer(self, ee_image_object, vis_params, name, show=True, opacity=1.0):
     try:
         map_id_dict = ee.Image(ee_image_object).getMapId(vis_params)
         tiles_url = map_id_dict.get('tile_fetcher', {}).url_format if 'tile_fetcher' in map_id_dict else map_id_dict.get('urlFormat', map_id_dict.get('url_format', ''))
@@ -161,20 +161,18 @@ st.sidebar.markdown("---")
 area_protegida = st.sidebar.selectbox("🌳 Análise de Risco (Cruzamento Espacial):", ["Nenhuma", "Terras Indígenas", "Unidades de Conservação"])
 
 # ==========================================
-# 🤫 SEGREDO DA URL (MODO INVISÍVEL)
+# 🤫 SEGREDO DA URL
 # ==========================================
 st.sidebar.markdown("---")
-modo_debug = False # Falso por padrão
+modo_debug = False
 
-# Verifica se o parâmetro secreto 'qa' está na URL e se é igual a 'true'
 if "qa" in st.query_params and st.query_params["qa"].lower() == "true":
-    modo_debug = st.sidebar.toggle("🐛 Modo de Validação (QA)", value=True, help="Apenas visível via parâmetro secreto na URL.")
+    modo_debug = st.sidebar.toggle("🐛 Modo de Validação (QA)", value=True)
 
 gerar = st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True)
 
 # --- SEÇÃO DE CONTATO ---
 st.sidebar.markdown("---")
-
 gmail_logo_url = "https://upload.wikimedia.org/wikipedia/commons/7/7e/Gmail_icon_%282020%29.svg"
 linkedin_logo_url = "https://upload.wikimedia.org/wikipedia/commons/c/ca/LinkedIn_logo_initials.png"
 
@@ -194,13 +192,14 @@ html_contato_novo = f"""
 </div>
 </div>
 """
-
 st.sidebar.markdown(html_contato_novo, unsafe_allow_html=True)
-# -------------------------------------
 
-
-# --- INTERFACE (TELA PRINCIPAL) ---
+# --- TELA PRINCIPAL ---
 st.title("🔥 Dashboard de Queimadas 🔥")
+
+# Variáveis globais de estado
+total_valor = 0
+dados_indisponiveis = False # Controle para MODIS não processado
 
 if gerar:
     hoje = datetime.now()
@@ -214,7 +213,6 @@ if gerar:
 
         df_ranking_areas = pd.DataFrame()
         areas_afetadas = gpd.GeoDataFrame()
-        total_valor = 0
         df_rec = pd.DataFrame() 
         area_queimada_img = None 
         df_top_mun_modis = pd.DataFrame()
@@ -241,13 +239,11 @@ if gerar:
                 df_rec = pd.DataFrame(gdf.drop(columns="geometry"))
                 total_valor = len(df_rec)
                 
-                # Cruzamento Espacial INPE
                 if area_protegida != "Nenhuma" and not df_rec.empty:
                     st.write(f"🌳 Isolando focos em {area_protegida}...")
                     gdf_areas = carregar_areas_protegidas(area_protegida)
                     gdf_areas = gdf_areas.to_crs(gdf.crs)
                     
-                    # CORREÇÃO: Remover 'index_right' do sjoin anterior
                     if 'index_right' in gdf.columns:
                         gdf = gdf.drop(columns=['index_right'])
                         
@@ -258,8 +254,6 @@ if gerar:
                         focos_em_areas = pd.DataFrame(gdf_focos_risco.drop(columns="geometry"))
                         df_ranking_areas = focos_em_areas['nome_area'].value_counts().reset_index()
                         df_ranking_areas.columns = ['Área Protegida', 'Valor']
-                        
-                        # Filtra o DataFrame principal (Deixa só os focos nas TIs/UCs)
                         df_rec = focos_em_areas
                         total_valor = len(df_rec)
                     else:
@@ -272,11 +266,14 @@ if gerar:
         else:
             st.write("☁️ Analisando satélite MODIS no GEE...")
             try:
-                # 1. Carrega imagem base do mês selecionado para o mapa principal
                 data_ini_ee = ee.Date.fromYMD(ano_modis, mes_modis, 1)
                 colecao = ee.ImageCollection('MODIS/061/MCD64A1').filterDate(data_ini_ee, data_ini_ee.advance(1, 'month')).filterBounds(ee_geom_complex)
                 
-                if colecao.size().getInfo() > 0:
+                # Modificação 3: Alerta de dados não processados pela NASA
+                if colecao.size().getInfo() == 0:
+                    dados_indisponiveis = True
+                    total_valor = 0
+                else:
                     area_queimada_img = colecao.select('BurnDate').max().clip(ee_geom_complex)
                     img_area_km2 = ee.Image.pixelArea().divide(1000000).updateMask(area_queimada_img.gt(0)).rename('area_km2')
                     
@@ -285,10 +282,9 @@ if gerar:
                     ).getInfo()
                     total_valor = round(stats_total.get('area_km2', 0) if stats_total.get('area_km2') else 0, 2)
 
-                    # 2. Cruzamento Espacial MODIS (Recorte da Imagem e Tabela de Áreas)
                     if area_protegida != "Nenhuma" and total_valor > 0:
                         st.write(f"🌳 Isolando km² afetados em {area_protegida}...")
-                        gdf_areas_br = carregar_areas_protegidas(tipo_area=area_protegida) # Chamada corrigida
+                        gdf_areas_br = carregar_areas_protegidas(tipo_area=area_protegida)
                         gdf_areas = gpd.sjoin(gdf_areas_br, limite, predicate='intersects').drop(columns=['index_right'])
                         
                         if not gdf_areas.empty:
@@ -302,7 +298,6 @@ if gerar:
                             if not df_ranking_areas.empty:
                                 areas_afetadas = gdf_areas[gdf_areas['nome_area'].isin(df_ranking_areas['Área Protegida'])]
                                 
-                                # Atualiza total_valor e recorta a imagem para as TIs/UCs afetadas
                                 total_valor = round(df_ranking_areas['Valor'].sum(), 2)
                                 ee_geom_afetadas = ee.Geometry(areas_afetadas.geometry.union_all().__geo_interface__)
                                 area_queimada_img = area_queimada_img.clip(ee_geom_afetadas)
@@ -310,21 +305,16 @@ if gerar:
                             else:
                                 total_valor = 0
 
-                    # 3. Ranking de Municípios MODIS (Calculado sempre que não for análise por município)
                     if tipo_analise != "Por Município" and total_valor > 0:
                         st.write("🏙️ Calculando ranking de municípios (MODIS)...")
                         muns_ee = ee.FeatureCollection("FAO/GAUL/2015/level2").filterBounds(ee_geom_complex)
-                        # O img_area_km2 já está recortado pela TI se o filtro estiver ativo!
                         stats_mun = img_area_km2.reduceRegions(collection=muns_ee, reducer=ee.Reducer.sum(), scale=1000).getInfo()
-                        
                         recs_mun = [{'Município': f['properties']['ADM2_NAME'], 'Valor': round(f['properties'].get('sum', 0), 2)} for f in stats_mun['features'] if f['properties'].get('sum', 0) > 0]
                         if recs_mun:
                             df_top_mun_modis = pd.DataFrame(recs_mun).sort_values(by='Valor', ascending=False).head(5)
 
-                    # 4. Evolução Temporal MODIS (12 meses do ano selecionado)
                     if total_valor > 0:
                         st.write("📊 Calculando série temporal anual (MODIS)...")
-                        # Define qual geometria usar para a série temporal
                         geom_temporal = ee_geom_afetadas if (area_protegida != "Nenhuma" and not areas_afetadas.empty) else ee_geom_complex
                         
                         def calc_mes(m):
@@ -336,7 +326,6 @@ if gerar:
                             val = area_calc.reduceRegion(reducer=ee.Reducer.sum(), geometry=geom_temporal, scale=1000, maxPixels=1e10).get('area')
                             return ee.Feature(None, {'mes': m_num, 'area': val})
                         
-                        # Mapeia a função sobre os 12 meses do ano
                         meses_list = ee.List.sequence(1, 12)
                         fc_meses = ee.FeatureCollection(meses_list.map(calc_mes)).getInfo()
                         
@@ -351,12 +340,14 @@ if gerar:
         status.update(label="✅ Análise concluída!", state="complete", expanded=False)
 
     # ==========================================
-    # RENDERIZAÇÃO VISUAL (Serve para INPE e MODIS)
+    # RENDERIZAÇÃO VISUAL (Seção Final)
     # ==========================================
-    if total_valor == 0:
+    if dados_indisponiveis:
+        mes_nome = {1:'Jan', 2:'Fev', 3:'Mar', 4:'Abr', 5:'Mai', 6:'Jun', 7:'Jul', 8:'Ago', 9:'Set', 10:'Out', 11:'Nov', 12:'Dez'}[mes_modis]
+        st.warning(f"⏳ **Aviso de Processamento NASA:** Os dados do satélite MODIS para **{mes_nome} de {ano_modis}** ainda não foram publicados. (Geralmente há um atraso de 1 a 2 meses na disponibilização oficial). Por favor, tente selecionar um mês anterior.")
+    elif total_valor == 0:
         st.error("⚠️ Nenhum registro detectado nos limites selecionados.")
     else:
-        # 1. CARD DE RESUMO ESTILIZADO
         texto_titulo = f"Total Confirmado: {total_valor:,} focos" if "INPE" in fonte_escolhida else f"Área Queimada Total: {total_valor:,.2f} km²"
         texto_sub = f"Período: {quantidade_sel} {unidade_dd}" if "INPE" in fonte_escolhida else f"Período: Mês {mes_modis} de {ano_modis} (Mapa) / Ano {ano_modis} (Evolução)"
         
@@ -372,7 +363,6 @@ if gerar:
         """
         st.markdown(card_html, unsafe_allow_html=True)
 
-        # 2. ALERTA DE RISCO COM GRÁFICO DINÂMICO
         if not df_ranking_areas.empty:
             metrica = "focos detectados" if "INPE" in fonte_escolhida else "km² queimados"
             st.error(f"🚨 **ANÁLISE FOCADA:** {total_valor} {metrica} limitados dentro de {area_protegida}!")
@@ -381,7 +371,6 @@ if gerar:
             with col_alerta1:
                 qtd_areas = min(10, len(df_ranking_areas))
                 titulo_dinamico = f"🔥 Top {qtd_areas} Áreas Mais Afetadas" if qtd_areas > 1 else "🔥 Área Mais Afetada"
-                
                 fig_areas = px.bar(
                     df_ranking_areas.head(10), x='Valor', y='Área Protegida', orientation='h', 
                     text='Valor', color='Valor', color_continuous_scale=px.colors.sequential.Reds, title=titulo_dinamico
@@ -396,22 +385,48 @@ if gerar:
         
         st.markdown("---") 
 
-        # 3. CONSTRUÇÃO DO MAPA E GRÁFICOS INFERIORES
         col1, col2 = st.columns([1.3, 1])
         
         with col1:
             st.subheader("🗺️ Mapa Espacial")
-            centro = limite.geometry.union_all().centroid
-            m = folium.Map(location=[centro.y, centro.x], zoom_start=10 if tipo_analise == "Por Município" else 6, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Satélite')
+            
+            # Modificação 2A: Controles interativos em cima do mapa
+            col_controles1, col_controles2 = st.columns([1, 1.2])
+            with col_controles1:
+                estilo_mapa = st.radio("🎨 Estilo de Fundo:", ["🌑 Escuro (Melhor Contraste)", "🛰️ Satélite (Google)"], horizontal=False)
+            
+            focar_area = "Visão Geral"
+            with col_controles2:
+                if not areas_afetadas.empty:
+                    focar_area = st.selectbox("🔍 Zoom direto para:", ["Visão Geral"] + df_ranking_areas['Área Protegida'].tolist())
+            
+            # Modificação 2B: Lógica de teletransporte (Zoom e Limites)
+            if focar_area != "Visão Geral" and not areas_afetadas.empty:
+                area_especifica = areas_afetadas[areas_afetadas['nome_area'] == focar_area]
+                centro = area_especifica.geometry.union_all().centroid
+                bounds = area_especifica.geometry.total_bounds
+                zoom_inicio = 11 # Aproxima bem
+            else:
+                centro = limite.geometry.union_all().centroid
+                bounds = limite.geometry.total_bounds
+                zoom_inicio = 10 if tipo_analise == "Por Município" else 6
+
+            # Aplicação do Fundo Escuro
+            if "Escuro" in estilo_mapa:
+                m = folium.Map(location=[centro.y, centro.x], zoom_start=zoom_inicio, tiles='CartoDB dark_matter')
+            else:
+                m = folium.Map(location=[centro.y, centro.x], zoom_start=zoom_inicio, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Satélite')
+            
+            # Força o mapa a se ajustar exatamente ao quadrado da área selecionada
+            if focar_area != "Visão Geral":
+                m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
             
             folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}).add_to(m)
             
-            # --- DESENHO DAS ÁREAS PROTEGIDAS NO MAPA ---
             if not areas_afetadas.empty:
                 estilo_tooltip = "font-size: 12px; max-width: 250px; white-space: normal; background-color: white; color: black; border-radius: 4px; box-shadow: 2px 2px 5px rgba(0,0,0,0.3);"
                 folium.GeoJson(
                     areas_afetadas.__geo_interface__, 
-                    # MUDANÇA AQUI: 'weight' alterado de 3 para 1 para linhas mais finas
                     style_function=lambda x: {'fillColor': 'transparent', 'color': '#c0392b', 'weight': 1},
                     tooltip=folium.GeoJsonTooltip(fields=['nome_area'], aliases=['Área Protegida:'], style=estilo_tooltip)
                 ).add_to(m)
@@ -419,23 +434,17 @@ if gerar:
             if "INPE" in fonte_escolhida and not df_rec.empty:
                 HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=15, blur=20).add_to(m)
             
-            # ==========================================
-            # AQUI ESTÁ A OPÇÃO 1 PARA O MODIS
-            # ==========================================
             elif "MODIS" in fonte_escolhida and area_queimada_img:
-                # Definir parâmetros visuais para parecer "incandescente" (Efeito Mapa de Calor)
-                # Uma paleta sequencial YlOrRd (Amarelo, Laranja, Vermelho) com 8 cores
                 vis_params_quente = {
                     'min': 1,
                     'max': 366,
                     'palette': ['#ffffcc', '#ffeda0', '#fed976', '#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#b10026']
                 }
-                m.add_ee_layer(area_queimada_img.updateMask(area_queimada_img.gt(0)), vis_params_quente, 'MODIS Área Queimada (Efeito Calor)')
+                m.add_ee_layer(area_queimada_img.updateMask(area_queimada_img.gt(0)), vis_params_quente, 'MODIS Área Queimada')
 
             st_folium(m, width=700, height=750, returned_objects=[])
         
         with col2:
-            # --- SEÇÃO DE GRÁFICOS: INPE ---
             if "INPE" in fonte_escolhida:
                 st.subheader("📈 Evolução Temporal dos Focos")
                 data_col = next(c for c in df_rec.columns if 'data' in c)
@@ -449,20 +458,16 @@ if gerar:
                 fig_line.update_layout(template='plotly_dark', xaxis_title="Tempo", yaxis_title="Nº de Focos", margin=dict(t=20, b=20))
                 st.plotly_chart(fig_line, use_container_width=True)
 
-                # Gráfico de Municípios INPE (Aparece mesmo com filtro de área protegida)
                 if 'municipio' in df_rec.columns and tipo_analise != "Por Município":
                     df_top_mun = df_rec['municipio'].value_counts().reset_index()
                     qtd_mun = min(5, len(df_top_mun))
                     st.subheader(f"🏆 Top {qtd_mun} Municípios Afetados")
-                    
                     df_top_mun = df_top_mun.head(5)
                     df_top_mun.columns = ['Município', 'Focos']
-                    
                     fig_bar = px.bar(df_top_mun, x='Focos', y='Município', orientation='h', text='Focos', color='Focos', color_continuous_scale=px.colors.sequential.Reds)
                     fig_bar.update_layout(template='plotly_dark', yaxis={'categoryorder':'total ascending'}, height=320, margin=dict(t=20, b=20), coloraxis_showscale=False)
                     st.plotly_chart(fig_bar, use_container_width=True)
 
-            # --- SEÇÃO DE GRÁFICOS: MODIS ---
             else:
                 if not df_modis_temporal.empty:
                     st.subheader(f"📈 Evolução Temporal ({ano_modis})")
@@ -471,7 +476,6 @@ if gerar:
                     fig_line.update_layout(template='plotly_dark', xaxis_title="Mês", yaxis_title="Área Afetada (km²)", margin=dict(t=20, b=20))
                     st.plotly_chart(fig_line, use_container_width=True)
 
-                # Gráfico de Municípios MODIS (Aparece mesmo com filtro de área protegida)
                 if tipo_analise != "Por Município" and not df_top_mun_modis.empty:
                     st.subheader("🏆 Top 5 Municípios Afetados")
                     fig_bar = px.bar(df_top_mun_modis, x='Valor', y='Município', orientation='h', text='Valor', color='Valor', color_continuous_scale=px.colors.sequential.Reds)
@@ -479,43 +483,25 @@ if gerar:
                     st.plotly_chart(fig_bar, use_container_width=True)
 
         # ==========================================
-        # 🐛 MODO DEBUG (QA) - INVISÍVEL AO PÚBLICO
+        # 🐛 MODO DEBUG (QA) 
         # ==========================================
         if modo_debug:
             st.markdown("---")
             st.header("🐛 Painel Secreto de Validação")
-            
             with st.expander("🔍 Abrir Raio-X dos Dados", expanded=True):
                 col_db1, col_db2 = st.columns(2)
-                
                 with col_db1:
                     st.markdown("**1. Verificação de Matemática (SJOIN)**")
                     if "INPE" in fonte_escolhida:
                         qtd_bruta = len(df) if 'df' in locals() else 0
                         qtd_limite = len(df_rec)
-                        
                         st.write(f"- Focos totais descarregados da API (Bruto): **{qtd_bruta}**")
                         st.write(f"- Focos na área final exibida: **{qtd_limite}**")
-                        
-                        if area_protegida != "Nenhuma" and 'focos_em_areas' in locals():
-                            qtd_risco = len(focos_em_areas)
-                            st.write(f"- Focos originais que caíram em {area_protegida}: **{qtd_risco}**")
-                            
-                            # Alerta de possível duplicação
-                            if qtd_risco > qtd_bruta:
-                                st.warning("⚠️ ALERTA: Tem mais focos cruzados do que descarregados no total. Isso significa que há polígonos sobrepostos na base de áreas protegidas a gerar dados duplicados!")
                     else:
                         st.write(f"- Área Queimada Calculada Total (MODIS): **{total_valor} km²**")
-
                 with col_db2:
                     st.markdown("**2. Dados para o Teste do Espelho**")
                     st.info(f"Use estes parâmetros no site oficial:\n- **Local:** {val_sel}\n- **Fonte:** {fonte_escolhida}\n- **Área Protegida:** {area_protegida}")
-                
-                st.markdown("**3. Tabela Bruta (Amostra para inspeção)**")
-                if "INPE" in fonte_escolhida and not df_rec.empty:
-                    st.dataframe(df_rec.head(100), use_container_width=True)
-                elif "MODIS" in fonte_escolhida and not df_modis_temporal.empty:
-                    st.dataframe(df_modis_temporal, use_container_width=True)
 
 else:
     st.info("👈 Use os filtros ao lado para selecionar a Fonte de Dados, o local e o período de análise.")
