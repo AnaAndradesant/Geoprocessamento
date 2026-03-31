@@ -221,12 +221,12 @@ if st.session_state.gerar_dashboard:
         df_top_mun_modis = pd.DataFrame()
         df_modis_temporal = pd.DataFrame()
 
-        # Calcula a data de início fora do bloco INPE para usarmos no subtítulo
-        if unidade_dd == "Dias": dt_ini = hoje - timedelta(days=quantidade_sel)
-        elif unidade_dd == "Meses": dt_ini = hoje - timedelta(days=30*quantidade_sel)
-        else: dt_ini = hoje - timedelta(days=365*quantidade_sel)
-
         if "INPE" in fonte_escolhida:
+            # --- CORREÇÃO DA DATA: Calculada apenas se INPE estiver selecionado ---
+            if unidade_dd == "Dias": dt_ini = hoje - timedelta(days=quantidade_sel)
+            elif unidade_dd == "Meses": dt_ini = hoje - timedelta(days=30*quantidade_sel)
+            else: dt_ini = hoje - timedelta(days=365*quantidade_sel)
+
             if not satelites_sel:
                 st.error("⚠️ Você precisa selecionar pelo menos um satélite.")
                 st.stop()
@@ -344,7 +344,7 @@ if st.session_state.gerar_dashboard:
     else:
         texto_titulo = f"Total Confirmado: {total_valor:,} focos" if "INPE" in fonte_escolhida else f"Área Queimada Total: {total_valor:,.2f} km²"
         
-        # --- AQUI AS DATAS EXATAS SÃO INSERIDAS NO CARD ---
+        # --- DATAS EXATAS NO CARD ---
         if "INPE" in fonte_escolhida:
             texto_sub = f"Período Analisado: {dt_ini.strftime('%d/%m/%Y')} até {hoje.strftime('%d/%m/%Y')}"
         else:
@@ -438,11 +438,11 @@ if st.session_state.gerar_dashboard:
                 ).add_to(m)
 
             if "INPE" in fonte_escolhida and not df_rec.empty:
-                # --- AQUI O MAPA FICA MAIS "SECO" E MENOS EXTRAPOLADO ---
+                # --- MAPA MAIS PONTUAL E MENOS EXTRAPOLADO ---
                 HeatMap(
                     df_rec[["latitude", "longitude"]].dropna().values.tolist(), 
-                    radius=5,         # Reduzido de 8 para 5
-                    blur=3,           # Reduzido de 5 para 3
+                    radius=5,         
+                    blur=3,           
                     max_zoom=13,      
                     min_opacity=0.4   
                 ).add_to(m)
