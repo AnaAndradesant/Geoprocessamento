@@ -7,3 +7,5 @@ streamlit-folium
 plotly
 requests
 earthengine-api
+openpyxl
+plotly>=5.0
