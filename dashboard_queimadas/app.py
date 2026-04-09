@@ -286,7 +286,8 @@ def calcular_nbr_sentinel(geom_json_str, ano, mes):
     """
     Calcula dNBR (severidade de queimada) com Sentinel-2 SR.
     Janela pré: 3 meses antes. Janela pós: mês selecionado + 1 mês após.
-    Retorna: (dnbr_img_serializado, sev_img_serializado, stats_por_classe)
+    Retorna: (dnbr_img, sev_img, stats_por_classe)
+    Levanta ValueError com mensagem amigável se não houver imagens disponíveis.
     """
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     data_ref = ee.Date.fromYMD(ano, mes, 1)
@@ -301,15 +302,42 @@ def calcular_nbr_sentinel(geom_json_str, ano, mes):
         )
         return img.updateMask(mascara).divide(10000)
 
-    colecao = (
+    colecao_base = (
         ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         .filterBounds(ee_geom)
         .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
         .map(mascara_nuvem)
     )
 
-    img_pre = colecao.filterDate(data_pre, data_ref).median().clip(ee_geom)
-    img_pos = colecao.filterDate(data_ref, data_pos).median().clip(ee_geom)
+    col_pre = colecao_base.filterDate(data_pre, data_ref)
+    col_pos = colecao_base.filterDate(data_ref, data_pos)
+
+    n_pre = col_pre.size().getInfo()
+    n_pos = col_pos.size().getInfo()
+
+    if n_pre == 0 and n_pos == 0:
+        raise ValueError(
+            f"Nenhuma imagem Sentinel-2 encontrada para esta região no período "
+            f"analisado (pré: {ano}-{mes-3:02d} a {ano}-{mes:02d} / "
+            f"pós: {ano}-{mes:02d} a {ano}-{mes+2:02d}). "
+            "Isso pode ocorrer por cobertura de nuvens acima de 20% ou por região "
+            "fora da cobertura do satélite no período. Tente outro mês ou região menor."
+        )
+    if n_pre == 0:
+        raise ValueError(
+            "Não há imagens Sentinel-2 sem nuvens para o período PRÉ-fogo "
+            f"({ano}-{mes-3:02d} a {ano}-{mes:02d}). "
+            "Tente selecionar um mês diferente para ampliar a janela de análise."
+        )
+    if n_pos == 0:
+        raise ValueError(
+            "Não há imagens Sentinel-2 sem nuvens para o período PÓS-fogo "
+            f"({ano}-{mes:02d} a {ano}-{mes+2:02d}). "
+            "Tente selecionar um mês mais antigo para que o período pós já tenha imagens disponíveis."
+        )
+
+    img_pre = col_pre.median().clip(ee_geom)
+    img_pos = col_pos.median().clip(ee_geom)
 
     nbr_pre = img_pre.normalizedDifference(['B8', 'B12']).rename('NBR_pre')
     nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
@@ -811,7 +839,7 @@ if st.session_state.gerar_dashboard:
             with col_controles1:
                 estilo_mapa = st.radio(
                     "🎨 Estilo de Fundo:",
-                    ["🌑 Mapa Dark", "🛰️ Satélite (Google)"],
+                    ["🌑 Mapa Dark", "🛰️ Satélite (Google)", "🗺️ Mapa Padrão"],
                     horizontal=False
                 )
             focar_area = "Visão Geral"
@@ -834,70 +862,131 @@ if st.session_state.gerar_dashboard:
                 bounds = limite.geometry.total_bounds
                 zoom_inicio = 10 if tipo_analise == "Por Município" else 6
 
-            if "Dark" in estilo_mapa:
-                m = folium.Map(
-                    location=[centro.y, centro.x],
-                    zoom_start=zoom_inicio,
-                    tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
-                    attr='Esri Base'
-                )
+            tiles_config = {
+                "🌑 Mapa Dark": {
+                    "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                    "attr": "Esri",
+                    "ref_url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
+                },
+                "🛰️ Satélite (Google)": {
+                    "url": "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+                    "attr": "Google",
+                    "ref_url": None,
+                },
+                "🗺️ Mapa Padrão": {
+                    "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                    "attr": "OpenStreetMap",
+                    "ref_url": None,
+                },
+            }
+            cfg = tiles_config[estilo_mapa]
+            m = folium.Map(
+                location=[centro.y, centro.x],
+                zoom_start=zoom_inicio,
+                tiles=cfg["url"],
+                attr=cfg["attr"],
+                zoom_control=True,
+                prefer_canvas=True,
+            )
+            if cfg["ref_url"]:
                 folium.TileLayer(
-                    tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
-                    attr='Esri Reference', overlay=True, control=False
+                    tiles=cfg["ref_url"], attr="Esri Ref",
+                    overlay=True, control=False
                 ).add_to(m)
-            else:
-                m = folium.Map(
-                    location=[centro.y, centro.x],
-                    zoom_start=zoom_inicio,
-                    tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-                    attr='Google Satélite'
-                )
 
             if focar_area != "Visão Geral":
                 m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
 
+            # Borda da região selecionada
             folium.GeoJson(
                 limite.__geo_interface__,
+                name="Região selecionada",
                 style_function=lambda x: {
-                    'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3
-                }
+                    'fillColor': '#00d4ff',
+                    'fillOpacity': 0.04,
+                    'color': '#00d4ff',
+                    'weight': 2.5,
+                    'dashArray': '6 3',
+                },
             ).add_to(m)
 
+            # Áreas protegidas afetadas
             if not areas_afetadas.empty:
-                estilo_tooltip = (
-                    "font-size: 12px; max-width: 250px; white-space: normal; "
-                    "background-color: white; color: black; border-radius: 4px; "
-                    "box-shadow: 2px 2px 5px rgba(0,0,0,0.3);"
-                )
                 folium.GeoJson(
                     areas_afetadas.__geo_interface__,
+                    name="Áreas protegidas afetadas",
                     style_function=lambda x: {
-                        'fillColor': 'transparent', 'color': '#c0392b', 'weight': 1
+                        'fillColor': '#e74c3c',
+                        'fillOpacity': 0.18,
+                        'color': '#c0392b',
+                        'weight': 1.5,
                     },
                     tooltip=folium.GeoJsonTooltip(
                         fields=['nome_area'],
-                        aliases=['Área Protegida:'],
-                        style=estilo_tooltip
-                    )
+                        aliases=['📍 Área Protegida:'],
+                        style=(
+                            "font-size:12px; background:white; color:#2c3e50; "
+                            "border-radius:6px; box-shadow:2px 2px 6px rgba(0,0,0,0.25);"
+                        ),
+                    ),
                 ).add_to(m)
 
+            # Dados de queimada / focos
             if "INPE" in fonte_escolhida and not df_rec.empty:
                 HeatMap(
                     df_rec[["latitude", "longitude"]].dropna().values.tolist(),
-                    radius=5, blur=3, max_zoom=13, min_opacity=0.4
+                    name="Densidade de focos",
+                    radius=8,
+                    blur=12,
+                    max_zoom=14,
+                    min_opacity=0.35,
+                    gradient={0.2: '#ffffb2', 0.45: '#fecc5c',
+                               0.65: '#fd8d3c', 0.85: '#f03b20', 1.0: '#bd0026'},
                 ).add_to(m)
+
+                # Legenda INPE
+                legenda_inpe = """
+                <div style="position:fixed; bottom:28px; left:12px; z-index:9999;
+                            background:rgba(15,15,15,0.82); padding:10px 14px;
+                            border-radius:10px; font-size:12px; color:#ecf0f1;
+                            line-height:1.9; border:1px solid rgba(255,255,255,0.1);">
+                  <b style="font-size:13px; letter-spacing:.5px;">🔥 Intensidade de Focos</b><br>
+                  <span style="background:linear-gradient(to right,#ffffb2,#fecc5c,#fd8d3c,#f03b20,#bd0026);
+                               display:inline-block;width:130px;height:10px;border-radius:4px;
+                               vertical-align:middle;margin-top:4px;"></span><br>
+                  <span style="color:#ffffb2;">Baixa</span>
+                  <span style="float:right;color:#bd0026;">Alta</span>
+                </div>"""
+                m.get_root().html.add_child(folium.Element(legenda_inpe))
+
             elif "MODIS" in fonte_escolhida and area_queimada_img:
                 vis_params_quente = {
                     'min': 1, 'max': 366,
-                    'palette': ['#ffffcc','#ffeda0','#fed976','#feb24c',
-                                '#fd8d3c','#fc4e2a','#e31a1c','#b10026']
+                    'palette': ['#fff7bc', '#fec44f', '#fe9929',
+                                '#ec7014', '#cc4c02', '#8c2d04'],
                 }
                 m.add_ee_layer(
                     area_queimada_img.updateMask(area_queimada_img.gt(0)),
-                    vis_params_quente, 'MODIS Área Queimada'
+                    vis_params_quente, 'Área Queimada (MODIS)', opacity=0.85
                 )
 
-            st_folium(m, width=None, height=750, returned_objects=[])
+                # Legenda MODIS
+                legenda_modis = """
+                <div style="position:fixed; bottom:28px; left:12px; z-index:9999;
+                            background:rgba(15,15,15,0.82); padding:10px 14px;
+                            border-radius:10px; font-size:12px; color:#ecf0f1;
+                            line-height:1.9; border:1px solid rgba(255,255,255,0.1);">
+                  <b style="font-size:13px; letter-spacing:.5px;">🗺️ Área Queimada (MODIS)</b><br>
+                  <span style="background:linear-gradient(to right,#fff7bc,#fec44f,#fe9929,#ec7014,#cc4c02,#8c2d04);
+                               display:inline-block;width:130px;height:10px;border-radius:4px;
+                               vertical-align:middle;margin-top:4px;"></span><br>
+                  <span style="color:#fff7bc;">Início do mês</span>
+                  <span style="float:right;color:#8c2d04;">Fim do mês</span>
+                </div>"""
+                m.get_root().html.add_child(folium.Element(legenda_modis))
+
+            folium.LayerControl(collapsed=False).add_to(m)
+            st_folium(m, width=None, height=700, returned_objects=[])
 
         # ----------------------------------------------------------
         # ABA 2 — GRÁFICOS & ANOMALIA
@@ -976,92 +1065,165 @@ if st.session_state.gerar_dashboard:
                 # --- ANOMALIA HISTÓRICA ---
                 if not df_modis_temporal.empty and ano_modis > 2001:
                     st.markdown("---")
-                    st.subheader(
-                        f"📉 Anomalia vs. Média Histórica (2001–{ano_modis - 1})"
-                    )
+                    st.subheader(f"📊 {ano_modis} foi um ano normal para queimadas?")
                     st.caption(
-                        "Compara a área queimada de cada mês do ano selecionado "
-                        "com a média do mesmo mês desde 2001. "
-                        "🔴 Acima da média  •  🟢 Abaixo da média"
+                        f"Comparamos cada mês de **{ano_modis}** com a média histórica "
+                        f"do mesmo mês entre **2001 e {ano_modis - 1}**. "
+                        "Assim você vê rapidamente se o ano foi mais ou menos crítico que o habitual."
                     )
 
-                    with st.spinner(
-                        "Calculando anomalia histórica... "
-                        "(pode levar ~1 min na 1ª vez, depois fica em cache)"
-                    ):
+                    with st.spinner("Calculando comparação histórica..."):
                         df_anomalia = calcular_anomalia_modis(geom_json_str, ano_modis)
 
                     if not df_anomalia.empty:
                         col_ano = f'Área {ano_modis} (km²)'
 
+                        # --- Resumo geral em linguagem simples ---
+                        meses_acima = df_anomalia[df_anomalia['Anomalia (%)'] > 20]
+                        meses_abaixo = df_anomalia[df_anomalia['Anomalia (%)'] < -20]
+                        mes_pior = df_anomalia.loc[df_anomalia['Anomalia (%)'].idxmax()]
+                        mes_melhor = df_anomalia.loc[df_anomalia['Anomalia (%)'].idxmin()]
+
+                        # Card de veredicto geral
+                        if len(meses_acima) >= 6:
+                            veredicto_cor = "#c0392b"
+                            veredicto_icon = "🔴"
+                            veredicto_texto = f"{ano_modis} foi um ano <b>acima do normal</b> em queimadas"
+                            veredicto_detalhe = f"{len(meses_acima)} de 12 meses ficaram acima da média histórica."
+                        elif len(meses_abaixo) >= 6:
+                            veredicto_cor = "#27ae60"
+                            veredicto_icon = "🟢"
+                            veredicto_texto = f"{ano_modis} foi um ano <b>abaixo do normal</b> em queimadas"
+                            veredicto_detalhe = f"{len(meses_abaixo)} de 12 meses ficaram abaixo da média histórica."
+                        else:
+                            veredicto_cor = "#e67e22"
+                            veredicto_icon = "🟡"
+                            veredicto_texto = f"{ano_modis} foi um ano <b>dentro do padrão histórico</b>"
+                            veredicto_detalhe = "Os meses se distribuíram equilibradamente acima e abaixo da média."
+
+                        st.markdown(f"""
+                        <div style="background:rgba(255,255,255,0.04); border-left:6px solid {veredicto_cor};
+                                    border-radius:8px; padding:14px 18px; margin-bottom:16px;">
+                            <span style="font-size:20px;">{veredicto_icon}</span>
+                            <span style="font-size:17px; font-weight:600;"> {veredicto_texto}</span><br>
+                            <span style="color:#aaa; font-size:13px;">{veredicto_detalhe}</span>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        # Cards de destaques (mês mais crítico e mais tranquilo)
+                        col_dest1, col_dest2 = st.columns(2)
+                        with col_dest1:
+                            pct = mes_pior['Anomalia (%)']
+                            sinal = "+" if pct > 0 else ""
+                            st.markdown(f"""
+                            <div style="background:rgba(192,57,43,0.12); border:1px solid #c0392b;
+                                        border-radius:8px; padding:12px 16px; text-align:center;">
+                                <div style="font-size:12px; color:#e74c3c; text-transform:uppercase;
+                                            letter-spacing:1px; margin-bottom:4px;">📛 Mês mais crítico</div>
+                                <div style="font-size:28px; font-weight:700; color:#e74c3c;">
+                                    {mes_pior['Mês Nome']}
+                                </div>
+                                <div style="font-size:20px; font-weight:600; color:#e74c3c;">
+                                    {sinal}{pct:.0f}% vs. média
+                                </div>
+                                <div style="font-size:12px; color:#aaa; margin-top:4px;">
+                                    {mes_pior[col_ano]:,.1f} km² queimados<br>
+                                    Média histórica: {mes_pior['Média Histórica (km²)']:,.1f} km²
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        with col_dest2:
+                            pct2 = mes_melhor['Anomalia (%)']
+                            sinal2 = "+" if pct2 > 0 else ""
+                            st.markdown(f"""
+                            <div style="background:rgba(39,174,96,0.12); border:1px solid #27ae60;
+                                        border-radius:8px; padding:12px 16px; text-align:center;">
+                                <div style="font-size:12px; color:#2ecc71; text-transform:uppercase;
+                                            letter-spacing:1px; margin-bottom:4px;">✅ Mês mais tranquilo</div>
+                                <div style="font-size:28px; font-weight:700; color:#2ecc71;">
+                                    {mes_melhor['Mês Nome']}
+                                </div>
+                                <div style="font-size:20px; font-weight:600; color:#2ecc71;">
+                                    {sinal2}{pct2:.0f}% vs. média
+                                </div>
+                                <div style="font-size:12px; color:#aaa; margin-top:4px;">
+                                    {mes_melhor[col_ano]:,.1f} km² queimados<br>
+                                    Média histórica: {mes_melhor['Média Histórica (km²)']:,.1f} km²
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                        st.markdown("<div style='margin-top:20px;'></div>", unsafe_allow_html=True)
+
+                        # --- Gráfico de barras de anomalia (mais intuitivo que linhas) ---
+                        cores_barras = [
+                            '#c0392b' if v > 50 else
+                            '#e67e22' if v > 20 else
+                            '#27ae60' if v < -20 else
+                            '#636e72'
+                            for v in df_anomalia['Anomalia (%)']
+                        ]
+
                         fig_anom = go.Figure()
-
-                        # Linha da média histórica
-                        fig_anom.add_trace(go.Scatter(
+                        fig_anom.add_bar(
                             x=df_anomalia['Mês Nome'],
-                            y=df_anomalia['Média Histórica (km²)'],
-                            name=f'Média 2001–{ano_modis - 1}',
-                            line=dict(color='#74b9ff', width=2, dash='dash'),
-                            mode='lines+markers'
-                        ))
-
-                        # Linha do ano atual com marcadores coloridos
-                        fig_anom.add_trace(go.Scatter(
-                            x=df_anomalia['Mês Nome'],
-                            y=df_anomalia[col_ano],
-                            name=str(ano_modis),
-                            line=dict(color='#e17055', width=3),
-                            mode='lines+markers',
-                            marker=dict(
-                                color=[
-                                    '#d63031' if v > m else '#00b894'
-                                    for v, m in zip(
-                                        df_anomalia[col_ano],
-                                        df_anomalia['Média Histórica (km²)']
-                                    )
-                                ],
-                                size=9
-                            )
-                        ))
-
+                            y=df_anomalia['Anomalia (%)'],
+                            marker_color=cores_barras,
+                            text=[
+                                f"+{v:.0f}%" if v > 0 else f"{v:.0f}%"
+                                for v in df_anomalia['Anomalia (%)']
+                            ],
+                            textposition='outside',
+                            hovertemplate=(
+                                "<b>%{x}</b><br>"
+                                "Desvio da média: %{y:.1f}%<br>"
+                                "<extra></extra>"
+                            ),
+                        )
+                        fig_anom.add_hline(
+                            y=0, line_color='rgba(255,255,255,0.4)',
+                            line_width=1.5, line_dash='dot'
+                        )
+                        fig_anom.add_hrect(
+                            y0=-20, y1=20,
+                            fillcolor='rgba(255,255,255,0.03)',
+                            line_width=0,
+                            annotation_text="Faixa normal (±20%)",
+                            annotation_position="top right",
+                            annotation_font_size=11,
+                            annotation_font_color='rgba(255,255,255,0.4)',
+                        )
                         fig_anom.update_layout(
                             template='plotly_dark',
-                            xaxis_title="Mês",
-                            yaxis_title="Área Queimada (km²)",
-                            height=370,
-                            margin=dict(t=20, b=20),
-                            legend=dict(orientation='h', yanchor='bottom', y=1.02)
+                            title=dict(
+                                text=f"Desvio de {ano_modis} em relação à média histórica (%) — por mês",
+                                font_size=14
+                            ),
+                            xaxis_title="",
+                            yaxis_title="Desvio da média histórica (%)",
+                            height=380,
+                            margin=dict(t=50, b=20),
+                            showlegend=False,
+                            yaxis=dict(zeroline=False),
                         )
                         st.plotly_chart(fig_anom, use_container_width=True)
 
-                        # Tabela com semáforo de anomalia
-                        st.markdown("**Resumo por mês:**")
-                        df_display = df_anomalia[[
-                            'Mês Nome', col_ano,
-                            'Média Histórica (km²)', 'Anomalia (%)'
-                        ]].copy()
+                        # Legenda de cores simples
+                        st.markdown("""
+                        <div style="display:flex; gap:16px; font-size:12px;
+                                    color:#aaa; margin-top:-8px; margin-bottom:8px;
+                                    flex-wrap:wrap;">
+                            <span><span style="color:#c0392b;">■</span> Muito acima (+50%)</span>
+                            <span><span style="color:#e67e22;">■</span> Acima (+20% a +50%)</span>
+                            <span><span style="color:#636e72;">■</span> Dentro do normal (±20%)</span>
+                            <span><span style="color:#27ae60;">■</span> Abaixo (menos de −20%)</span>
+                        </div>
+                        """, unsafe_allow_html=True)
 
-                        def colorir_anomalia(val):
-                            if val > 50:
-                                return 'background-color: #c0392b; color: white'
-                            elif val > 20:
-                                return 'background-color: #e67e22; color: white'
-                            elif val < -20:
-                                return 'background-color: #27ae60; color: white'
-                            return ''
-
-                        st.dataframe(
-                            df_display.style.map(
-                                colorir_anomalia, subset=['Anomalia (%)']
-                            ),
-                            hide_index=True,
-                            use_container_width=True,
-                            height=280
-                        )
                 elif ano_modis == 2001:
                     st.info(
-                        "💡 O gráfico de anomalia histórica requer pelo menos 2 anos "
-                        "de dados. Selecione um ano a partir de 2002."
+                        "💡 A comparação histórica requer pelo menos 2 anos de dados. "
+                        "Selecione um ano a partir de 2002."
                     )
 
         # ----------------------------------------------------------
@@ -1090,61 +1252,63 @@ if st.session_state.gerar_dashboard:
                     with st.spinner(
                         "🛰️ Processando imagens Sentinel-2... (~30s na 1ª vez)"
                     ):
+                        nbr_ok = False
+                        stats_sev = {}
                         try:
                             dnbr_img, sev_img, stats_sev = calcular_nbr_sentinel(
                                 geom_json_str, ano_modis, mes_modis
                             )
-
-                            # Mapa NBR
-                            centro_nbr = limite.geometry.union_all().centroid
-                            m_nbr = folium.Map(
-                                location=[centro_nbr.y, centro_nbr.x],
-                                zoom_start=8,
-                                tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-                                attr='Google'
-                            )
-
-                            folium.GeoJson(
-                                limite.__geo_interface__,
-                                style_function=lambda x: {
-                                    'fillColor': 'transparent',
-                                    'color': '#00d4ff', 'weight': 2
-                                }
-                            ).add_to(m_nbr)
-
-                            vis_dnbr = {
-                                'min': -0.5, 'max': 1.3,
-                                'palette': [
-                                    '#1a9850', '#91cf60', '#d9ef8b', '#ffffbf',
-                                    '#fee08b', '#fc8d59', '#d73027', '#7a0403'
-                                ]
-                            }
-                            m_nbr.add_ee_layer(
-                                dnbr_img, vis_dnbr,
-                                'dNBR (severidade contínua)', opacity=0.85
-                            )
-
-                            legenda_html = """
-                            <div style="position: fixed; bottom: 30px; right: 10px;
-                                        z-index:9999; background:rgba(20,20,20,0.88);
-                                        padding:12px 16px; border-radius:10px;
-                                        font-size:12px; color:white; line-height:2;">
-                                <b style="font-size:13px;">Severidade dNBR</b><br>
-                                <span style="color:#1a9850;">■</span> Regeneração (dNBR &lt; -0.1)<br>
-                                <span style="color:#91cf60;">■</span> Não afetado (-0.1 a 0.1)<br>
-                                <span style="color:#fee08b;">■</span> Baixa (0.1 a 0.27)<br>
-                                <span style="color:#fc8d59;">■</span> Moderada (0.27 a 0.44)<br>
-                                <span style="color:#d73027;">■</span> Moderada-Alta (0.44 a 0.66)<br>
-                                <span style="color:#7a0403;">■</span> Alta (&gt; 0.66)
-                            </div>"""
-                            m_nbr.get_root().html.add_child(folium.Element(legenda_html))
-                            folium.LayerControl().add_to(m_nbr)
-
-                            st_folium(m_nbr, width=None, height=620, returned_objects=[])
-
+                            nbr_ok = True
+                        except ValueError as ve:
+                            st.warning(f"⚠️ {ve}")
                         except Exception as e:
-                            st.error(f"⚠️ Erro ao processar Sentinel-2: {e}")
-                            stats_sev = {}
+                            st.error(
+                                f"⚠️ Erro inesperado ao processar Sentinel-2: {e}\n\n"
+                                "Tente uma região menor (Por Município) ou um mês diferente."
+                            )
+
+                    if nbr_ok:
+                        centro_nbr = limite.geometry.union_all().centroid
+                        m_nbr = folium.Map(
+                            location=[centro_nbr.y, centro_nbr.x],
+                            zoom_start=8,
+                            tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
+                            attr='Google'
+                        )
+                        folium.GeoJson(
+                            limite.__geo_interface__,
+                            style_function=lambda x: {
+                                'fillColor': 'transparent',
+                                'color': '#00d4ff', 'weight': 2
+                            }
+                        ).add_to(m_nbr)
+                        vis_dnbr = {
+                            'min': -0.5, 'max': 1.3,
+                            'palette': [
+                                '#1a9850', '#91cf60', '#d9ef8b', '#ffffbf',
+                                '#fee08b', '#fc8d59', '#d73027', '#7a0403'
+                            ]
+                        }
+                        m_nbr.add_ee_layer(
+                            dnbr_img, vis_dnbr,
+                            'dNBR (severidade contínua)', opacity=0.85
+                        )
+                        legenda_html = """
+                        <div style="position:fixed; bottom:28px; right:10px; z-index:9999;
+                                    background:rgba(20,20,20,0.88); padding:12px 16px;
+                                    border-radius:10px; font-size:12px; color:white; line-height:2;
+                                    border:1px solid rgba(255,255,255,0.1);">
+                            <b style="font-size:13px;">Severidade dNBR</b><br>
+                            <span style="color:#1a9850;">■</span> Regeneração (dNBR &lt; -0.1)<br>
+                            <span style="color:#91cf60;">■</span> Não afetado (-0.1 a 0.1)<br>
+                            <span style="color:#fee08b;">■</span> Baixa (0.1 a 0.27)<br>
+                            <span style="color:#fc8d59;">■</span> Moderada (0.27 a 0.44)<br>
+                            <span style="color:#d73027;">■</span> Moderada-Alta (0.44 a 0.66)<br>
+                            <span style="color:#7a0403;">■</span> Alta (&gt; 0.66)
+                        </div>"""
+                        m_nbr.get_root().html.add_child(folium.Element(legenda_html))
+                        folium.LayerControl().add_to(m_nbr)
+                        st_folium(m_nbr, width=None, height=620, returned_objects=[])
 
                 with col_nbr2:
                     if stats_sev:
