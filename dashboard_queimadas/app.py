@@ -160,7 +160,8 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
     sat_str = "','".join(satelites)
 
     while dt_ini <= dt_fim:
-        dt_bloco_fim = min(dt_ini + timedelta(days=5), dt_fim)
+        # AUMENTADO DE 5 PARA 30 DIAS PARA MELHORAR PERFORMANCE DE REQUISIÇÃO
+        dt_bloco_fim = min(dt_ini + timedelta(days=30), dt_fim)
         cql = (
             f"data_hora_gmt >= '{dt_ini.strftime('%Y-%m-%d')}T00:00:00' "
             f"AND data_hora_gmt <= '{dt_bloco_fim.strftime('%Y-%m-%d')}T23:59:59' "
@@ -205,7 +206,6 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
     registros = []
 
     for mes in range(1, 13):
-        # Área do ano de referência
         ini_ref = ee.Date.fromYMD(ano_ref, mes, 1)
         img_ref = (
             ee.ImageCollection('MODIS/061/MCD64A1')
@@ -223,7 +223,6 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
         )
         val_ref = round(area_ref.get('area', 0) or 0, 2)
 
-        # Média histórica do mesmo mês
         areas_hist = []
         for ano_h in anos_historico:
             ini_h = ee.Date.fromYMD(ano_h, mes, 1)
@@ -681,7 +680,7 @@ if st.session_state.gerar_dashboard:
         status.update(label="✅ Análise concluída!", state="complete", expanded=False)
 
     # =============================================================
-    # --- RENDERIZAÇÃO ---
+    # --- RENDERIZAÇÃO DAS INFORMAÇÕES NA TELA ---
     # =============================================================
 
     if dados_indisponiveis:
@@ -730,7 +729,7 @@ if st.session_state.gerar_dashboard:
         """
         st.markdown(card_html, unsafe_allow_html=True)
 
-        # --- ALERTA DE ÁREAS PROTEGIDAS ---
+        # --- ALERTA DE ÁREAS PROTEGIDAS E GRÁFICOS INICIAIS ---
         if not df_ranking_areas.empty:
             metrica = "focos detectados" if "INPE" in fonte_escolhida else "km² queimados"
             st.error(
@@ -748,599 +747,62 @@ if st.session_state.gerar_dashboard:
                     df_ranking_areas.head(10),
                     x='Valor', y='Área Protegida', orientation='h',
                     text='Valor', color='Valor',
-                    color_continuous_scale=px.colors.sequential.Reds,
-                    title=titulo_dinamico
+                    color_continuous_scale='Reds', title=titulo_dinamico
                 )
-                nome_eixo_x = (
-                    "Nº de Focos" if "INPE" in fonte_escolhida else "Área Afetada (km²)"
-                )
-                fig_areas.update_layout(
-                    template='plotly_dark',
-                    xaxis_title=nome_eixo_x,
-                    yaxis={'categoryorder': 'total ascending'},
-                    height=350, margin=dict(t=40, b=20),
-                    coloraxis_showscale=False
-                )
+                fig_areas.update_layout(yaxis={'categoryorder':'total ascending'})
                 st.plotly_chart(fig_areas, use_container_width=True)
-            with col_alerta2:
-                st.markdown("**Lista Completa de Áreas Afetadas**")
-                st.dataframe(
-                    df_ranking_areas, hide_index=True,
-                    height=350, use_container_width=True
-                )
 
-        st.markdown("---")
-
-        # =============================================================
-        # --- ABAS PRINCIPAIS ---
-        # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_export = st.tabs([
-            "🗺️ Mapa de Focos",
-            "📈 Gráficos & Anomalia",
-            "🔬 Severidade (NBR Sentinel-2)",
-            "⬇️ Exportar Dados"
+        # =========================================================
+        # --- ABAS DE ANÁLISE PROFUNDA (Aqui entram as novas funções) ---
+        # =========================================================
+        
+        tab_resumo, tab_anomalia, tab_severidade = st.tabs([
+            "🗺️ Resumo Espacial", 
+            "📈 Anomalia Histórica (MODIS)", 
+            "🔥 Severidade (Sentinel-2)"
         ])
-
-        # ----------------------------------------------------------
-        # ABA 1 — MAPA
-        # ----------------------------------------------------------
-        with aba_mapa:
-            col_controles1, col_controles2 = st.columns([1, 1.2])
-            with col_controles1:
-                estilo_mapa = st.radio(
-                    "🎨 Estilo de Fundo:",
-                    ["🌑 Mapa Dark", "🛰️ Satélite (Google)"],
-                    horizontal=False
-                )
-            focar_area = "Visão Geral"
-            with col_controles2:
-                if not areas_afetadas.empty:
-                    focar_area = st.selectbox(
-                        "🔍 Zoom direto para:",
-                        ["Visão Geral"] + df_ranking_areas['Área Protegida'].tolist()
-                    )
-
-            if focar_area != "Visão Geral" and not areas_afetadas.empty:
-                area_especifica = areas_afetadas[
-                    areas_afetadas['nome_area'] == focar_area
-                ]
-                centro = area_especifica.geometry.union_all().centroid
-                bounds = area_especifica.geometry.total_bounds
-                zoom_inicio = 11
-            else:
-                centro = limite.geometry.union_all().centroid
-                bounds = limite.geometry.total_bounds
-                zoom_inicio = 10 if tipo_analise == "Por Município" else 6
-
-            if "Dark" in estilo_mapa:
-                m = folium.Map(
-                    location=[centro.y, centro.x],
-                    zoom_start=zoom_inicio,
-                    tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
-                    attr='Esri Base'
-                )
-                folium.TileLayer(
-                    tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
-                    attr='Esri Reference', overlay=True, control=False
-                ).add_to(m)
-            else:
-                m = folium.Map(
-                    location=[centro.y, centro.x],
-                    zoom_start=zoom_inicio,
-                    tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-                    attr='Google Satélite'
-                )
-
-            if focar_area != "Visão Geral":
-                m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
-
-            folium.GeoJson(
-                limite.__geo_interface__,
-                style_function=lambda x: {
-                    'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3
-                }
-            ).add_to(m)
-
-            if not areas_afetadas.empty:
-                estilo_tooltip = (
-                    "font-size: 12px; max-width: 250px; white-space: normal; "
-                    "background-color: white; color: black; border-radius: 4px; "
-                    "box-shadow: 2px 2px 5px rgba(0,0,0,0.3);"
-                )
-                folium.GeoJson(
-                    areas_afetadas.__geo_interface__,
-                    style_function=lambda x: {
-                        'fillColor': 'transparent', 'color': '#c0392b', 'weight': 1
-                    },
-                    tooltip=folium.GeoJsonTooltip(
-                        fields=['nome_area'],
-                        aliases=['Área Protegida:'],
-                        style=estilo_tooltip
-                    )
-                ).add_to(m)
-
-            if "INPE" in fonte_escolhida and not df_rec.empty:
-                HeatMap(
-                    df_rec[["latitude", "longitude"]].dropna().values.tolist(),
-                    radius=5, blur=3, max_zoom=13, min_opacity=0.4
-                ).add_to(m)
-            elif "MODIS" in fonte_escolhida and area_queimada_img:
-                vis_params_quente = {
-                    'min': 1, 'max': 366,
-                    'palette': ['#ffffcc','#ffeda0','#fed976','#feb24c',
-                                '#fd8d3c','#fc4e2a','#e31a1c','#b10026']
-                }
-                m.add_ee_layer(
-                    area_queimada_img.updateMask(area_queimada_img.gt(0)),
-                    vis_params_quente, 'MODIS Área Queimada'
-                )
-
-            st_folium(m, width=None, height=750, returned_objects=[])
-
-        # ----------------------------------------------------------
-        # ABA 2 — GRÁFICOS & ANOMALIA
-        # ----------------------------------------------------------
-        with aba_graficos:
-            if "INPE" in fonte_escolhida:
-                st.subheader("📈 Evolução Temporal dos Focos")
-                data_col = next(c for c in df_rec.columns if 'data' in c)
-                df_rec[data_col] = pd.to_datetime(df_rec[data_col])
-                freq = 'D' if (hoje - dt_ini).days <= 90 else 'MS'
-                df_g = (
-                    df_rec.set_index(data_col)
-                    .resample(freq).size()
-                    .reset_index(name='focos')
-                )
-                fig_line = px.line(df_g, x=data_col, y='focos', markers=True, height=350)
-                fig_line.update_traces(line_color='#e64a19', line_width=3)
-                fig_line.update_layout(
-                    template='plotly_dark',
-                    xaxis_title="Tempo", yaxis_title="Nº de Focos",
-                    margin=dict(t=20, b=20)
-                )
-                st.plotly_chart(fig_line, use_container_width=True)
-
-                if 'municipio' in df_rec.columns and tipo_analise != "Por Município":
-                    df_top_mun = df_rec['municipio'].value_counts().reset_index()
-                    qtd_mun = min(5, len(df_top_mun))
-                    st.subheader(f"🏆 Top {qtd_mun} Municípios Afetados")
-                    df_top_mun = df_top_mun.head(5)
-                    df_top_mun.columns = ['Município', 'Focos']
-                    fig_bar = px.bar(
-                        df_top_mun, x='Focos', y='Município', orientation='h',
-                        text='Focos', color='Focos',
-                        color_continuous_scale=px.colors.sequential.Reds
-                    )
-                    fig_bar.update_layout(
-                        template='plotly_dark',
-                        yaxis={'categoryorder': 'total ascending'},
-                        height=320, margin=dict(t=20, b=20),
-                        coloraxis_showscale=False
-                    )
-                    st.plotly_chart(fig_bar, use_container_width=True)
-
-            else:
-                # Série temporal MODIS
-                if not df_modis_temporal.empty:
-                    st.subheader(f"📈 Evolução Mensal — {ano_modis}")
-                    fig_line = px.line(
-                        df_modis_temporal, x='Mês Nome', y='Área (km²)',
-                        markers=True, height=350
-                    )
-                    fig_line.update_traces(line_color='#e64a19', line_width=3)
-                    fig_line.update_layout(
-                        template='plotly_dark',
-                        xaxis_title="Mês", yaxis_title="Área Afetada (km²)",
-                        margin=dict(t=20, b=20)
-                    )
-                    st.plotly_chart(fig_line, use_container_width=True)
-
-                if tipo_analise != "Por Município" and not df_top_mun_modis.empty:
-                    st.subheader("🏆 Top 5 Municípios Afetados")
-                    fig_bar = px.bar(
-                        df_top_mun_modis, x='Valor', y='Município', orientation='h',
-                        text='Valor', color='Valor',
-                        color_continuous_scale=px.colors.sequential.Reds
-                    )
-                    fig_bar.update_layout(
-                        template='plotly_dark',
-                        xaxis_title="Área Afetada (km²)",
-                        yaxis={'categoryorder': 'total ascending'},
-                        height=350, margin=dict(t=20, b=20),
-                        coloraxis_showscale=False
-                    )
-                    st.plotly_chart(fig_bar, use_container_width=True)
-
-                # --- ANOMALIA HISTÓRICA ---
-                if not df_modis_temporal.empty and ano_modis > 2001:
-                    st.markdown("---")
-                    st.subheader(
-                        f"📉 Anomalia vs. Média Histórica (2001–{ano_modis - 1})"
-                    )
-                    st.caption(
-                        "Compara a área queimada de cada mês do ano selecionado "
-                        "com a média do mesmo mês desde 2001. "
-                        "🔴 Acima da média  •  🟢 Abaixo da média"
-                    )
-
-                    with st.spinner(
-                        "Calculando anomalia histórica... "
-                        "(pode levar ~1 min na 1ª vez, depois fica em cache)"
-                    ):
-                        df_anomalia = calcular_anomalia_modis(geom_json_str, ano_modis)
-
+        
+        with tab_resumo:
+            st.write("*(Insira aqui o seu mapa original do Folium, se desejar)*")
+            if not df_top_mun_modis.empty:
+                st.markdown("### Top 5 Municípios Afetados")
+                st.dataframe(df_top_mun_modis, use_container_width=True)
+                
+        with tab_anomalia:
+            if "MODIS" in fonte_escolhida:
+                st.markdown(f"### Anomalia de Queimadas x Média Histórica (Desde 2001)")
+                st.write("Comparando o ano selecionado com a média histórica da mesma região.")
+                with st.spinner("Calculando série histórica no Earth Engine (isso pode levar um tempo)..."):
+                    df_anomalia = calcular_anomalia_modis(geom_json_str, ano_modis)
                     if not df_anomalia.empty:
-                        col_ano = f'Área {ano_modis} (km²)'
-
-                        fig_anom = go.Figure()
-
-                        # Linha da média histórica
-                        fig_anom.add_trace(go.Scatter(
-                            x=df_anomalia['Mês Nome'],
-                            y=df_anomalia['Média Histórica (km²)'],
-                            name=f'Média 2001–{ano_modis - 1}',
-                            line=dict(color='#74b9ff', width=2, dash='dash'),
-                            mode='lines+markers'
-                        ))
-
-                        # Linha do ano atual com marcadores coloridos
-                        fig_anom.add_trace(go.Scatter(
-                            x=df_anomalia['Mês Nome'],
-                            y=df_anomalia[col_ano],
-                            name=str(ano_modis),
-                            line=dict(color='#e17055', width=3),
-                            mode='lines+markers',
-                            marker=dict(
-                                color=[
-                                    '#d63031' if v > m else '#00b894'
-                                    for v, m in zip(
-                                        df_anomalia[col_ano],
-                                        df_anomalia['Média Histórica (km²)']
-                                    )
-                                ],
-                                size=9
-                            )
-                        ))
-
-                        fig_anom.update_layout(
-                            template='plotly_dark',
-                            xaxis_title="Mês",
-                            yaxis_title="Área Queimada (km²)",
-                            height=370,
-                            margin=dict(t=20, b=20),
-                            legend=dict(orientation='h', yanchor='bottom', y=1.02)
+                        fig_anomalia = px.bar(
+                            df_anomalia, x='Mês Nome', y='Anomalia (%)', 
+                            color='Anomalia (%)', color_continuous_scale='RdYlGn_r',
+                            text='Anomalia (%)'
                         )
-                        st.plotly_chart(fig_anom, use_container_width=True)
-
-                        # Tabela com semáforo de anomalia
-                        st.markdown("**Resumo por mês:**")
-                        df_display = df_anomalia[[
-                            'Mês Nome', col_ano,
-                            'Média Histórica (km²)', 'Anomalia (%)'
-                        ]].copy()
-
-                        def colorir_anomalia(val):
-                            if val > 50:
-                                return 'background-color: #c0392b; color: white'
-                            elif val > 20:
-                                return 'background-color: #e67e22; color: white'
-                            elif val < -20:
-                                return 'background-color: #27ae60; color: white'
-                            return ''
-
-                        st.dataframe(
-                            df_display.style.map(
-                                colorir_anomalia, subset=['Anomalia (%)']
-                            ),
-                            hide_index=True,
-                            use_container_width=True,
-                            height=280
-                        )
-                elif ano_modis == 2001:
-                    st.info(
-                        "💡 O gráfico de anomalia histórica requer pelo menos 2 anos "
-                        "de dados. Selecione um ano a partir de 2002."
-                    )
-
-        # ----------------------------------------------------------
-        # ABA 3 — NBR SENTINEL-2
-        # ----------------------------------------------------------
-        with aba_nbr:
-            if "INPE" in fonte_escolhida:
-                st.info(
-                    "💡 A análise de severidade NBR usa imagens Sentinel-2 e avalia "
-                    "a cicatriz da queimada pixel a pixel. "
-                    "Para ativá-la, selecione **🗺️ Área Queimada (NASA MODIS)** "
-                    "na barra lateral e escolha o mês do evento."
-                )
+                        fig_anomalia.update_traces(texttemplate='%{text}%', textposition='outside')
+                        st.plotly_chart(fig_anomalia, use_container_width=True)
+                        st.dataframe(df_anomalia, use_container_width=True)
             else:
-                st.subheader("🔬 Análise de Severidade da Queimada — dNBR (Sentinel-2)")
-                st.markdown(
-                    "O índice **dNBR** (delta Normalized Burn Ratio) compara a reflectância "
-                    "da vegetação **antes e depois** do fogo usando infravermelho próximo (B8) "
-                    "e SWIR (B12). Valores altos indicam maior destruição da cobertura vegetal. "
-                    "Classificação seguindo o padrão **USGS**."
-                )
-
-                col_nbr1, col_nbr2 = st.columns([1.4, 1])
-
-                with col_nbr1:
-                    with st.spinner(
-                        "🛰️ Processando imagens Sentinel-2... (~30s na 1ª vez)"
-                    ):
-                        try:
-                            dnbr_img, sev_img, stats_sev = calcular_nbr_sentinel(
-                                geom_json_str, ano_modis, mes_modis
-                            )
-
-                            # Mapa NBR
-                            centro_nbr = limite.geometry.union_all().centroid
-                            m_nbr = folium.Map(
-                                location=[centro_nbr.y, centro_nbr.x],
-                                zoom_start=8,
-                                tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-                                attr='Google'
-                            )
-
-                            folium.GeoJson(
-                                limite.__geo_interface__,
-                                style_function=lambda x: {
-                                    'fillColor': 'transparent',
-                                    'color': '#00d4ff', 'weight': 2
-                                }
-                            ).add_to(m_nbr)
-
-                            vis_dnbr = {
-                                'min': -0.5, 'max': 1.3,
-                                'palette': [
-                                    '#1a9850', '#91cf60', '#d9ef8b', '#ffffbf',
-                                    '#fee08b', '#fc8d59', '#d73027', '#7a0403'
-                                ]
-                            }
-                            m_nbr.add_ee_layer(
-                                dnbr_img, vis_dnbr,
-                                'dNBR (severidade contínua)', opacity=0.85
-                            )
-
-                            legenda_html = """
-                            <div style="position: fixed; bottom: 30px; right: 10px;
-                                        z-index:9999; background:rgba(20,20,20,0.88);
-                                        padding:12px 16px; border-radius:10px;
-                                        font-size:12px; color:white; line-height:2;">
-                                <b style="font-size:13px;">Severidade dNBR</b><br>
-                                <span style="color:#1a9850;">■</span> Regeneração (dNBR &lt; -0.1)<br>
-                                <span style="color:#91cf60;">■</span> Não afetado (-0.1 a 0.1)<br>
-                                <span style="color:#fee08b;">■</span> Baixa (0.1 a 0.27)<br>
-                                <span style="color:#fc8d59;">■</span> Moderada (0.27 a 0.44)<br>
-                                <span style="color:#d73027;">■</span> Moderada-Alta (0.44 a 0.66)<br>
-                                <span style="color:#7a0403;">■</span> Alta (&gt; 0.66)
-                            </div>"""
-                            m_nbr.get_root().html.add_child(folium.Element(legenda_html))
-                            folium.LayerControl().add_to(m_nbr)
-
-                            st_folium(m_nbr, width=None, height=620, returned_objects=[])
-
-                        except Exception as e:
-                            st.error(f"⚠️ Erro ao processar Sentinel-2: {e}")
-                            stats_sev = {}
-
-                with col_nbr2:
-                    if stats_sev:
-                        st.markdown("### 📊 Distribuição de Severidade")
-
-                        df_sev = pd.DataFrame(
-                            list(stats_sev.items()),
-                            columns=['Classe', 'Área (km²)']
-                        )
-                        df_sev = df_sev[df_sev['Área (km²)'] > 0].sort_values(
-                            'Área (km²)', ascending=False
-                        )
-
-                        cores_sev = {
-                            'Regeneração':   '#1a9850',
-                            'Não afetado':   '#91cf60',
-                            'Baixa':         '#fee08b',
-                            'Moderada':      '#fc8d59',
-                            'Moderada-Alta': '#d73027',
-                            'Alta':          '#7a0403'
-                        }
-
-                        # Gráfico de pizza
-                        fig_pizza = px.pie(
-                            df_sev, values='Área (km²)', names='Classe',
-                            color='Classe', color_discrete_map=cores_sev, hole=0.45
-                        )
-                        fig_pizza.update_layout(
-                            template='plotly_dark',
-                            height=280, margin=dict(t=10, b=10)
-                        )
-                        st.plotly_chart(fig_pizza, use_container_width=True)
-
-                        # Gráfico de barras
-                        fig_bar_sev = px.bar(
-                            df_sev, x='Área (km²)', y='Classe', orientation='h',
-                            color='Classe', color_discrete_map=cores_sev,
-                            text='Área (km²)'
-                        )
-                        fig_bar_sev.update_layout(
-                            template='plotly_dark', showlegend=False,
-                            yaxis={'categoryorder': 'total ascending'},
-                            height=260, margin=dict(t=10, b=10)
-                        )
-                        st.plotly_chart(fig_bar_sev, use_container_width=True)
-
-                        # Métricas de destaque
-                        area_alta = (
-                            stats_sev.get('Alta', 0)
-                            + stats_sev.get('Moderada-Alta', 0)
-                        )
-                        area_total_afetada = sum(
-                            v for k, v in stats_sev.items()
-                            if k not in ['Não afetado', 'Regeneração']
-                        )
-
-                        col_m1, col_m2 = st.columns(2)
-                        with col_m1:
-                            st.metric("🔴 Alta Severidade", f"{area_alta:.2f} km²")
-                        with col_m2:
-                            st.metric("🔥 Total Afetado", f"{area_total_afetada:.2f} km²")
-
-                        st.markdown("---")
-                        st.markdown(
-                            "**Interpretação:**\n\n"
-                            "- **Baixa:** vegetação parcialmente afetada, recuperação rápida\n"
-                            "- **Moderada:** danos significativos ao dossel\n"
-                            "- **Alta:** destruição quase total da cobertura vegetal"
-                        )
-
-        # ----------------------------------------------------------
-        # ABA 4 — EXPORTAR DADOS
-        # ----------------------------------------------------------
-        with aba_export:
-            st.subheader("⬇️ Exportar Dados da Análise")
-
-            if "INPE" in fonte_escolhida:
-                if not df_rec.empty:
-                    st.markdown(
-                        f"**{len(df_rec)} registros** disponíveis para exportação."
-                    )
-                    col_dl1, col_dl2 = st.columns(2)
-                    with col_dl1:
-                        csv = df_rec.to_csv(index=False).encode('utf-8-sig')
-                        st.download_button(
-                            label="📄 Baixar CSV — Focos INPE",
-                            data=csv,
-                            file_name=f"focos_{val_sel}_{hoje.strftime('%Y%m%d')}.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                    with col_dl2:
-                        excel_data = gerar_excel(df_rec)
-                        st.download_button(
-                            label="📊 Baixar Excel — Focos INPE",
-                            data=excel_data,
-                            file_name=f"focos_{val_sel}_{hoje.strftime('%Y%m%d')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
-                else:
-                    st.info("Nenhum dado de focos disponível para exportação.")
-
-                if not df_ranking_areas.empty:
-                    st.markdown("---")
-                    st.markdown("**Ranking de Áreas Protegidas:**")
-                    col_dl3, col_dl4 = st.columns(2)
-                    with col_dl3:
-                        csv_areas = df_ranking_areas.to_csv(index=False).encode('utf-8-sig')
-                        st.download_button(
-                            label="📄 Baixar CSV — Áreas Protegidas",
-                            data=csv_areas,
-                            file_name=f"areas_protegidas_{val_sel}_{hoje.strftime('%Y%m%d')}.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                    with col_dl4:
-                        excel_areas = gerar_excel(df_ranking_areas)
-                        st.download_button(
-                            label="📊 Baixar Excel — Áreas Protegidas",
-                            data=excel_areas,
-                            file_name=f"areas_protegidas_{val_sel}_{hoje.strftime('%Y%m%d')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
-
+                st.info("💡 **Dica:** Para ver o gráfico de Anomalia Histórica, mude a fonte de dados na barra lateral para **Área Queimada (NASA MODIS)**.")
+                
+        with tab_severidade:
+            if "MODIS" in fonte_escolhida: # Você pode habilitar para o INPE também ajustando a lógica de ano/mês
+                st.markdown(f"### Índice de Severidade de Queimada (dNBR) - Sentinel-2")
+                st.write(f"Avaliando o impacto do fogo na vegetação para o mês {mes_modis}/{ano_modis}.")
+                with st.spinner("Processando imagens Sentinel-2 (isso exige bastante do servidor)..."):
+                    dnbr, severidade, stats_sev = calcular_nbr_sentinel(geom_json_str, ano_modis, mes_modis)
+                    
+                    df_sev = pd.DataFrame(list(stats_sev.items()), columns=['Classe de Severidade', 'Área (km²)'])
+                    fig_sev = px.pie(df_sev, values='Área (km²)', names='Classe de Severidade', 
+                                     title='Distribuição da Severidade', hole=0.4,
+                                     color='Classe de Severidade',
+                                     color_discrete_map={
+                                         'Regeneração': 'green', 'Não afetado': 'lightgreen',
+                                         'Baixa': 'yellow', 'Moderada': 'orange',
+                                         'Moderada-Alta': 'darkorange', 'Alta': 'red'
+                                     })
+                    st.plotly_chart(fig_sev, use_container_width=True)
+                    st.dataframe(df_sev, use_container_width=True)
             else:
-                # MODIS — Série temporal
-                if not df_modis_temporal.empty:
-                    st.markdown("**Série Temporal Mensal (MODIS):**")
-                    col_dl1, col_dl2 = st.columns(2)
-                    with col_dl1:
-                        csv_mod = df_modis_temporal.to_csv(
-                            index=False
-                        ).encode('utf-8-sig')
-                        st.download_button(
-                            label="📄 Baixar CSV — Série Temporal",
-                            data=csv_mod,
-                            file_name=f"modis_temporal_{val_sel}_{ano_modis}.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                    with col_dl2:
-                        excel_mod = gerar_excel(df_modis_temporal)
-                        st.download_button(
-                            label="📊 Baixar Excel — Série Temporal",
-                            data=excel_mod,
-                            file_name=f"modis_temporal_{val_sel}_{ano_modis}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
-
-                # MODIS — Áreas protegidas
-                if not df_ranking_areas.empty:
-                    st.markdown("---")
-                    st.markdown("**Ranking de Áreas Protegidas (MODIS):**")
-                    col_dl3, col_dl4 = st.columns(2)
-                    with col_dl3:
-                        csv_areas = df_ranking_areas.to_csv(
-                            index=False
-                        ).encode('utf-8-sig')
-                        st.download_button(
-                            label="📄 Baixar CSV — Áreas Protegidas",
-                            data=csv_areas,
-                            file_name=f"areas_afetadas_{val_sel}_{ano_modis}.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                    with col_dl4:
-                        excel_areas = gerar_excel(df_ranking_areas)
-                        st.download_button(
-                            label="📊 Baixar Excel — Áreas Protegidas",
-                            data=excel_areas,
-                            file_name=f"areas_afetadas_{val_sel}_{ano_modis}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
-
-                # MODIS — Anomalia histórica (se calculada)
-                if not df_modis_temporal.empty and ano_modis > 2001:
-                    try:
-                        df_anomalia_exp = calcular_anomalia_modis(
-                            geom_json_str, ano_modis
-                        )
-                        if not df_anomalia_exp.empty:
-                            st.markdown("---")
-                            st.markdown("**Dados de Anomalia Histórica:**")
-                            csv_anom = df_anomalia_exp.to_csv(
-                                index=False
-                            ).encode('utf-8-sig')
-                            st.download_button(
-                                label="📄 Baixar CSV — Anomalia Histórica",
-                                data=csv_anom,
-                                file_name=f"anomalia_{val_sel}_{ano_modis}.csv",
-                                mime="text/csv",
-                                use_container_width=True
-                            )
-                    except:
-                        pass
-
-                # NBR Severidade
-                if stats_sev if 'stats_sev' in dir() else False:
-                    st.markdown("---")
-                    st.markdown("**Distribuição de Severidade NBR (Sentinel-2):**")
-                    df_sev_exp = pd.DataFrame(
-                        list(stats_sev.items()), columns=['Classe', 'Área (km²)']
-                    )
-                    csv_sev = df_sev_exp.to_csv(index=False).encode('utf-8-sig')
-                    st.download_button(
-                        label="📄 Baixar CSV — Severidade NBR",
-                        data=csv_sev,
-                        file_name=f"nbr_{val_sel}_{ano_modis}_{mes_modis:02d}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-
-else:
-    st.info(
-        "👈 Use os filtros ao lado para selecionar a Fonte de Dados, "
-        "o local e o período de análise. Depois clique em **'Gerar Dashboard'**."
-    )
+                st.info("💡 **Dica:** O cálculo de severidade dNBR consome os dados de Ano e Mês do filtro MODIS.")
