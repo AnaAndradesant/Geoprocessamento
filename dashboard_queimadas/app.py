@@ -1,1326 +1,400 @@
 import streamlit as st
 import pandas as pd
 import geopandas as gpd
-from datetime import datetime, timedelta
-from geobr import read_state, read_biomes, read_municipality, read_indigenous_land, read_conservation_units
 import folium
-from folium.plugins import HeatMap
 from streamlit_folium import st_folium
+from folium.plugins import HeatMap
 import plotly.express as px
 import plotly.graph_objects as go
-import requests, warnings, time, unicodedata, re, json, io
 import ee
+import json
+import requests
+from datetime import datetime, timedelta
+from io import BytesIO
 
-# --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(
-    page_title="Monitor de Queimadas Brasil",
-    page_icon="🔥",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# =============================================================
+# 1. CONFIGURAÇÕES INICIAIS E FUNÇÕES DE SUPORTE
+# =============================================================
 
-# ==========================================
-# 🛠️ KEEP-ALIVE E ESTADO
-if 'last_heartbeat' not in st.session_state:
-    st.session_state.last_heartbeat = datetime.now()
+st.set_page_config(page_title="Monitor de Fogo Pro", layout="wide", page_icon="🔥")
 
-if (datetime.now() - st.session_state.last_heartbeat).seconds > 60:
-    st.session_state.last_heartbeat = datetime.now()
+# Injeção de CSS para melhorar a estética
+st.markdown("""
+    <style>
+    .main { background-color: #0e1117; }
+    .stMetric { background-color: #1e2130; padding: 15px; border-radius: 10px; border: 1px solid #3e4253; }
+    [data-testid="stSidebar"] { background-color: #161b22; }
+    </style>
+    """, unsafe_allow_html=True)
 
-if 'gerar_dashboard' not in st.session_state:
-    st.session_state.gerar_dashboard = False
-# ==========================================
-
-warnings.filterwarnings('ignore')
-requests.packages.urllib3.disable_warnings()
-
-# --- AUTENTICAÇÃO DO EARTH ENGINE ---
-try:
-    key_dict = json.loads(st.secrets["EARTHENGINE_KEY"])
-    credentials = ee.ServiceAccountCredentials(
-        email=key_dict['client_email'],
-        key_data=st.secrets["EARTHENGINE_KEY"]
-    )
-    ee.Initialize(credentials, project='ee-anacarolinasantos580')
-except Exception as e:
-    st.error("⚠️ Erro ao conectar com o Google Earth Engine. Verifique seus Secrets.")
-
-def add_ee_layer(self, ee_image_object, vis_params, name, show=True, opacity=1.0):
+# Inicialização do Earth Engine
+@st.cache_resource
+def iniciar_ee():
     try:
-        map_id_dict = ee.Image(ee_image_object).getMapId(vis_params)
-        tiles_url = (
-            map_id_dict.get('tile_fetcher', {}).url_format
-            if 'tile_fetcher' in map_id_dict
-            else map_id_dict.get('urlFormat', map_id_dict.get('url_format', ''))
-        )
-        folium.raster_layers.TileLayer(
-            tiles=tiles_url, attr='Map Data © Google Earth Engine', name=name,
-            overlay=True, control=True, show=show, opacity=opacity
-        ).add_to(self)
-    except Exception as e:
-        st.error(f"🚨 Erro crítico ao desenhar a camada: {e}")
+        ee.Initialize()
+    except Exception:
+        ee.Authenticate()
+        ee.Initialize()
 
+iniciar_ee()
+
+# --- FUNÇÃO CRUCIAL: Adiciona suporte ao EE no Folium ---
+def add_ee_layer(self, ee_object, vis_params, name, opacity=1, show=True):
+    """Método injetado no folium.Map para plotar objetos do Earth Engine."""
+    try:
+        if isinstance(ee_object, ee.Image):
+            map_id_dict = ee.Image(ee_object).getMapId(vis_params)
+            folium.raster_layers.TileLayer(
+                tiles=map_id_dict['tile_fetcher'].url_format,
+                attr='Google Earth Engine',
+                name=name,
+                overlay=True,
+                control=True,
+                opacity=opacity,
+                show=show
+            ).add_to(self)
+        elif isinstance(ee_object, ee.FeatureCollection):
+            ee_object_new = ee.FeatureCollection(ee_object).draw(color='000000', strokeWidth=1)
+            map_id_dict = ee_object_new.getMapId(vis_params)
+            folium.raster_layers.TileLayer(
+                tiles=map_id_dict['tile_fetcher'].url_format,
+                attr='Google Earth Engine',
+                name=name,
+                overlay=True,
+                control=True,
+                opacity=opacity,
+                show=show
+            ).add_to(self)
+    except Exception as e:
+        print(f"Erro ao adicionar camada EE: {e}")
+
+# Injeta a função no Folium
 folium.Map.add_ee_layer = add_ee_layer
 
 # =============================================================
-# --- FUNÇÕES UTILITÁRIAS ---
+# 2. FUNÇÕES DE PROCESSAMENTO (API INPE, MODIS, NBR)
 # =============================================================
+
+@st.cache_data(ttl=3600)
+def carregar_focos_inpe(municipio_id):
+    url = f"https://queimadas.dgi.inpe.br/api/focos/?municipio_id={municipio_id}"
+    try:
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            df = pd.DataFrame(r.json())
+            if not df.empty:
+                df['properties'] = df['properties'].apply(lambda x: x if isinstance(x, dict) else {})
+                props = pd.json_normalize(df['properties'])
+                df = pd.concat([df.drop('properties', axis=1), props], axis=1)
+                # Extrai lat/lon da coluna geometry
+                df['longitude'] = df['geometry'].apply(lambda x: x['coordinates'][0])
+                df['latitude'] = df['geometry'].apply(lambda x: x['coordinates'][1])
+                return df
+    except:
+        return pd.DataFrame()
+    return pd.DataFrame()
+
+@st.cache_data(ttl=86400)
+def obter_limite_area(tipo, nome):
+    if tipo == "Por Estado":
+        url = f"https://servicodados.ibge.gov.br/api/v3/malhas/estados/{nome}?formato=application/vnd.geo+json"
+    else:
+        # Busca ID do município
+        url_mun = f"https://servicodados.ibge.gov.br/api/v1/localidades/municipios/{nome.replace(' ', '%20')}"
+        res = requests.get(url_mun).json()
+        id_mun = res['id'] if isinstance(res, dict) else res[0]['id']
+        url = f"https://servicodados.ibge.gov.br/api/v3/malhas/municipios/{id_mun}?formato=application/vnd.geo+json"
+    
+    gdf = gpd.read_file(url)
+    return gdf
+
+@st.cache_data
+def carregar_areas_protegidas(geom_json):
+    # Simplificação: Usando WDPA via Earth Engine para interseção
+    poly = ee.Geometry(json.loads(geom_json)['features'][0]['geometry'])
+    wdpa = ee.FeatureCollection("WCMC/WDPA/current/polygons")\
+             .filterBounds(poly)\
+             .filter(ee.Filter.neq('DESIG_ENG', 'UNESCO-MAB Biosphere Reserve'))
+    
+    features = wdpa.getInfo()['features']
+    if not features: return gpd.GeoDataFrame()
+    
+    rows = []
+    for f in features:
+        rows.append({
+            'nome_area': f['properties']['NAME'],
+            'tipo': f['properties']['DESIG_PORT'],
+            'geometry': ee.Geometry(f['geometry']).toGeoJSONString()
+        })
+    
+    gdf = gpd.GeoDataFrame(rows)
+    gdf['geometry'] = gdf['geometry'].apply(lambda x: gpd.GeoSeries.from_json(x).iloc[0])
+    return gdf
+
+@st.cache_data
+def calcular_area_queimada_modis(geom_json, ano, mes=None):
+    poly = ee.Geometry(json.loads(geom_json)['features'][0]['geometry'])
+    dataset = ee.ImageCollection('MODIS/061/MCD64A1').filterBounds(poly)
+    
+    if mes:
+        img = dataset.filter(ee.Filter.calendarRange(ano, ano, 'year'))\
+                     .filter(ee.Filter.calendarRange(mes, mes, 'month')).max()
+    else:
+        img = dataset.filter(ee.Filter.calendarRange(ano, ano, 'year')).max()
+    
+    burned = img.select('BurnDate').clip(poly)
+    area_img = ee.Image.pixelArea().updateMask(burned.gt(0))
+    stats = area_img.reduceRegion(reducer=ee.Reducer.sum(), geometry=poly, scale=500, maxPixels=1e9)
+    area_km2 = ee.Number(stats.get('area')).divide(1e6).getInfo()
+    
+    return burned, area_km2 or 0
+
+@st.cache_data
+def calcular_anomalia_modis(geom_json, ano_alvo):
+    poly = ee.Geometry(json.loads(geom_json)['features'][0]['geometry'])
+    dataset = ee.ImageCollection('MODIS/061/MCD64A1').filterBounds(poly)
+    
+    meses_nomes = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez']
+    dados = []
+    
+    for m in range(1, 13):
+        # Média histórica (2001 até ano anterior)
+        hist = dataset.filter(ee.Filter.calendarRange(2001, ano_alvo-1, 'year'))\
+                      .filter(ee.Filter.calendarRange(m, m, 'month'))
+        
+        def calc_area(img):
+            return ee.Image.pixelArea().updateMask(img.select('BurnDate').gt(0))\
+                           .reduceRegion(ee.Reducer.sum(), poly, 500).get('area')
+
+        media_m = hist.map(lambda i: ee.Feature(None, {'a': calc_area(i)}))\
+                      .aggregate_mean('a')
+        
+        # Ano atual
+        atual_img = dataset.filter(ee.Filter.calendarRange(ano_alvo, ano_alvo, 'year'))\
+                           .filter(ee.Filter.calendarRange(m, m, 'month')).max()
+        area_atual = calc_area(atual_img)
+        
+        m_hist = ee.Number(media_m).divide(1e6).getInfo() or 0
+        a_atual = ee.Number(area_atual).divide(1e6).getInfo() or 0
+        
+        anomalia = ((a_atual - m_hist) / m_hist * 100) if m_hist > 0 else 0
+        
+        dados.append({
+            'Mês': m, 'Mês Nome': meses_nomes[m-1],
+            f'Área {ano_alvo} (km²)': round(a_atual, 2),
+            'Média Histórica (km²)': round(m_hist, 2),
+            'Anomalia (%)': round(anomalia, 1)
+        })
+    
+    return pd.DataFrame(dados)
+
+@st.cache_data
+def calcular_nbr_sentinel(geom_json, ano, mes):
+    poly = ee.Geometry(json.loads(geom_json)['features'][0]['geometry'])
+    
+    # Datas para o Sentinel (1 mês antes e o mês atual)
+    data_fim = datetime(ano, mes, 28)
+    data_ini = data_fim - timedelta(days=60)
+    
+    def get_nbr(img):
+        return img.normalizedDifference(['B8', 'B12']).rename('nbr')
+
+    s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
+           .filterBounds(poly)\
+           .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    
+    pre_fire = s2.filterDate(data_ini.strftime('%Y-%m-%d'), (data_ini + timedelta(days=30)).strftime('%Y-%m-%d')).median()
+    post_fire = s2.filterDate(data_fim.replace(day=1).strftime('%Y-%m-%d'), data_fim.strftime('%Y-%m-%d')).median()
+    
+    dnbr = get_nbr(pre_fire).subtract(get_nbr(post_fire)).multiply(1000).clip(poly)
+    
+    # Classificação
+    sld_intervals = (dnbr.gt(-100).add(dnbr.gt(100)).add(dnbr.gt(270)).add(dnbr.gt(440)).add(dnbr.gt(660)))
+    
+    stats = sld_intervals.reduceRegion(ee.Reducer.frequencyHistogram(), poly, 20).getInfo()
+    
+    classes = {0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa', 3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'}
+    res_stats = {}
+    if 'groups' not in str(stats): # Simplificado
+        for k, v in stats['groups' if 'groups' in stats else 'constant'].items():
+            area = (v * 400) / 1e6 # 20m scale
+            res_stats[classes.get(int(float(k)), 'Outros')] = round(area, 2)
+            
+    return dnbr, sld_intervals, res_stats
 
 def gerar_excel(df):
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Dados')
-    return buffer.getvalue()
-
-def normalizar_texto(txt):
-    if pd.isna(txt):
-        return ""
-    return ''.join(
-        c for c in unicodedata.normalize('NFD', str(txt))
-        if unicodedata.category(c) != 'Mn'
-    ).lower()
+    return output.getvalue()
 
 # =============================================================
-# --- FUNÇÕES COM CACHE ---
+# 3. SIDEBAR / FILTROS
 # =============================================================
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def buscar_cidades(uf):
-    url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
-    try:
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            return sorted([d['nome'] for d in resp.json()])
-    except:
-        pass
-    return ["Erro ao carregar cidades"]
-
-@st.cache_data(show_spinner=False)
-def carregar_fronteira(tipo, estado, bioma, municipio):
-    if tipo == "Por Estado":
-        limite = read_state(code_state=estado, year=2020)
-    elif tipo == "Por Bioma":
-        limite = read_biomes(year=2019)
-        limite = limite[limite['name_biome'] == bioma]
-    elif tipo == "Por Município":
-        limite = read_municipality(code_muni=estado, year=2020)
-        busca = normalizar_texto(municipio.strip())
-        limite['nome_norm'] = limite['name_muni'].apply(normalizar_texto)
-        limite = limite[limite['nome_norm'].str.contains(busca)]
-    limite = limite.to_crs("EPSG:4326")
-    limite['geometry'] = limite['geometry'].simplify(tolerance=0.005, preserve_topology=True)
-    return limite
-
-@st.cache_data(show_spinner=False)
-def carregar_areas_protegidas(tipo_area):
-    if tipo_area == "Terras Indígenas":
-        gdf_areas = read_indigenous_land()
-        if 'terrai_nom' in gdf_areas.columns:
-            gdf_areas = gdf_areas.rename(columns={'terrai_nom': 'nome_area'})
+with st.sidebar:
+    st.title("🔥 Filtros de Análise")
+    fonte_escolhida = st.selectbox("📡 Fonte de Dados:", ["Focos Ativos (INPE)", "Área Queimada (NASA MODIS)"])
+    
+    tipo_analise = st.radio("📍 Abrangência:", ["Por Estado", "Por Município"])
+    
+    if tipo_analise == "Por Estado":
+        val_sel = st.selectbox("UF:", ["AM", "MT", "PA", "RO", "TO", "MS", "MA"])
     else:
-        gdf_areas = read_conservation_units()
-        if 'name_conservation_unit' in gdf_areas.columns:
-            gdf_areas = gdf_areas.rename(columns={'name_conservation_unit': 'nome_area'})
-    gdf_areas['geometry'] = gdf_areas['geometry'].make_valid()
-    gdf_areas = gdf_areas.to_crs("EPSG:4326")
-    gdf_areas['geometry'] = gdf_areas['geometry'].simplify(tolerance=0.01, preserve_topology=True)
-    return gdf_areas[['nome_area', 'geometry']]
+        val_sel = st.text_input("Digite o nome do Município (Ex: Corumbá):", "Corumbá")
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satelites):
-    url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
-    dic_estados = {
-        "AC": "ACRE", "AL": "ALAGOAS", "AP": "AMAP%", "AM": "AMAZONAS",
-        "BA": "BAHIA", "CE": "CEAR%", "DF": "DISTRITO FEDERAL",
-        "ES": "ESP%RITO SANTO", "GO": "GOI%S", "MA": "MARANH%O",
-        "MT": "MATO GROSSO", "MS": "MATO GROSSO DO SUL", "MG": "MINAS GERAIS",
-        "PA": "PAR%", "PB": "PARA%BA", "PR": "PARAN%", "PE": "PERNAMBUCO",
-        "PI": "PIAU%", "RJ": "RIO DE JANEIRO", "RN": "RIO GRANDE DO NORTE",
-        "RS": "RIO GRANDE DO SUL", "RO": "ROND%NIA", "RR": "RORAIMA",
-        "SC": "SANTA CATARINA", "SP": "S%O PAULO", "SE": "SERGIPE",
-        "TO": "TOCANTINS"
-    }
-    if tipo == "Por Estado":
-        filtro_base = f"estado ILIKE '{dic_estados.get(val_estado, val_estado)}'"
-    elif tipo == "Por Bioma":
-        tradutor = {"Amazônia": "Amaz%nia", "Mata Atlântica": "Mata Atl%ntica"}
-        filtro_base = f"bioma ILIKE '{tradutor.get(val_bioma, val_bioma)}'"
-    elif tipo == "Por Município":
-        muni_curinga = re.sub(
-            r'[aeiouáéíóúãõâêîôûAEIOUÁÉÍÓÚÃÕÂÊÎÔÛ]', '%', val_muni
-        ).replace(' ', '%')
-        filtro_base = (
-            f"estado ILIKE '{dic_estados.get(val_estado, val_estado)}' "
-            f"AND municipio ILIKE '{muni_curinga}%'"
-        )
-
-    dt_ini = datetime.strptime(d_ini, "%Y-%m-%d")
-    dt_fim = datetime.strptime(d_fim, "%Y-%m-%d")
-    all_dfs = []
-    sat_str = "','".join(satelites)
-
-    while dt_ini <= dt_fim:
-        dt_bloco_fim = min(dt_ini + timedelta(days=5), dt_fim)
-        cql = (
-            f"data_hora_gmt >= '{dt_ini.strftime('%Y-%m-%d')}T00:00:00' "
-            f"AND data_hora_gmt <= '{dt_bloco_fim.strftime('%Y-%m-%d')}T23:59:59' "
-            f"AND satelite IN ('{sat_str}') AND pais_complete_id=33 AND {filtro_base}"
-        )
-        try:
-            r = requests.get(
-                url,
-                params={
-                    "service": "WFS", "version": "1.0.0", "request": "GetFeature",
-                    "typeName": "bdqueimadas:focos", "outputFormat": "application/json",
-                    "CQL_FILTER": cql, "maxFeatures": 10000
-                },
-                verify=False, timeout=60
-            )
-            if r.status_code == 200 and r.json().get("features"):
-                registros = [
-                    {"longitude": f["geometry"]["coordinates"][0],
-                     "latitude": f["geometry"]["coordinates"][1],
-                     **f["properties"]}
-                    for f in r.json()["features"]
-                ]
-                all_dfs.append(pd.DataFrame(registros))
-        except:
-            pass
-        dt_ini = dt_bloco_fim + timedelta(days=1)
-
-    return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def calcular_anomalia_modis(geom_json_str, ano_ref):
-    """
-    Versão otimizada: toda a computação acontece server-side no GEE.
-    Uma única chamada getInfo() ao final, em vez de ~276 chamadas individuais.
-    Tempo esperado: 10–20s (vs 2–5min da versão anterior).
-    """
-    ee_geom = ee.Geometry(json.loads(geom_json_str))
-    anos_historico = list(range(2001, ano_ref))
-    anos_ee = ee.List(anos_historico)
-    n_anos = len(anos_historico)
-
-    meses_map = {
-        1: 'Jan', 2: 'Fev', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun',
-        7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Out', 11: 'Nov', 12: 'Dez'
-    }
-
-    def get_area_km2(img):
-        """Calcula área queimada em km² de uma imagem MODIS — server-side."""
-        raw = (
-            ee.Image.pixelArea().divide(1e6)
-            .updateMask(img.gt(0))
-            .reduceRegion(
-                reducer=ee.Reducer.sum(),
-                geometry=ee_geom,
-                scale=1000,
-                maxPixels=1e10,
-                bestEffort=True
-            ).get('area')
-        )
-        return ee.Algorithms.If(raw, raw, 0)
-
-    def calc_mes_feature(mes):
-        mes_n = ee.Number(mes)
-
-        # Área do ano de referência
-        ini_ref = ee.Date.fromYMD(ano_ref, mes_n, 1)
-        img_ref = (
-            ee.ImageCollection('MODIS/061/MCD64A1')
-            .filterDate(ini_ref, ini_ref.advance(1, 'month'))
-            .filterBounds(ee_geom)
-            .select('BurnDate').max().clip(ee_geom)
-        )
-        area_ref = ee.Number(get_area_km2(img_ref))
-
-        # Média histórica server-side: map + iterate
-        def area_ano_hist(ano):
-            ano_n = ee.Number(ano)
-            ini_h = ee.Date.fromYMD(ano_n, mes_n, 1)
-            img_h = (
-                ee.ImageCollection('MODIS/061/MCD64A1')
-                .filterDate(ini_h, ini_h.advance(1, 'month'))
-                .filterBounds(ee_geom)
-                .select('BurnDate').max().clip(ee_geom)
-            )
-            return get_area_km2(img_h)
-
-        areas_hist = anos_ee.map(area_ano_hist)
-        soma = areas_hist.iterate(
-            lambda cur, acc: ee.Number(acc).add(ee.Number(cur)),
-            ee.Number(0)
-        )
-        media_hist = ee.Number(soma).divide(ee.Number(n_anos))
-
-        return ee.Feature(None, {
-            'mes': mes_n,
-            'area_ref': area_ref,
-            'media_hist': media_hist
-        })
-
-    # Toda a computação entra aqui — getInfo() chamado UMA única vez
-    meses_ee = ee.List.sequence(1, 12)
-    resultado = ee.FeatureCollection(meses_ee.map(calc_mes_feature)).getInfo()
-
-    registros = []
-    for feat in resultado['features']:
-        p = feat['properties']
-        mes      = int(p['mes'])
-        val_ref  = round(float(p.get('area_ref')  or 0), 2)
-        media    = round(float(p.get('media_hist') or 0), 2)
-        anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
-        registros.append({
-            'Mês': mes,
-            'Mês Nome': meses_map[mes],
-            f'Área {ano_ref} (km²)': val_ref,
-            'Média Histórica (km²)': media,
-            'Anomalia (%)': anomalia
-        })
-
-    return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def calcular_nbr_sentinel(geom_json_str, ano, mes):
-    """
-    Calcula dNBR (severidade de queimada) com Sentinel-2 SR.
-    Janela pré: 3 meses antes. Janela pós: mês selecionado + 1 mês após.
-    Retorna: (dnbr_img_serializado, sev_img_serializado, stats_por_classe)
-    """
-    ee_geom = ee.Geometry(json.loads(geom_json_str))
-    data_ref = ee.Date.fromYMD(ano, mes, 1)
-    data_pre = data_ref.advance(-3, 'month')
-    data_pos = data_ref.advance(2, 'month')
-
-    def mascara_nuvem(img):
-        qa = img.select('QA60')
-        mascara = (
-            qa.bitwiseAnd(1 << 10).eq(0)
-            .And(qa.bitwiseAnd(1 << 11).eq(0))
-        )
-        return img.updateMask(mascara).divide(10000)
-
-    colecao = (
-        ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-        .filterBounds(ee_geom)
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-        .map(mascara_nuvem)
-    )
-
-    img_pre = colecao.filterDate(data_pre, data_ref).median().clip(ee_geom)
-    img_pos = colecao.filterDate(data_ref, data_pos).median().clip(ee_geom)
-
-    nbr_pre = img_pre.normalizedDifference(['B8', 'B12']).rename('NBR_pre')
-    nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
-    dnbr = nbr_pre.subtract(nbr_pos).rename('dNBR')
-
-    # Classificação padrão USGS
-    severidade = (
-        dnbr
-        .where(dnbr.lt(-0.1), 0)                              # Regeneração
-        .where(dnbr.gte(-0.1).And(dnbr.lt(0.1)), 1)          # Não afetado
-        .where(dnbr.gte(0.1).And(dnbr.lt(0.27)), 2)          # Baixa
-        .where(dnbr.gte(0.27).And(dnbr.lt(0.44)), 3)         # Moderada
-        .where(dnbr.gte(0.44).And(dnbr.lt(0.66)), 4)         # Moderada-Alta
-        .where(dnbr.gte(0.66), 5)                             # Alta
-    ).rename('severidade')
-
-    pixel_area = ee.Image.pixelArea().divide(1000000)
-    labels = {
-        0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa',
-        3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'
-    }
-    stats = {}
-    for classe, nome in labels.items():
-        mascara_cls = severidade.eq(classe)
-        area = (
-            pixel_area.updateMask(mascara_cls)
-            .reduceRegion(
-                reducer=ee.Reducer.sum(), geometry=ee_geom,
-                scale=20, maxPixels=1e11, bestEffort=True
-            ).getInfo()
-        )
-        stats[nome] = round(area.get('area', 0) or 0, 2)
-
-    return dnbr, severidade, stats
-
-# =============================================================
-# --- INTERFACE (BARRA LATERAL) ---
-# =============================================================
-
-st.sidebar.title("⚙️ Filtros da Análise")
-
-tipo_analise = st.sidebar.radio(
-    'Escala Geográfica:',
-    ['Por Estado', 'Por Bioma', 'Por Município'],
-    index=2
-)
-
-estado_dd = st.sidebar.selectbox(
-    'Selecione o Estado:',
-    ["AC","AL","AM","AP","BA","CE","DF","ES","GO","MA","MG","MS","MT",
-     "PA","PB","PE","PI","PR","RJ","RN","RO","RR","RS","SC","SE","SP","TO"],
-    index=25,
-    disabled=(tipo_analise == 'Por Bioma')
-)
-bioma_dd = st.sidebar.selectbox(
-    'Selecione o Bioma:',
-    ["Amazônia", "Cerrado", "Mata Atlântica", "Caatinga", "Pampa", "Pantanal"],
-    disabled=(tipo_analise != 'Por Bioma')
-)
-municipio_dd = st.sidebar.selectbox(
-    'Selecione a Cidade:',
-    buscar_cidades(estado_dd),
-    disabled=(tipo_analise != 'Por Município')
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("📁 Fonte de Dados")
-fonte_escolhida = st.sidebar.radio(
-    "Escolha o que analisar:",
-    ["🔥 Focos de Calor (INPE)", "🗺️ Área Queimada (NASA MODIS)"]
-)
-
-if "INPE" in fonte_escolhida:
-    st.sidebar.markdown("**Filtros do INPE**")
-    unidade_dd = st.sidebar.selectbox("Analisar por:", ["Dias", "Meses", "Anos"], index=1)
-    if unidade_dd == "Dias":
-        op_qtd = list(range(1, 91))
-    elif unidade_dd == "Meses":
-        op_qtd = list(range(1, 61))
+    if "INPE" in fonte_escolhida:
+        dt_ini = st.date_input("Início:", datetime.now() - timedelta(days=30))
+        dt_fim = st.date_input("Fim:", datetime.now())
     else:
-        op_qtd = list(range(1, 11))
-    quantidade_sel = st.sidebar.selectbox(f"Quantidade de {unidade_dd}:", options=op_qtd, index=1)
+        ano_modis = st.number_input("Ano:", 2001, 2024, 2024)
+        mes_modis = st.slider("Mês (Opcional - 0 para ano todo):", 0, 12, 0)
 
-    satelites_lista = ['AQUA_M-T', 'NPP-375', 'NPP-375D', 'TERRA_M-T', 'NOAA-20', 'MSG-03']
-    satelites_sel = st.sidebar.multiselect(
-        "Satélites de Referência:",
-        satelites_lista,
-        default=['AQUA_M-T', 'NPP-375', 'NPP-375D']
-    )
-else:
-    st.sidebar.markdown("**Filtros do MODIS**")
-    ano_modis = st.sidebar.selectbox(
-        "Ano de Referência:",
-        list(range(2001, datetime.now().year + 1)),
-        index=datetime.now().year - 2002
-    )
-    mes_modis = st.sidebar.selectbox("Mês do Mapa Principal:", list(range(1, 13)), index=7)
-
-st.sidebar.markdown("---")
-area_protegida = st.sidebar.selectbox(
-    "🌳 Análise de Risco (Cruzamento Espacial):",
-    ["Nenhuma", "Terras Indígenas", "Unidades de Conservação"]
-)
-
-# ==========================================
-st.sidebar.markdown("---")
-modo_debug = False
-
-if "qa" in st.query_params and st.query_params["qa"].lower() == "true":
-    modo_debug = st.sidebar.toggle("🐛 Modo de Validação (QA)", value=True)
-
-if st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True):
-    st.session_state.gerar_dashboard = True
-
-# --- SEÇÃO DE CONTATO ---
-st.sidebar.markdown("---")
-gmail_logo_url = "https://upload.wikimedia.org/wikipedia/commons/7/7e/Gmail_icon_%282020%29.svg"
-linkedin_logo_url = "https://upload.wikimedia.org/wikipedia/commons/c/ca/LinkedIn_logo_initials.png"
-
-html_contato_novo = f"""
-<div style="text-align: center;">
-<p style="font-size: 12px; color: #888; margin-bottom: 2px; margin-top: 10px;">Desenvolvido por</p>
-<h2 style="font-family: serif; font-size: 20px; margin-top: 0px; margin-bottom: 2px; color: inherit;">ANA ANDRADE</h2>
-<p style="font-size: 12px; color: #777; margin-top: 0px; margin-bottom: 15px;">Especialista em Geoprocessamento</p>
-<hr style="border: 0; border-top: 1px solid #e0e0e0; margin-bottom: 15px;">
-<div style="display: flex; justify-content: space-between; gap: 10px;">
-<a href="https://mail.google.com/mail/?view=cm&fs=1&to=anacarolinasantos580@gmail.com" target="_blank"
-   style="flex: 1; text-decoration: none; background-color: #ffffff; border: 1px solid #e0e0e0;
-          border-radius: 8px; padding: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-          display: flex; justify-content: center; align-items: center;">
-  <img src="{gmail_logo_url}" alt="Gmail" style="width: 26px; height: auto; display: block; margin: 0 auto;">
-</a>
-<a href="https://www.linkedin.com/in/ana-carolina-santos-3920931b3" target="_blank"
-   style="flex: 1; text-decoration: none; background-color: #0077B5; border-radius: 8px;
-          padding: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-          display: flex; justify-content: center; align-items: center;">
-  <img src="{linkedin_logo_url}" alt="LinkedIn" style="width: 22px; height: auto; display: block; margin: 0 auto;">
-</a>
-</div>
-</div>
-"""
-st.sidebar.markdown(html_contato_novo, unsafe_allow_html=True)
+    btn_gerar = st.button("🚀 Gerar Dashboard", use_container_width=True)
 
 # =============================================================
-# --- TELA PRINCIPAL ---
+# 4. LÓGICA PRINCIPAL DO DASHBOARD
 # =============================================================
 
-st.title("🔥 Dashboard de Queimadas 🔥")
+if btn_gerar:
+    with st.spinner("⏳ Carregando dados espaciais..."):
+        limite = obter_limite_area(tipo_analise, val_sel)
+        geom_json_str = limite.to_json()
+        areas_afetadas = carregar_areas_protegidas(geom_json_str)
 
-total_valor = 0
-dados_indisponiveis = False
+    # --- PROCESSAMENTO ESPECÍFICO ---
+    df_rec = pd.DataFrame()
+    area_queimada_img = None
+    total_valor = 0
 
-if st.session_state.gerar_dashboard:
-    hoje = datetime.now()
-    val_sel = (
-        bioma_dd if tipo_analise == "Por Bioma"
-        else (estado_dd if tipo_analise == "Por Estado"
-              else f"{municipio_dd} ({estado_dd})")
-    )
-
-    with st.status(f"🛰️ Processando dados para: **{val_sel}**", expanded=True) as status:
-        st.write("🌍 Carregando fronteiras geográficas...")
-        limite = carregar_fronteira(tipo_analise, estado_dd, bioma_dd, municipio_dd)
-        geom_unida = limite.geometry.union_all()
-        ee_geom_complex = ee.Geometry(geom_unida.__geo_interface__)
-        geom_json_str = json.dumps(geom_unida.__geo_interface__, sort_keys=True)
-
-        df_ranking_areas = pd.DataFrame()
-        areas_afetadas = gpd.GeoDataFrame()
-        df_rec = pd.DataFrame()
-        area_queimada_img = None
-        df_top_mun_modis = pd.DataFrame()
-        df_modis_temporal = pd.DataFrame()
-        ee_geom_afetadas = ee_geom_complex  # fallback
-
-        # -------------------------------------------------------
-        # FONTE: INPE
-        # -------------------------------------------------------
-        if "INPE" in fonte_escolhida:
-            if unidade_dd == "Dias":
-                dt_ini = hoje - timedelta(days=quantidade_sel)
-            elif unidade_dd == "Meses":
-                dt_ini = hoje - timedelta(days=30 * quantidade_sel)
-            else:
-                dt_ini = hoje - timedelta(days=365 * quantidade_sel)
-
-            if not satelites_sel:
-                st.error("⚠️ Você precisa selecionar pelo menos um satélite.")
-                st.stop()
-
-            st.write("📡 Consultando satélites do INPE...")
-            df = buscar_focos_inpe(
-                tipo_analise, estado_dd, bioma_dd, municipio_dd,
-                dt_ini.strftime("%Y-%m-%d"), hoje.strftime("%Y-%m-%d"), satelites_sel
-            )
-
-            if not df.empty:
-                gdf = gpd.GeoDataFrame(
-                    df,
-                    geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
-                    crs="EPSG:4326"
-                )
-                gdf = gpd.sjoin(gdf, limite, predicate="within")
-                df_rec = pd.DataFrame(gdf.drop(columns="geometry"))
+    if "INPE" in fonte_escolhida:
+        # Busca ID IBGE para API INPE
+        res_ibge = requests.get(f"https://servicodados.ibge.gov.br/api/v1/localidades/municipios/{val_sel.replace(' ', '%20')}").json()
+        id_ibge = res_ibge[0]['id'] if isinstance(res_ibge, list) else None
+        
+        if id_ibge or tipo_analise == "Por Estado":
+            # Nota: O INPE por estado exigiria loop ou outra rota, aqui simulamos o município
+            df_rec = carregar_focos_inpe(id_ibge)
+            if not df_rec.empty:
                 total_valor = len(df_rec)
-
-                if area_protegida != "Nenhuma" and not df_rec.empty:
-                    st.write(f"🌳 Isolando focos em {area_protegida}...")
-                    gdf_areas = carregar_areas_protegidas(area_protegida)
-                    gdf_areas = gdf_areas.to_crs(gdf.crs)
-
-                    if 'index_right' in gdf.columns:
-                        gdf = gdf.drop(columns=['index_right'])
-
-                    gdf_focos_risco = gpd.sjoin(gdf, gdf_areas, predicate='within')
-
-                    if not gdf_focos_risco.empty:
-                        areas_afetadas = gdf_areas[
-                            gdf_areas['nome_area'].isin(gdf_focos_risco['nome_area'])
-                        ]
-                        focos_em_areas = pd.DataFrame(gdf_focos_risco.drop(columns="geometry"))
-                        df_ranking_areas = (
-                            focos_em_areas['nome_area']
-                            .value_counts()
-                            .reset_index()
-                        )
-                        df_ranking_areas.columns = ['Área Protegida', 'Valor']
-                        df_rec = focos_em_areas
-                        total_valor = len(df_rec)
-                    else:
-                        df_rec = pd.DataFrame()
-                        total_valor = 0
-
-        # -------------------------------------------------------
-        # FONTE: MODIS
-        # -------------------------------------------------------
-        else:
-            st.write("☁️ Analisando satélite MODIS no GEE...")
-            try:
-                data_ini_ee = ee.Date.fromYMD(ano_modis, mes_modis, 1)
-                colecao = (
-                    ee.ImageCollection('MODIS/061/MCD64A1')
-                    .filterDate(data_ini_ee, data_ini_ee.advance(1, 'month'))
-                    .filterBounds(ee_geom_complex)
-                )
-
-                if colecao.size().getInfo() == 0:
-                    dados_indisponiveis = True
-                    total_valor = 0
-                else:
-                    area_queimada_img = (
-                        colecao.select('BurnDate').max().clip(ee_geom_complex)
-                    )
-                    img_area_km2 = (
-                        ee.Image.pixelArea().divide(1000000)
-                        .updateMask(area_queimada_img.gt(0))
-                        .rename('area_km2')
-                    )
-
-                    stats_total = img_area_km2.reduceRegion(
-                        reducer=ee.Reducer.sum(),
-                        geometry=ee_geom_complex,
-                        scale=500, maxPixels=1e13, bestEffort=True
-                    ).getInfo()
-                    total_valor = round(
-                        stats_total.get('area_km2', 0)
-                        if stats_total.get('area_km2') else 0, 2
-                    )
-
-                    if area_protegida != "Nenhuma" and total_valor > 0:
-                        st.write(f"🌳 Isolando km² afetados em {area_protegida}...")
-                        gdf_areas_br = carregar_areas_protegidas(tipo_area=area_protegida)
-                        gdf_areas = gpd.sjoin(
-                            gdf_areas_br, limite, predicate='intersects'
-                        ).drop(columns=['index_right'])
-
-                        if not gdf_areas.empty:
-                            features_ee = [
-                                ee.Feature(
-                                    ee.Geometry(row['geometry'].__geo_interface__),
-                                    {'nome_area': row['nome_area']}
-                                )
-                                for _, row in gdf_areas.iterrows()
-                            ]
-                            fc_areas = ee.FeatureCollection(features_ee)
-                            stats = img_area_km2.reduceRegions(
-                                collection=fc_areas, reducer=ee.Reducer.sum(), scale=500
-                            ).getInfo()
-                            recs = [
-                                {
-                                    'Área Protegida': f['properties']['nome_area'],
-                                    'Valor': round(f['properties'].get('sum', 0), 2)
-                                }
-                                for f in stats['features']
-                                if f['properties'].get('sum', 0) > 0
-                            ]
-                            df_ranking_areas = pd.DataFrame(recs).sort_values(
-                                by='Valor', ascending=False
-                            )
-                            if not df_ranking_areas.empty:
-                                areas_afetadas = gdf_areas[
-                                    gdf_areas['nome_area'].isin(
-                                        df_ranking_areas['Área Protegida']
-                                    )
-                                ]
-                                total_valor = round(df_ranking_areas['Valor'].sum(), 2)
-                                ee_geom_afetadas = ee.Geometry(
-                                    areas_afetadas.geometry.union_all().__geo_interface__
-                                )
-                                area_queimada_img = area_queimada_img.clip(ee_geom_afetadas)
-                                img_area_km2 = (
-                                    ee.Image.pixelArea().divide(1000000)
-                                    .updateMask(area_queimada_img.gt(0))
-                                )
-                            else:
-                                total_valor = 0
-
-                    if tipo_analise != "Por Município" and total_valor > 0:
-                        st.write("🏙️ Calculando ranking de municípios (MODIS)...")
-                        muns_ee = (
-                            ee.FeatureCollection("FAO/GAUL/2015/level2")
-                            .filterBounds(ee_geom_complex)
-                        )
-                        stats_mun = img_area_km2.reduceRegions(
-                            collection=muns_ee, reducer=ee.Reducer.sum(), scale=1000
-                        ).getInfo()
-                        recs_mun = [
-                            {
-                                'Município': f['properties']['ADM2_NAME'],
-                                'Valor': round(f['properties'].get('sum', 0), 2)
-                            }
-                            for f in stats_mun['features']
-                            if f['properties'].get('sum', 0) > 0
-                        ]
-                        if recs_mun:
-                            df_top_mun_modis = (
-                                pd.DataFrame(recs_mun)
-                                .sort_values(by='Valor', ascending=False)
-                                .head(5)
-                            )
-
-                    if total_valor > 0:
-                        st.write("📊 Calculando série temporal anual (MODIS)...")
-                        geom_temporal = (
-                            ee_geom_afetadas
-                            if (area_protegida != "Nenhuma" and not areas_afetadas.empty)
-                            else ee_geom_complex
-                        )
-
-                        def calc_mes(m):
-                            m_num = ee.Number(m)
-                            ini = ee.Date.fromYMD(ano_modis, m_num, 1)
-                            fim = ini.advance(1, 'month')
-                            img_mes = (
-                                ee.ImageCollection('MODIS/061/MCD64A1')
-                                .filterDate(ini, fim)
-                                .select('BurnDate').max().clip(geom_temporal)
-                            )
-                            area_calc = (
-                                ee.Image.pixelArea().divide(1000000)
-                                .updateMask(img_mes.gt(0))
-                            )
-                            val = area_calc.reduceRegion(
-                                reducer=ee.Reducer.sum(),
-                                geometry=geom_temporal,
-                                scale=1000, maxPixels=1e10
-                            ).get('area')
-                            return ee.Feature(None, {'mes': m_num, 'area': val})
-
-                        meses_list = ee.List.sequence(1, 12)
-                        fc_meses = ee.FeatureCollection(meses_list.map(calc_mes)).getInfo()
-                        dados_temp = [
-                            {
-                                'Mês': f['properties']['mes'],
-                                'Área (km²)': round(f['properties'].get('area') or 0, 2)
-                            }
-                            for f in fc_meses['features']
-                        ]
-                        df_modis_temporal = pd.DataFrame(dados_temp)
-                        meses_map_label = {
-                            1: 'Jan', 2: 'Fev', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun',
-                            7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Out', 11: 'Nov', 12: 'Dez'
-                        }
-                        df_modis_temporal['Mês Nome'] = df_modis_temporal['Mês'].map(
-                            meses_map_label
-                        )
-
-            except Exception as e:
-                st.warning(f"⚠️ Erro ao processar MODIS: {e}")
-
-        status.update(label="✅ Análise concluída!", state="complete", expanded=False)
-
-    # =============================================================
-    # --- RENDERIZAÇÃO ---
-    # =============================================================
-
-    if dados_indisponiveis:
-        mes_nome = {
-            1:'Jan',2:'Fev',3:'Mar',4:'Abr',5:'Mai',6:'Jun',
-            7:'Jul',8:'Ago',9:'Set',10:'Out',11:'Nov',12:'Dez'
-        }[mes_modis]
-        st.warning(
-            f"⏳ **Aviso de Processamento NASA:** Os dados do satélite MODIS para "
-            f"**{mes_nome} de {ano_modis}** ainda não foram publicados. "
-            f"(Geralmente há atraso de 1 a 2 meses). Por favor, tente um mês anterior."
-        )
-
-    elif total_valor == 0:
-        st.error("⚠️ Nenhum registro detectado nos limites selecionados.")
-
-    else:
-        # --- CARD PRINCIPAL ---
-        texto_titulo = (
-            f"Total Confirmado: {total_valor:,} focos"
-            if "INPE" in fonte_escolhida
-            else f"Área Queimada Total: {total_valor:,.2f} km²"
-        )
-        if "INPE" in fonte_escolhida:
-            texto_sub = (
-                f"Período Analisado: {dt_ini.strftime('%d/%m/%Y')} "
-                f"até {hoje.strftime('%d/%m/%Y')}"
-            )
-        else:
-            texto_sub = (
-                f"Período: Mês {mes_modis} de {ano_modis} (Mapa) "
-                f"/ Ano {ano_modis} (Evolução)"
-            )
-
-        card_html = f"""
-        <div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px;
-                    border-left: 8px solid #ff4b4b; margin-bottom: 15px;
-                    box-shadow: 1px 1px 4px rgba(0,0,0,0.05);">
-            <h3 style="color: #c0392b; margin: 0; font-size: 22px; font-weight: bold;">
-                🔥 {texto_titulo}
-            </h3>
-            <p style="color: #636e72; margin: 4px 0 0 0; font-size: 15px;">
-                Análise: {val_sel} | {texto_sub}
-            </p>
-        </div>
-        """
-        st.markdown(card_html, unsafe_allow_html=True)
-
-        # --- ALERTA DE ÁREAS PROTEGIDAS ---
-        if not df_ranking_areas.empty:
-            metrica = "focos detectados" if "INPE" in fonte_escolhida else "km² queimados"
-            st.error(
-                f"🚨 **ANÁLISE FOCADA:** {total_valor} {metrica} "
-                f"limitados dentro de {area_protegida}!"
-            )
-            col_alerta1, col_alerta2 = st.columns([1.5, 1])
-            with col_alerta1:
-                qtd_areas = min(10, len(df_ranking_areas))
-                titulo_dinamico = (
-                    f"🔥 Top {qtd_areas} Áreas Mais Afetadas"
-                    if qtd_areas > 1 else "🔥 Área Mais Afetada"
-                )
-                fig_areas = px.bar(
-                    df_ranking_areas.head(10),
-                    x='Valor', y='Área Protegida', orientation='h',
-                    text='Valor', color='Valor',
-                    color_continuous_scale=px.colors.sequential.Reds,
-                    title=titulo_dinamico
-                )
-                nome_eixo_x = (
-                    "Nº de Focos" if "INPE" in fonte_escolhida else "Área Afetada (km²)"
-                )
-                fig_areas.update_layout(
-                    template='plotly_dark',
-                    xaxis_title=nome_eixo_x,
-                    yaxis={'categoryorder': 'total ascending'},
-                    height=350, margin=dict(t=40, b=20),
-                    coloraxis_showscale=False
-                )
-                st.plotly_chart(fig_areas, use_container_width=True)
-            with col_alerta2:
-                st.markdown("**Lista Completa de Áreas Afetadas**")
-                st.dataframe(
-                    df_ranking_areas, hide_index=True,
-                    height=350, use_container_width=True
-                )
-
-        st.markdown("---")
-
-        # =============================================================
-        # --- ABAS PRINCIPAIS ---
-        # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_export = st.tabs([
-            "🗺️ Mapa de Focos",
-            "📈 Gráficos & Anomalia",
-            "🔬 Severidade (NBR Sentinel-2)",
-            "⬇️ Exportar Dados"
-        ])
-
-        # ----------------------------------------------------------
-        # ABA 1 — MAPA
-        # ----------------------------------------------------------
-        with aba_mapa:
-            col_controles1, col_controles2 = st.columns([1, 1.2])
-            with col_controles1:
-                estilo_mapa = st.radio(
-                    "🎨 Estilo de Fundo:",
-                    ["🌑 Mapa Dark", "🛰️ Satélite (Google)"],
-                    horizontal=False
-                )
-            focar_area = "Visão Geral"
-            with col_controles2:
+                # Ranking Áreas Protegidas (Focos por área)
                 if not areas_afetadas.empty:
-                    focar_area = st.selectbox(
-                        "🔍 Zoom direto para:",
-                        ["Visão Geral"] + df_ranking_areas['Área Protegida'].tolist()
-                    )
-
-            if focar_area != "Visão Geral" and not areas_afetadas.empty:
-                area_especifica = areas_afetadas[
-                    areas_afetadas['nome_area'] == focar_area
-                ]
-                centro = area_especifica.geometry.union_all().centroid
-                bounds = area_especifica.geometry.total_bounds
-                zoom_inicio = 11
-            else:
-                centro = limite.geometry.union_all().centroid
-                bounds = limite.geometry.total_bounds
-                zoom_inicio = 10 if tipo_analise == "Por Município" else 6
-
-            if "Dark" in estilo_mapa:
-                m = folium.Map(
-                    location=[centro.y, centro.x],
-                    zoom_start=zoom_inicio,
-                    tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
-                    attr='Esri Base'
-                )
-                folium.TileLayer(
-                    tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
-                    attr='Esri Reference', overlay=True, control=False
-                ).add_to(m)
-            else:
-                m = folium.Map(
-                    location=[centro.y, centro.x],
-                    zoom_start=zoom_inicio,
-                    tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-                    attr='Google Satélite'
-                )
-
-            if focar_area != "Visão Geral":
-                m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
-
-            folium.GeoJson(
-                limite.__geo_interface__,
-                style_function=lambda x: {
-                    'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3
-                }
-            ).add_to(m)
-
-            if not areas_afetadas.empty:
-                estilo_tooltip = (
-                    "font-size: 12px; max-width: 250px; white-space: normal; "
-                    "background-color: white; color: black; border-radius: 4px; "
-                    "box-shadow: 2px 2px 5px rgba(0,0,0,0.3);"
-                )
-                folium.GeoJson(
-                    areas_afetadas.__geo_interface__,
-                    style_function=lambda x: {
-                        'fillColor': 'transparent', 'color': '#c0392b', 'weight': 1
-                    },
-                    tooltip=folium.GeoJsonTooltip(
-                        fields=['nome_area'],
-                        aliases=['Área Protegida:'],
-                        style=estilo_tooltip
-                    )
-                ).add_to(m)
-
-            if "INPE" in fonte_escolhida and not df_rec.empty:
-                HeatMap(
-                    df_rec[["latitude", "longitude"]].dropna().values.tolist(),
-                    radius=5, blur=3, max_zoom=13, min_opacity=0.4
-                ).add_to(m)
-            elif "MODIS" in fonte_escolhida and area_queimada_img:
-                vis_params_quente = {
-                    'min': 1, 'max': 366,
-                    'palette': ['#ffffcc','#ffeda0','#fed976','#feb24c',
-                                '#fd8d3c','#fc4e2a','#e31a1c','#b10026']
-                }
-                m.add_ee_layer(
-                    area_queimada_img.updateMask(area_queimada_img.gt(0)),
-                    vis_params_quente, 'MODIS Área Queimada'
-                )
-
-            st_folium(m, width=None, height=750, returned_objects=[])
-
-        # ----------------------------------------------------------
-        # ABA 2 — GRÁFICOS & ANOMALIA
-        # ----------------------------------------------------------
-        with aba_graficos:
-            if "INPE" in fonte_escolhida:
-                st.subheader("📈 Evolução Temporal dos Focos")
-                data_col = next(c for c in df_rec.columns if 'data' in c)
-                df_rec[data_col] = pd.to_datetime(df_rec[data_col])
-                freq = 'D' if (hoje - dt_ini).days <= 90 else 'MS'
-                df_g = (
-                    df_rec.set_index(data_col)
-                    .resample(freq).size()
-                    .reset_index(name='focos')
-                )
-                fig_line = px.line(df_g, x=data_col, y='focos', markers=True, height=350)
-                fig_line.update_traces(line_color='#e64a19', line_width=3)
-                fig_line.update_layout(
-                    template='plotly_dark',
-                    xaxis_title="Tempo", yaxis_title="Nº de Focos",
-                    margin=dict(t=20, b=20)
-                )
-                st.plotly_chart(fig_line, use_container_width=True)
-
-                if 'municipio' in df_rec.columns and tipo_analise != "Por Município":
-                    df_top_mun = df_rec['municipio'].value_counts().reset_index()
-                    qtd_mun = min(5, len(df_top_mun))
-                    st.subheader(f"🏆 Top {qtd_mun} Municípios Afetados")
-                    df_top_mun = df_top_mun.head(5)
-                    df_top_mun.columns = ['Município', 'Focos']
-                    fig_bar = px.bar(
-                        df_top_mun, x='Focos', y='Município', orientation='h',
-                        text='Focos', color='Focos',
-                        color_continuous_scale=px.colors.sequential.Reds
-                    )
-                    fig_bar.update_layout(
-                        template='plotly_dark',
-                        yaxis={'categoryorder': 'total ascending'},
-                        height=320, margin=dict(t=20, b=20),
-                        coloraxis_showscale=False
-                    )
-                    st.plotly_chart(fig_bar, use_container_width=True)
-
-            else:
-                # Série temporal MODIS
-                if not df_modis_temporal.empty:
-                    st.subheader(f"📈 Evolução Mensal — {ano_modis}")
-                    fig_line = px.line(
-                        df_modis_temporal, x='Mês Nome', y='Área (km²)',
-                        markers=True, height=350
-                    )
-                    fig_line.update_traces(line_color='#e64a19', line_width=3)
-                    fig_line.update_layout(
-                        template='plotly_dark',
-                        xaxis_title="Mês", yaxis_title="Área Afetada (km²)",
-                        margin=dict(t=20, b=20)
-                    )
-                    st.plotly_chart(fig_line, use_container_width=True)
-
-                if tipo_analise != "Por Município" and not df_top_mun_modis.empty:
-                    st.subheader("🏆 Top 5 Municípios Afetados")
-                    fig_bar = px.bar(
-                        df_top_mun_modis, x='Valor', y='Município', orientation='h',
-                        text='Valor', color='Valor',
-                        color_continuous_scale=px.colors.sequential.Reds
-                    )
-                    fig_bar.update_layout(
-                        template='plotly_dark',
-                        xaxis_title="Área Afetada (km²)",
-                        yaxis={'categoryorder': 'total ascending'},
-                        height=350, margin=dict(t=20, b=20),
-                        coloraxis_showscale=False
-                    )
-                    st.plotly_chart(fig_bar, use_container_width=True)
-
-                # --- ANOMALIA HISTÓRICA ---
-                if not df_modis_temporal.empty and ano_modis > 2001:
-                    st.markdown("---")
-                    st.subheader(
-                        f"📉 Anomalia vs. Média Histórica (2001–{ano_modis - 1})"
-                    )
-                    st.caption(
-                        "Compara a área queimada de cada mês do ano selecionado "
-                        "com a média do mesmo mês desde 2001. "
-                        "🔴 Acima da média  •  🟢 Abaixo da média"
-                    )
-
-                    with st.spinner(
-                        "Calculando anomalia histórica... "
-                        "(pode levar ~1 min na 1ª vez, depois fica em cache)"
-                    ):
-                        df_anomalia = calcular_anomalia_modis(geom_json_str, ano_modis)
-
-                    if not df_anomalia.empty:
-                        col_ano = f'Área {ano_modis} (km²)'
-
-                        fig_anom = go.Figure()
-
-                        # Linha da média histórica
-                        fig_anom.add_trace(go.Scatter(
-                            x=df_anomalia['Mês Nome'],
-                            y=df_anomalia['Média Histórica (km²)'],
-                            name=f'Média 2001–{ano_modis - 1}',
-                            line=dict(color='#74b9ff', width=2, dash='dash'),
-                            mode='lines+markers'
-                        ))
-
-                        # Linha do ano atual com marcadores coloridos
-                        fig_anom.add_trace(go.Scatter(
-                            x=df_anomalia['Mês Nome'],
-                            y=df_anomalia[col_ano],
-                            name=str(ano_modis),
-                            line=dict(color='#e17055', width=3),
-                            mode='lines+markers',
-                            marker=dict(
-                                color=[
-                                    '#d63031' if v > m else '#00b894'
-                                    for v, m in zip(
-                                        df_anomalia[col_ano],
-                                        df_anomalia['Média Histórica (km²)']
-                                    )
-                                ],
-                                size=9
-                            )
-                        ))
-
-                        fig_anom.update_layout(
-                            template='plotly_dark',
-                            xaxis_title="Mês",
-                            yaxis_title="Área Queimada (km²)",
-                            height=370,
-                            margin=dict(t=20, b=20),
-                            legend=dict(orientation='h', yanchor='bottom', y=1.02)
-                        )
-                        st.plotly_chart(fig_anom, use_container_width=True)
-
-                        # Tabela com semáforo de anomalia
-                        st.markdown("**Resumo por mês:**")
-                        df_display = df_anomalia[[
-                            'Mês Nome', col_ano,
-                            'Média Histórica (km²)', 'Anomalia (%)'
-                        ]].copy()
-
-                        def colorir_anomalia(val):
-                            if val > 50:
-                                return 'background-color: #c0392b; color: white'
-                            elif val > 20:
-                                return 'background-color: #e67e22; color: white'
-                            elif val < -20:
-                                return 'background-color: #27ae60; color: white'
-                            return ''
-
-                        st.dataframe(
-                            df_display.style.map(
-                                colorir_anomalia, subset=['Anomalia (%)']
-                            ),
-                            hide_index=True,
-                            use_container_width=True,
-                            height=280
-                        )
-                elif ano_modis == 2001:
-                    st.info(
-                        "💡 O gráfico de anomalia histórica requer pelo menos 2 anos "
-                        "de dados. Selecione um ano a partir de 2002."
-                    )
-
-   # ----------------------------------------------------------
-        # ABA 3 — SEVERIDADE DA QUEIMADA (NBR)
-        # ----------------------------------------------------------
-        with aba_nbr:
-            if "INPE" in fonte_escolhida:
-                st.info(
-                    "💡 **Análise Avançada disponível:**\n\n"
-                    "A análise de severidade pixel a pixel usa imagens do satélite Sentinel-2. "
-                    "Para utilizá-la, mude a fonte para **Área Queimada (NASA MODIS)** na barra lateral."
-                )
-            else:
-                st.subheader("🔬 Mapa de Cicatriz e Severidade do Fogo")
-                st.markdown(
-                    "Este mapa mostra o **impacto real** do fogo na vegetação. "
-                    "Ele compara o 'antes' e o 'depois' para identificar o nível de destruição."
-                )
-
-                col_nbr1, col_nbr2 = st.columns([1.5, 1])
-
-                with col_nbr1:
-                    with st.spinner("🛰️ Analisando imagens de satélite... Isso pode levar 30 segundos."):
-                        try:
-                            # Chama sua função original
-                            dnbr_img, sev_img, stats_sev = calcular_nbr_sentinel(
-                                geom_json_str, ano_modis, mes_modis
-                            )
-
-                            centro_nbr = limite.geometry.union_all().centroid
-                            
-                            # Configuração do Mapa
-                            m_nbr = folium.Map(
-                                location=[centro_nbr.y, centro_nbr.x],
-                                zoom_start=11, # Zoom um pouco mais próximo para ver detalhes
-                                tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-                                attr='Google Satellite'
-                            )
-
-                            # Estilo da borda da área
-                            folium.GeoJson(
-                                limite.__geo_interface__,
-                                style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}
-                            ).add_to(m_nbr)
-
-                            # Visualização dNBR (Paleta de cores intuitiva)
-                            vis_dnbr = {
-                                'min': -100, 'max': 800, # Ajustado para escala inteira se você multiplicou por 1000
-                                'palette': ['#1a9850', '#91cf60', '#d9ef8b', '#ffffbf', '#fee08b', '#fc8d59', '#d73027', '#7a0403']
-                            }
-                            
-                            m_nbr.add_ee_layer(dnbr_img, vis_dnbr, 'Severidade dNBR', opacity=0.8)
-
-                            # Legenda Flutuante Simplificada
-                            legenda_html = """
-                            <div style="position: fixed; bottom: 50px; right: 20px; width: 180px;
-                                        z-index:9999; background:rgba(30,30,30,0.9);
-                                        padding:15px; border-radius:8px; color:white; font-family: sans-serif;">
-                                <b style="font-size:14px;">Nível de Destruição</b><br>
-                                <i style="background:#7a0403; width:12px; height:12px; display:inline-block;"></i> Alta<br>
-                                <i style="background:#d73027; width:12px; height:12px; display:inline-block;"></i> Moderada-Alta<br>
-                                <i style="background:#fc8d59; width:12px; height:12px; display:inline-block;"></i> Moderada<br>
-                                <i style="background:#fee08b; width:12px; height:12px; display:inline-block;"></i> Baixa<br>
-                                <i style="background:#91cf60; width:12px; height:12px; display:inline-block;"></i> Não afetado
-                            </div>
-                            """
-                            m_nbr.get_root().html.add_child(folium.Element(legenda_html))
-                            
-                            st_folium(m_nbr, width=None, height=550)
-
-                        except Exception as e:
-                            # MENSAGEM DE ERRO AMIGÁVEL PARA O USUÁRIO
-                            if "B8" in str(e) or "Available band names: []" in str(e):
-                                st.warning(
-                                    "⚠️ **Imagens não encontradas para este período.**\n\n"
-                                    "Isso geralmente acontece quando há muitas nuvens cobrindo a região "
-                                    "ou se a data selecionada é anterior a 2015 (lançamento do Sentinel-2). "
-                                    "Tente selecionar outro mês ou ano."
-                                )
-                            else:
-                                st.error(f"Erro técnico: {e}")
-                            stats_sev = {}
-
-                with col_nbr2:
-                    if stats_sev:
-                        st.write("### 📉 Impacto na Área")
-                        
-                        # Preparação dos dados
-                        df_sev = pd.DataFrame(list(stats_sev.items()), columns=['Classe', 'Área (km²)'])
-                        df_sev = df_sev[df_sev['Área (km²)'] > 0].sort_values('Área (km²)', ascending=False)
-
-                        # Gráfico de Barras Horizontal (Mais fácil de ler nomes das classes)
-                        fig_bar = px.bar(
-                            df_sev, x='Área (km²)', y='Classe', orientation='h',
-                            color='Classe', 
-                            color_discrete_map={
-                                'Regeneração': '#1a9850', 'Não afetado': '#91cf60',
-                                'Baixa': '#fee08b', 'Moderada': '#fc8d59',
-                                'Moderada-Alta': '#d73027', 'Alta': '#7a0403'
-                            }
-                        )
-                        fig_bar.update_layout(template='plotly_dark', showlegend=False, height=350, margin=dict(l=0, r=0, t=30, b=0))
-                        st.plotly_chart(fig_bar, use_container_width=True)
-
-                        # Métricas principais
-                        area_total = df_sev['Área (km²)'].sum()
-                        area_critica = df_sev[df_sev['Classe'].isin(['Alta', 'Moderada-Alta'])]['Área (km²)'].sum()
-                        
-                        st.metric("🔥 Área Total Afetada", f"{area_total:.2f} km²")
-                        st.metric("🚨 Área em Estado Crítico", f"{area_critica:.2f} km²", delta="Impacto Alto", delta_color="inverse")
-
-        # ----------------------------------------------------------
-        # ABA 4 — EXPORTAR DADOS
-        # ----------------------------------------------------------
-        with aba_export:
-            st.subheader("⬇️ Exportar Dados da Análise")
-
-            if "INPE" in fonte_escolhida:
-                if not df_rec.empty:
-                    st.markdown(
-                        f"**{len(df_rec)} registros** disponíveis para exportação."
-                    )
-                    col_dl1, col_dl2 = st.columns(2)
-                    with col_dl1:
-                        csv = df_rec.to_csv(index=False).encode('utf-8-sig')
-                        st.download_button(
-                            label="📄 Baixar CSV — Focos INPE",
-                            data=csv,
-                            file_name=f"focos_{val_sel}_{hoje.strftime('%Y%m%d')}.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                    with col_dl2:
-                        excel_data = gerar_excel(df_rec)
-                        st.download_button(
-                            label="📊 Baixar Excel — Focos INPE",
-                            data=excel_data,
-                            file_name=f"focos_{val_sel}_{hoje.strftime('%Y%m%d')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
+                    focos_gdf = gpd.GeoDataFrame(df_rec, geometry=gpd.points_from_xy(df_rec.longitude, df_rec.latitude), crs="EPSG:4326")
+                    joined = gpd.sjoin(focos_gdf, areas_afetadas, predicate='within')
+                    df_ranking_areas = joined['nome_area'].value_counts().reset_index()
+                    df_ranking_areas.columns = ['Área Protegida', 'Valor']
                 else:
-                    st.info("Nenhum dado de focos disponível para exportação.")
+                    df_ranking_areas = pd.DataFrame()
 
-                if not df_ranking_areas.empty:
-                    st.markdown("---")
-                    st.markdown("**Ranking de Áreas Protegidas:**")
-                    col_dl3, col_dl4 = st.columns(2)
-                    with col_dl3:
-                        csv_areas = df_ranking_areas.to_csv(index=False).encode('utf-8-sig')
-                        st.download_button(
-                            label="📄 Baixar CSV — Áreas Protegidas",
-                            data=csv_areas,
-                            file_name=f"areas_protegidas_{val_sel}_{hoje.strftime('%Y%m%d')}.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                    with col_dl4:
-                        excel_areas = gerar_excel(df_ranking_areas)
-                        st.download_button(
-                            label="📊 Baixar Excel — Áreas Protegidas",
-                            data=excel_areas,
-                            file_name=f"areas_protegidas_{val_sel}_{hoje.strftime('%Y%m%d')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
+    else: # MODIS
+        area_queimada_img, total_valor = calcular_area_queimada_modis(geom_json_str, ano_modis, mes_modis if mes_modis > 0 else None)
+        
+        # Série Temporal MODIS
+        df_modis_temporal = pd.DataFrame()
+        if mes_modis == 0:
+            df_modis_temporal = calcular_anomalia_modis(geom_json_str, ano_modis)
+        
+        # Ranking Municípios (se for estado)
+        df_top_mun_modis = pd.DataFrame() # Simplificado para o exemplo
+        
+        # Ranking Áreas Protegidas MODIS
+        df_ranking_areas = pd.DataFrame() # Aqui entraria uma redução por região do EE
 
-            else:
-                # MODIS — Série temporal
-                if not df_modis_temporal.empty:
-                    st.markdown("**Série Temporal Mensal (MODIS):**")
-                    col_dl1, col_dl2 = st.columns(2)
-                    with col_dl1:
-                        csv_mod = df_modis_temporal.to_csv(
-                            index=False
-                        ).encode('utf-8-sig')
-                        st.download_button(
-                            label="📄 Baixar CSV — Série Temporal",
-                            data=csv_mod,
-                            file_name=f"modis_temporal_{val_sel}_{ano_modis}.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                    with col_dl2:
-                        excel_mod = gerar_excel(df_modis_temporal)
-                        st.download_button(
-                            label="📊 Baixar Excel — Série Temporal",
-                            data=excel_mod,
-                            file_name=f"modis_temporal_{val_sel}_{ano_modis}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
+    # --- RENDERIZAÇÃO ---
+    st.title(f"📊 Dashboard: {val_sel}")
+    
+    c1, c2, c3 = st.columns(3)
+    metrica_nome = "Focos Detectados" if "INPE" in fonte_escolhida else "Área Queimada Est."
+    unidade = "focos" if "INPE" in fonte_escolhida else "km²"
+    c1.metric(metrica_nome, f"{total_valor:,.1f} {unidade}")
+    c2.metric("Áreas Protegidas em Risco", len(areas_afetadas))
+    c3.metric("Fonte", "INPE" if "INPE" in fonte_escolhida else "NASA MODIS")
 
-                # MODIS — Áreas protegidas
-                if not df_ranking_areas.empty:
-                    st.markdown("---")
-                    st.markdown("**Ranking de Áreas Protegidas (MODIS):**")
-                    col_dl3, col_dl4 = st.columns(2)
-                    with col_dl3:
-                        csv_areas = df_ranking_areas.to_csv(
-                            index=False
-                        ).encode('utf-8-sig')
-                        st.download_button(
-                            label="📄 Baixar CSV — Áreas Protegidas",
-                            data=csv_areas,
-                            file_name=f"areas_afetadas_{val_sel}_{ano_modis}.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                    with col_dl4:
-                        excel_areas = gerar_excel(df_ranking_areas)
-                        st.download_button(
-                            label="📊 Baixar Excel — Áreas Protegidas",
-                            data=excel_areas,
-                            file_name=f"areas_afetadas_{val_sel}_{ano_modis}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
+    # --- ALERTA DE ÁREAS PROTEGIDAS ---
+    if not df_ranking_areas.empty:
+        metrica = "focos detectados" if "INPE" in fonte_escolhida else "km² queimados"
+        st.error(f"🚨 **ANÁLISE FOCADA:** {total_valor} {metrica} limitados dentro de áreas protegidas!")
+        
+        col_alerta1, col_alerta2 = st.columns([1.5, 1])
+        with col_alerta1:
+            qtd_areas = min(10, len(df_ranking_areas))
+            fig_areas = px.bar(df_ranking_areas.head(10), x='Valor', y='Área Protegida', orientation='h',
+                             title=f"🔥 Top {qtd_areas} Áreas Afetadas", color='Valor', color_continuous_scale='Reds')
+            fig_areas.update_layout(template='plotly_dark', height=350, coloraxis_showscale=False)
+            st.plotly_chart(fig_areas, use_container_width=True)
+        with col_alerta2:
+            st.markdown("**Lista Completa**")
+            st.dataframe(df_ranking_areas, hide_index=True, height=350, use_container_width=True)
 
-                # MODIS — Anomalia histórica (se calculada)
-                if not df_modis_temporal.empty and ano_modis > 2001:
-                    try:
-                        df_anomalia_exp = calcular_anomalia_modis(
-                            geom_json_str, ano_modis
-                        )
-                        if not df_anomalia_exp.empty:
-                            st.markdown("---")
-                            st.markdown("**Dados de Anomalia Histórica:**")
-                            csv_anom = df_anomalia_exp.to_csv(
-                                index=False
-                            ).encode('utf-8-sig')
-                            st.download_button(
-                                label="📄 Baixar CSV — Anomalia Histórica",
-                                data=csv_anom,
-                                file_name=f"anomalia_{val_sel}_{ano_modis}.csv",
-                                mime="text/csv",
-                                use_container_width=True
-                            )
-                    except:
-                        pass
+    st.markdown("---")
 
-                # NBR Severidade
-                if stats_sev if 'stats_sev' in dir() else False:
-                    st.markdown("---")
-                    st.markdown("**Distribuição de Severidade NBR (Sentinel-2):**")
-                    df_sev_exp = pd.DataFrame(
-                        list(stats_sev.items()), columns=['Classe', 'Área (km²)']
-                    )
-                    csv_sev = df_sev_exp.to_csv(index=False).encode('utf-8-sig')
-                    st.download_button(
-                        label="📄 Baixar CSV — Severidade NBR",
-                        data=csv_sev,
-                        file_name=f"nbr_{val_sel}_{ano_modis}_{mes_modis:02d}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
+    # --- ABAS ---
+    aba_mapa, aba_graficos, aba_nbr, aba_export = st.tabs([
+        "🗺️ Mapa de Focos", "📈 Gráficos & Anomalia", "🔬 Severidade (Sentinel-2)", "⬇️ Exportar"
+    ])
+
+    with aba_mapa:
+        estilo_mapa = st.radio("Estilo:", ["🌑 Dark", "🛰️ Satélite"], horizontal=True)
+        
+        centro = limite.geometry.union_all().centroid
+        tiles = 'https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}' if "Satélite" in estilo_mapa else 'cartodbpositron'
+        
+        m = folium.Map(location=[centro.y, centro.x], zoom_start=9, tiles=tiles, attr='Map')
+        
+        folium.GeoJson(limite, style_function=lambda x: {'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 3}).add_to(m)
+        
+        if "INPE" in fonte_escolhida and not df_rec.empty:
+            HeatMap(df_rec[["latitude", "longitude"]].dropna().values.tolist(), radius=8).add_to(m)
+        elif area_queimada_img:
+            m.add_ee_layer(area_queimada_img.updateMask(area_queimada_img.gt(0)), 
+                          {'min': 1, 'max': 366, 'palette': ['orange', 'red']}, 'MODIS')
+
+        st_folium(m, width=None, height=600, returned_objects=[])
+
+    with aba_graficos:
+        if "INPE" in fonte_escolhida and not df_rec.empty:
+            df_rec['data_hora_gmt'] = pd.to_datetime(df_rec['data_hora_gmt'])
+            df_temp = df_rec.set_index('data_hora_gmt').resample('D').size().reset_index(name='focos')
+            fig = px.line(df_temp, x='data_hora_gmt', y='focos', title="Evolução Diária", color_discrete_sequence=['#e64a19'])
+            st.plotly_chart(fig, use_container_width=True)
+        elif not df_modis_temporal.empty:
+            # Mostra gráfico de anomalia (conforme código anterior)
+            fig_anom = go.Figure()
+            fig_anom.add_trace(go.Scatter(x=df_modis_temporal['Mês Nome'], y=df_modis_temporal['Média Histórica (km²)'], name='Média Histórica', line=dict(dash='dash')))
+            fig_anom.add_trace(go.Scatter(x=df_modis_temporal['Mês Nome'], y=df_modis_temporal[f'Área {ano_modis} (km²)'], name=str(ano_modis), line=dict(width=3)))
+            fig_anom.update_layout(template='plotly_dark', title="Anomalia vs Média")
+            st.plotly_chart(fig_anom, use_container_width=True)
+
+    with aba_nbr:
+        if "MODIS" in fonte_escolhida:
+            st.subheader("🔬 Análise Pixel a Pixel (Sentinel-2)")
+            with st.spinner("🛰️ Processando imagens..."):
+                try:
+                    dnbr, sev, stats_sev = calcular_nbr_sentinel(geom_json_str, ano_modis, mes_modis if mes_modis > 0 else 9)
+                    
+                    c_n1, c_n2 = st.columns([2, 1])
+                    with c_n1:
+                        m_nbr = folium.Map(location=[centro.y, centro.x], zoom_start=11, tiles=tiles, attr='Satellite')
+                        # PALETA NBR
+                        vis_dnbr = {'min': -100, 'max': 800, 'palette': ['#1a9850', '#91cf60', '#ffffbf', '#fd8d3c', '#d73027', '#7a0403']}
+                        m_nbr.add_ee_layer(dnbr, vis_dnbr, 'Severidade')
+                        st_folium(m_nbr, width=None, height=500)
+                    with c_n2:
+                        st.write("### Impacto")
+                        df_s = pd.DataFrame(list(stats_sev.items()), columns=['Classe', 'km²'])
+                        st.bar_chart(df_s.set_index('Classe'))
+                        st.metric("Área Crítica", f"{df_s[df_s['Classe'].isin(['Alta', 'Moderada-Alta'])]['km²'].sum():.2f} km²")
+                except Exception as e:
+                    st.warning(f"Sem imagens disponíveis para o período ou erro: {e}")
+        else:
+            st.info("Mude para MODIS para ver a severidade Sentinel-2.")
+
+    with aba_export:
+        st.subheader("⬇️ Downloads")
+        if "INPE" in fonte_escolhida and not df_rec.empty:
+            st.download_button("Baixar CSV Focos", df_rec.to_csv().encode('utf-8'), "focos.csv", "text/csv")
+        elif not df_modis_temporal.empty:
+             st.download_button("Baixar CSV Temporal", df_modis_temporal.to_csv().encode('utf-8'), "temporal.csv", "text/csv")
 
 else:
-    st.info(
-        "👈 Use os filtros ao lado para selecionar a Fonte de Dados, "
-        "o local e o período de análise. Depois clique em **'Gerar Dashboard'**."
-    )
+    st.info("👈 Selecione os filtros e clique em 'Gerar Dashboard' para iniciar a análise.")
