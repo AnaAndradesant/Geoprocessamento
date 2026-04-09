@@ -166,15 +166,16 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
     all_dfs = []
     sat_str = "','".join(satelites)
 
+   # LOOP DE BUSCA
     while dt_ini <= dt_fim:
-        dt_bloco_fim = min(dt_ini + timedelta(days=5), dt_fim)
+        dt_bloco_fim = min(dt_ini + timedelta(days=3), dt_fim)
         
-        # 2. ADICIONADO: 'Z' na data (padrão UTC rígido do GeoServer) 
-        # e remoção do pais_complete_id para evitar crash interno do BD do INPE.
+        # 1. Correção Crítica: Sem aspas simples em volta das datas!
+        # 2. Voltamos com o id_pais=33 para acelerar o banco de dados deles.
         cql = (
-            f"data_hora_gmt >= '{dt_ini.strftime('%Y-%m-%d')}T00:00:00Z' "
-            f"AND data_hora_gmt <= '{dt_bloco_fim.strftime('%Y-%m-%d')}T23:59:59Z' "
-            f"AND satelite IN ('{sat_str}') AND {filtro_base}"
+            f"data_hora_gmt >= {dt_ini.strftime('%Y-%m-%d')}T00:00:00Z "
+            f"AND data_hora_gmt <= {dt_bloco_fim.strftime('%Y-%m-%d')}T23:59:59Z "
+            f"AND satelite IN ('{sat_str}') AND id_pais=33 AND {filtro_base}"
         )
         
         try:
@@ -185,31 +186,32 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
                     "typeName": "bdqueimadas:focos", "outputFormat": "application/json",
                     "CQL_FILTER": cql, "maxFeatures": 10000
                 },
-                headers=headers, # Passando os Headers aqui
-                verify=False, timeout=60
+                headers=headers,
+                verify=False, 
+                timeout=40
             )
             
             if r.status_code == 200:
-                resposta_json = r.json()
-                if resposta_json.get("features"):
+                dados_json = r.json()
+                if "features" in dados_json and len(dados_json["features"]) > 0:
                     registros = [
                         {"longitude": f["geometry"]["coordinates"][0],
                          "latitude": f["geometry"]["coordinates"][1],
                          **f["properties"]}
-                        for f in resposta_json["features"]
+                        for f in dados_json["features"]
                     ]
                     all_dfs.append(pd.DataFrame(registros))
             else:
-                # Opcional: print para debug no terminal caso o erro persista
-                print(f"Erro INPE: Status {r.status_code} - Bloco {dt_ini}")
-                
+                st.warning(f"⚠️ O INPE negou a conexão (Erro HTTP {r.status_code}).")
+                # DEBUG MODO ON: Mostra a URL para você testar no navegador
+                st.write(f"🔗 [Clique aqui para ver o erro do INPE]({r.url})")
+
+        except requests.exceptions.Timeout:
+            st.warning(f"⚠️ O servidor do INPE demorou muito (Timeout) em {dt_ini.strftime('%d/%m')}.")
         except Exception as e:
-            print(f"Falha na requisição: {e}")
-            pass
+            st.error(f"⚠️ Falha de conexão: {e}")
             
         dt_ini = dt_bloco_fim + timedelta(days=1)
-
-    return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_anomalia_modis(geom_json_str, ano_ref):
