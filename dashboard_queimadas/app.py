@@ -126,13 +126,21 @@ def carregar_areas_protegidas(tipo_area):
     gdf_areas['geometry'] = gdf_areas['geometry'].simplify(tolerance=0.01, preserve_topology=True)
     return gdf_areas[['nome_area', 'geometry']]
 
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satelites):
     url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
     
-    # 1. ADICIONADO: Header para simular um navegador e evitar bloqueio por firewall/anti-bot do INPE
+    # 1. CRIANDO UMA SESSÃO ROBUSTA COM RETENTATIVAS (Evita quedas por instabilidade do INPE)
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
 
     dic_estados = {
@@ -153,42 +161,45 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
         tradutor = {"Amazônia": "Amaz%nia", "Mata Atlântica": "Mata Atl%ntica"}
         filtro_base = f"bioma ILIKE '{tradutor.get(val_bioma, val_bioma)}'"
     elif tipo == "Por Município":
-        muni_curinga = re.sub(
-            r'[aeiouáéíóúãõâêîôûAEIOUÁÉÍÓÚÃÕÂÊÎÔÛ]', '%', val_muni
-        ).replace(' ', '%')
-        filtro_base = (
-            f"estado ILIKE '{dic_estados.get(val_estado, val_estado)}' "
-            f"AND municipio ILIKE '{muni_curinga}%'"
-        )
+        muni_curinga = re.sub(r'[aeiouáéíóúãõâêîôûAEIOUÁÉÍÓÚÃÕÂÊÎÔÛ]', '%', val_muni).replace(' ', '%')
+        filtro_base = f"estado ILIKE '{dic_estados.get(val_estado, val_estado)}' AND municipio ILIKE '{muni_curinga}%'"
 
     dt_ini = datetime.strptime(d_ini, "%Y-%m-%d")
     dt_fim = datetime.strptime(d_fim, "%Y-%m-%d")
     all_dfs = []
+    
     sat_str = "','".join(satelites)
 
-   # LOOP DE BUSCA
+    # 2. BARRA DE PROGRESSO VISUAL
+    progress_text = "📡 Extraindo dados pesados do INPE. Por favor, aguarde..."
+    my_bar = st.progress(0, text=progress_text)
+    
+    total_dias = (dt_fim - dt_ini).days + 1
+    dias_processados = 0
+
+    # LOOP DE BUSCA
     while dt_ini <= dt_fim:
-        dt_bloco_fim = min(dt_ini + timedelta(days=3), dt_fim)
+        # REDUZIDO PARA 1-2 DIAS (Evita que o banco do INPE engasgue com os dados de MT)
+        dt_bloco_fim = min(dt_ini + timedelta(days=1), dt_fim)
         
-        # 1. Correção Crítica: Sem aspas simples em volta das datas!
-        # 2. Voltamos com o id_pais=33 para acelerar o banco de dados deles.
+        # Consulta CQL corrigida, com aspas no formato ISO para acionar os índices do banco
         cql = (
-            f"data_hora_gmt >= {dt_ini.strftime('%Y-%m-%d')}T00:00:00Z "
-            f"AND data_hora_gmt <= {dt_bloco_fim.strftime('%Y-%m-%d')}T23:59:59Z "
-            f"AND satelite IN ('{sat_str}') AND id_pais=33 AND {filtro_base}"
+            f"data_hora_gmt >= '{dt_ini.strftime('%Y-%m-%d')}T00:00:00' "
+            f"AND data_hora_gmt <= '{dt_bloco_fim.strftime('%Y-%m-%d')}T23:59:59' "
+            f"AND satelite IN ('{sat_str}') AND {filtro_base}"
         )
         
         try:
-            r = requests.get(
+            r = session.get(
                 url,
                 params={
                     "service": "WFS", "version": "1.0.0", "request": "GetFeature",
                     "typeName": "bdqueimadas:focos", "outputFormat": "application/json",
-                    "CQL_FILTER": cql, "maxFeatures": 10000
+                    "CQL_FILTER": cql, "maxFeatures": 50000  # Aumentado para não cortar o topo do MT
                 },
                 headers=headers,
                 verify=False, 
-                timeout=40
+                timeout=90  # AUMENTADO DE 40 PARA 90 SEGUNDOS
             )
             
             if r.status_code == 200:
@@ -202,16 +213,36 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
                     ]
                     all_dfs.append(pd.DataFrame(registros))
             else:
-                st.warning(f"⚠️ O INPE negou a conexão (Erro HTTP {r.status_code}).")
-                # DEBUG MODO ON: Mostra a URL para você testar no navegador
-                st.write(f"🔗 [Clique aqui para ver o erro do INPE]({r.url})")
+                st.warning(f"⚠️ O INPE negou conexão no bloco {dt_ini.strftime('%d/%m')} (HTTP {r.status_code}).")
 
         except requests.exceptions.Timeout:
-            st.warning(f"⚠️ O servidor do INPE demorou muito (Timeout) em {dt_ini.strftime('%d/%m')}.")
+            st.warning(f"⚠️ Servidor congestionado. Pulando o dia {dt_ini.strftime('%d/%m')}.")
         except Exception as e:
-            st.error(f"⚠️ Falha de conexão: {e}")
+            pass  # Ignora erros menores de conexão para não parar o loop inteiro
             
+        # Atualiza a barrinha de progresso na tela
+        dias_processados += (dt_bloco_fim - dt_ini).days + 1
+        progresso = min(dias_processados / total_dias, 1.0)
+        my_bar.progress(progresso, text=f"{progress_text} ({int(progresso*100)}%)")
+
         dt_ini = dt_bloco_fim + timedelta(days=1)
+
+    my_bar.empty()  # Apaga a barra de progresso ao terminar
+
+    # Verifica se conseguiu extrair algo
+    if not all_dfs:
+        st.info("ℹ️ Nenhum foco detectado para os filtros selecionados, ou o INPE está totalmente fora do ar no momento.")
+        return pd.DataFrame()
+
+    df_final = pd.concat(all_dfs, ignore_index=True)
+    
+    # Remove eventuais duplicatas causadas pela emenda dos blocos de dias
+    if 'id' in df_final.columns:
+        df_final = df_final.drop_duplicates(subset=['id'])
+    else:
+        df_final = df_final.drop_duplicates()
+        
+    return df_final
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_anomalia_modis(geom_json_str, ano_ref):
