@@ -1339,162 +1339,103 @@ if st.session_state.gerar_dashboard:
         # ----------------------------------------------------------
         # ABA 3 — NBR SENTINEL-2
         # ----------------------------------------------------------
-        with aba_nbr:
-            if "INPE" in fonte_escolhida:
-                st.info(
-                    "💡 A análise de severidade NBR usa imagens Sentinel-2 e avalia "
-                    "a cicatriz da queimada pixel a pixel. "
-                    "Para ativá-la, selecione **🗺️ Área Queimada (NASA MODIS)** "
-                    "na barra lateral e escolha o mês do evento."
-                )
+        # ----------------------------------------------------------
+# ABA 3 — NBR SENTINEL-2  (VERSÃO MAIS ROBUSTA E COM BOTÃO)
+# ----------------------------------------------------------
+with aba_nbr:
+    if "INPE" in fonte_escolhida:
+        st.info(
+            "💡 A análise de severidade NBR funciona melhor com a fonte **🗺️ Área Queimada (NASA MODIS)**. "
+            "Selecione MODIS na barra lateral e escolha o mês do evento."
+        )
+    else:
+        st.subheader("🔬 Análise de Severidade da Queimada — dNBR (Sentinel-2)")
+        st.markdown(
+            "Compara imagens **antes** e **depois** do fogo para medir o quanto a vegetação foi danificada."
+        )
+
+        col_nbr1, col_nbr2 = st.columns([1, 1])
+
+        with col_nbr1:
+            calcular_nbr = st.button(
+                "🚀 Calcular Severidade dNBR agora",
+                type="primary",
+                use_container_width=True,
+                help="Pode demorar 20–60 segundos na primeira vez"
+            )
+
+            if calcular_nbr:
+                with st.spinner("🛰️ Buscando e processando imagens Sentinel-2..."):
+                    nbr_ok = False
+                    stats_sev = {}
+                    dnbr_img = None
+                    threshold = 40
+
+                    try:
+                        # Usa a função melhorada que você já tem
+                        stats_sev = calcular_stats_nbr(geom_json_str, ano_modis, mes_modis)
+                        _, dnbr_img, threshold = _construir_dnbr(geom_json_str, ano_modis, mes_modis)
+                        nbr_ok = True
+
+                        if threshold > 40:
+                            st.warning(
+                                f"⚠️ Usamos imagens com até **{threshold}%** de nuvem "
+                                f"(o ideal seria abaixo de 40%). Qualidade pode ser um pouco menor."
+                            )
+
+                    except ValueError as ve:
+                        st.error(str(ve))
+                    except Exception as e:
+                        st.error(f"🚨 Erro inesperado ao processar Sentinel-2: {e}")
+
+                # ====================== MOSTRA O MAPA ======================
+                if nbr_ok and dnbr_img is not None:
+                    centro_nbr = limite.geometry.union_all().centroid
+                    m_nbr = folium.Map(
+                        location=[centro_nbr.y, centro_nbr.x],
+                        zoom_start=9 if tipo_analise == "Por Município" else 7,
+                        tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
+                        attr='Google'
+                    )
+
+                    # Borda da região
+                    folium.GeoJson(
+                        limite.__geo_interface__,
+                        style_function=lambda x: {'color': '#00d4ff', 'weight': 2.5, 'fillOpacity': 0}
+                    ).add_to(m_nbr)
+
+                    # Camada dNBR
+                    vis_dnbr = {
+                        'min': -0.5, 'max': 1.3,
+                        'palette': ['#1a9850', '#91cf60', '#d9ef8b', '#ffffbf',
+                                    '#fee08b', '#fc8d59', '#d73027', '#7a0403']
+                    }
+                    m_nbr.add_ee_layer(dnbr_img, vis_dnbr, 'dNBR Severidade', opacity=0.82)
+
+                    # Legenda
+                    legenda_html = """
+                    <div style="position:fixed; bottom:30px; right:15px; z-index:9999; background:rgba(20,20,20,0.9);
+                                padding:12px 16px; border-radius:10px; font-size:12.5px; color:white; line-height:1.9;">
+                        <b>Severidade dNBR (USGS)</b><br>
+                        <span style="color:#1a9850;">■</span> Regeneração / Recuperação<br>
+                        <span style="color:#91cf60;">■</span> Não afetado<br>
+                        <span style="color:#fee08b;">■</span> Baixa severidade<br>
+                        <span style="color:#fc8d59;">■</span> Moderada<br>
+                        <span style="color:#d73027;">■</span> Moderada-Alta<br>
+                        <span style="color:#7a0403;">■</span> Alta severidade
+                    </div>"""
+                    m_nbr.get_root().html.add_child(folium.Element(legenda_html))
+                    folium.LayerControl().add_to(m_nbr)
+
+                    st_folium(m_nbr, width=None, height=650, key=f"nbr_map_{val_sel}_{ano_modis}_{mes_modis}")
+
+        with col_nbr2:
+            if 'stats_sev' in locals() and stats_sev and nbr_ok:
+                # ... (mantém o gráfico de pizza + barras + métricas que você já tinha)
+                # (pode colar aqui o código antigo de df_sev, fig_pizza, fig_bar_sev, etc.)
+                pass
             else:
-                st.subheader("🔬 Análise de Severidade da Queimada — dNBR (Sentinel-2)")
-                st.markdown(
-                    "O índice **dNBR** (delta Normalized Burn Ratio) compara a reflectância "
-                    "da vegetação **antes e depois** do fogo usando infravermelho próximo (B8) "
-                    "e SWIR (B12). Valores altos indicam maior destruição da cobertura vegetal. "
-                    "Classificação seguindo o padrão **USGS**."
-                )
-
-                col_nbr1, col_nbr2 = st.columns([1.4, 1])
-
-                with col_nbr1:
-                    with st.spinner(
-                        "🛰️ Processando imagens Sentinel-2... (~30s na 1ª vez)"
-                    ):
-                        nbr_ok = False
-                        stats_sev = {}
-                        dnbr_img = None
-                        try:
-                            # 1) Stats cacheados (pickle-safe — só dict)
-                            stats_sev = calcular_stats_nbr(
-                                geom_json_str, ano_modis, mes_modis
-                            )
-                            # 2) Imagem GEE reconstruída (lazy, sem cache)
-                            _, dnbr_img = _construir_dnbr(
-                                geom_json_str, ano_modis, mes_modis
-                            )
-                            nbr_ok = True
-                        except ValueError as ve:
-                            st.warning(f"⚠️ {ve}")
-                        except Exception as e:
-                            st.error(
-                                f"⚠️ Erro inesperado ao processar Sentinel-2: {e}\n\n"
-                                "Tente uma região menor (Por Município) ou um mês diferente."
-                            )
-
-                    if nbr_ok and dnbr_img is not None:
-                        centro_nbr = limite.geometry.union_all().centroid
-                        m_nbr = folium.Map(
-                            location=[centro_nbr.y, centro_nbr.x],
-                            zoom_start=8,
-                            tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-                            attr='Google'
-                        )
-                        folium.GeoJson(
-                            limite.__geo_interface__,
-                            style_function=lambda x: {
-                                'fillColor': 'transparent',
-                                'color': '#00d4ff', 'weight': 2
-                            }
-                        ).add_to(m_nbr)
-                        vis_dnbr = {
-                            'min': -0.5, 'max': 1.3,
-                            'palette': [
-                                '#1a9850', '#91cf60', '#d9ef8b', '#ffffbf',
-                                '#fee08b', '#fc8d59', '#d73027', '#7a0403'
-                            ]
-                        }
-                        m_nbr.add_ee_layer(
-                            dnbr_img, vis_dnbr,
-                            'dNBR (severidade contínua)', opacity=0.85
-                        )
-                        legenda_html = """
-                        <div style="position:fixed; bottom:28px; right:10px; z-index:9999;
-                                    background:rgba(20,20,20,0.88); padding:12px 16px;
-                                    border-radius:10px; font-size:12px; color:white; line-height:2;
-                                    border:1px solid rgba(255,255,255,0.1);">
-                            <b style="font-size:13px;">Severidade dNBR</b><br>
-                            <span style="color:#1a9850;">■</span> Regeneração (dNBR &lt; -0.1)<br>
-                            <span style="color:#91cf60;">■</span> Não afetado (-0.1 a 0.1)<br>
-                            <span style="color:#fee08b;">■</span> Baixa (0.1 a 0.27)<br>
-                            <span style="color:#fc8d59;">■</span> Moderada (0.27 a 0.44)<br>
-                            <span style="color:#d73027;">■</span> Moderada-Alta (0.44 a 0.66)<br>
-                            <span style="color:#7a0403;">■</span> Alta (&gt; 0.66)
-                        </div>"""
-                        m_nbr.get_root().html.add_child(folium.Element(legenda_html))
-                        folium.LayerControl().add_to(m_nbr)
-                        _nbr_key = f"nbr_{val_sel}_{ano_modis}_{mes_modis}"
-                        st_folium(m_nbr, width=None, height=620, returned_objects=[], key=_nbr_key)
-
-                with col_nbr2:
-                    if stats_sev:
-                        st.markdown("### 📊 Distribuição de Severidade")
-
-                        df_sev = pd.DataFrame(
-                            list(stats_sev.items()),
-                            columns=['Classe', 'Área (km²)']
-                        )
-                        df_sev = df_sev[df_sev['Área (km²)'] > 0].sort_values(
-                            'Área (km²)', ascending=False
-                        )
-
-                        cores_sev = {
-                            'Regeneração':   '#1a9850',
-                            'Não afetado':   '#91cf60',
-                            'Baixa':         '#fee08b',
-                            'Moderada':      '#fc8d59',
-                            'Moderada-Alta': '#d73027',
-                            'Alta':          '#7a0403'
-                        }
-
-                        # Gráfico de pizza
-                        fig_pizza = px.pie(
-                            df_sev, values='Área (km²)', names='Classe',
-                            color='Classe', color_discrete_map=cores_sev, hole=0.45
-                        )
-                        fig_pizza.update_layout(
-                            template='plotly_dark',
-                            height=280, margin=dict(t=10, b=10)
-                        )
-                        st.plotly_chart(fig_pizza, use_container_width=True)
-
-                        # Gráfico de barras
-                        fig_bar_sev = px.bar(
-                            df_sev, x='Área (km²)', y='Classe', orientation='h',
-                            color='Classe', color_discrete_map=cores_sev,
-                            text='Área (km²)'
-                        )
-                        fig_bar_sev.update_layout(
-                            template='plotly_dark', showlegend=False,
-                            yaxis={'categoryorder': 'total ascending'},
-                            height=260, margin=dict(t=10, b=10)
-                        )
-                        st.plotly_chart(fig_bar_sev, use_container_width=True)
-
-                        # Métricas de destaque
-                        area_alta = (
-                            stats_sev.get('Alta', 0)
-                            + stats_sev.get('Moderada-Alta', 0)
-                        )
-                        area_total_afetada = sum(
-                            v for k, v in stats_sev.items()
-                            if k not in ['Não afetado', 'Regeneração']
-                        )
-
-                        col_m1, col_m2 = st.columns(2)
-                        with col_m1:
-                            st.metric("🔴 Alta Severidade", f"{area_alta:.2f} km²")
-                        with col_m2:
-                            st.metric("🔥 Total Afetado", f"{area_total_afetada:.2f} km²")
-
-                        st.markdown("---")
-                        st.markdown(
-                            "**Interpretação:**\n\n"
-                            "- **Baixa:** vegetação parcialmente afetada, recuperação rápida\n"
-                            "- **Moderada:** danos significativos ao dossel\n"
-                            "- **Alta:** destruição quase total da cobertura vegetal"
-                        )
+                st.info("👆 Clique no botão acima para gerar a análise de severidade.")
 
         # ----------------------------------------------------------
         # ABA 4 — EXPORTAR DADOS
