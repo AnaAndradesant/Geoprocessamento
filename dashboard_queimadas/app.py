@@ -11,6 +11,7 @@ import plotly.graph_objects as go
 import requests, warnings, time, unicodedata, re, json, io
 import ee
 from io import BytesIO
+import calendar
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
@@ -251,96 +252,41 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
         
     return df_final
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def calcular_anomalia_modis(geom_json_str, ano_ref):
-    """
-    Versão otimizada: toda a computação acontece server-side no GEE.
-    Uma única chamada getInfo() ao final, em vez de ~276 chamadas individuais.
-    Tempo esperado: 10–20s (vs 2–5min da versão anterior).
-    """
-    ee_geom = ee.Geometry(json.loads(geom_json_str))
-    anos_historico = list(range(2001, ano_ref))
-    anos_ee = ee.List(anos_historico)
-    n_anos = len(anos_historico)
 
-    meses_map = {
-        1: 'Jan', 2: 'Fev', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun',
-        7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Out', 11: 'Nov', 12: 'Dez'
-    }
 
-    def get_area_km2(img):
-        """Calcula área queimada em km² de uma imagem MODIS — server-side."""
-        raw = (
-            ee.Image.pixelArea().divide(1e6)
-            .updateMask(img.gt(0))
-            .reduceRegion(
-                reducer=ee.Reducer.sum(),
-                geometry=ee_geom,
-                scale=1000,
-                maxPixels=1e10,
-                bestEffort=True
-            ).get('area')
-        )
-        return ee.Algorithms.If(raw, raw, 0)
-
-    def calc_mes_feature(mes):
-        mes_n = ee.Number(mes)
-
-        # Área do ano de referência
-        ini_ref = ee.Date.fromYMD(ano_ref, mes_n, 1)
-        img_ref = (
-            ee.ImageCollection('MODIS/061/MCD64A1')
-            .filterDate(ini_ref, ini_ref.advance(1, 'month'))
-            .filterBounds(ee_geom)
-            .select('BurnDate').max().clip(ee_geom)
-        )
-        area_ref = ee.Number(get_area_km2(img_ref))
-
-        # Média histórica server-side: map + iterate
-        def area_ano_hist(ano):
-            ano_n = ee.Number(ano)
-            ini_h = ee.Date.fromYMD(ano_n, mes_n, 1)
-            img_h = (
-                ee.ImageCollection('MODIS/061/MCD64A1')
-                .filterDate(ini_h, ini_h.advance(1, 'month'))
-                .filterBounds(ee_geom)
-                .select('BurnDate').max().clip(ee_geom)
-            )
-            return get_area_km2(img_h)
-
-        areas_hist = anos_ee.map(area_ano_hist)
-        soma = areas_hist.iterate(
-            lambda cur, acc: ee.Number(acc).add(ee.Number(cur)),
-            ee.Number(0)
-        )
-        media_hist = ee.Number(soma).divide(ee.Number(n_anos))
-
-        return ee.Feature(None, {
-            'mes': mes_n,
-            'area_ref': area_ref,
-            'media_hist': media_hist
-        })
-
-    # Toda a computação entra aqui — getInfo() chamado UMA única vez
-    meses_ee = ee.List.sequence(1, 12)
-    resultado = ee.FeatureCollection(meses_ee.map(calc_mes_feature)).getInfo()
-
-    registros = []
-    for feat in resultado['features']:
-        p = feat['properties']
-        mes      = int(p['mes'])
-        val_ref  = round(float(p.get('area_ref')  or 0), 2)
-        media    = round(float(p.get('media_hist') or 0), 2)
-        anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
-        registros.append({
-            'Mês': mes,
-            'Mês Nome': meses_map[mes],
-            f'Área {ano_ref} (km²)': val_ref,
-            'Média Histórica (km²)': media,
-            'Anomalia (%)': anomalia
-        })
-
-    return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
+@st.cache_data
+def calcular_area_queimada_modis(geom_json, ano, mes=None):
+    poly = ee.Geometry(json.loads(geom_json)['features'][0]['geometry'])
+    dataset = ee.ImageCollection('MODIS/061/MCD64A1').filterBounds(poly)
+    
+    if mes:
+        # Pega a coleção do mês específico
+        img = dataset.filter(ee.Filter.calendarRange(ano, ano, 'year'))\
+                     .filter(ee.Filter.calendarRange(mes, mes, 'month')).max()
+        
+        burned = img.select('BurnDate').clip(poly)
+        
+        # --- CORREÇÃO DO EFEITO FANTASMA ---
+        # Descobre qual é o Dia do Ano (DOY) que o mês começa e termina
+        doy_inicio = datetime(ano, mes, 1).timetuple().tm_yday
+        ultimo_dia = calendar.monthrange(ano, mes)[1]
+        doy_fim = datetime(ano, mes, ultimo_dia).timetuple().tm_yday
+        
+        # Obriga a imagem a mostrar apenas pixels que queimaram DENTRO deste mês
+        mask = burned.gte(doy_inicio).And(burned.lte(doy_fim))
+        burned = burned.updateMask(mask)
+        # -----------------------------------
+        
+    else:
+        # Se for o ano todo, pega normal
+        img = dataset.filter(ee.Filter.calendarRange(ano, ano, 'year')).max()
+        burned = img.select('BurnDate').clip(poly)
+    
+    area_img = ee.Image.pixelArea().updateMask(burned.gt(0))
+    stats = area_img.reduceRegion(reducer=ee.Reducer.sum(), geometry=poly, scale=500, maxPixels=1e9)
+    area_km2 = ee.Number(stats.get('area')).divide(1e6).getInfo()
+    
+    return burned, area_km2 or 0
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_nbr_sentinel(geom_json_str, ano, mes):
