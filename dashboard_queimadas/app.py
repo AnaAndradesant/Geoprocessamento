@@ -339,13 +339,11 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
 
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def calcular_nbr_sentinel(geom_json_str, ano, mes):
+def _construir_dnbr(geom_json_str, ano, mes):
     """
-    Calcula dNBR (severidade de queimada) com Sentinel-2 SR.
-    Janela pré: 3 meses antes. Janela pós: mês selecionado + 1 mês após.
-    Retorna: (dnbr_img, sev_img, stats_por_classe)
-    Levanta ValueError com mensagem amigável se não houver imagens disponíveis.
+    Constrói a imagem dNBR no GEE (lazy — sem chamadas de rede).
+    Levanta ValueError se não houver imagens disponíveis.
+    NÃO é cacheada: objetos ee.Image não são serializáveis por pickle.
     """
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     data_ref = ee.Date.fromYMD(ano, mes, 1)
@@ -370,28 +368,28 @@ def calcular_nbr_sentinel(geom_json_str, ano, mes):
     col_pre = colecao_base.filterDate(data_pre, data_ref)
     col_pos = colecao_base.filterDate(data_ref, data_pos)
 
-    n_pre = col_pre.size().getInfo()
-    n_pos = col_pos.size().getInfo()
+    # Verifica disponibilidade — única chamada de rede nesta etapa
+    counts = ee.Dictionary({
+        'n_pre': col_pre.size(),
+        'n_pos': col_pos.size()
+    }).getInfo()
+    n_pre, n_pos = counts['n_pre'], counts['n_pos']
 
     if n_pre == 0 and n_pos == 0:
         raise ValueError(
-            f"Nenhuma imagem Sentinel-2 encontrada para esta região no período "
-            f"analisado (pré: {ano}-{mes-3:02d} a {ano}-{mes:02d} / "
-            f"pós: {ano}-{mes:02d} a {ano}-{mes+2:02d}). "
-            "Isso pode ocorrer por cobertura de nuvens acima de 20% ou por região "
-            "fora da cobertura do satélite no período. Tente outro mês ou região menor."
+            "Nenhuma imagem Sentinel-2 sem nuvens encontrada para esta região no período. "
+            "Isso ocorre quando a cobertura de nuvens supera 20% em todos os dias. "
+            "Tente outro mês ou uma região menor."
         )
     if n_pre == 0:
         raise ValueError(
-            "Não há imagens Sentinel-2 sem nuvens para o período PRÉ-fogo "
-            f"({ano}-{mes-3:02d} a {ano}-{mes:02d}). "
-            "Tente selecionar um mês diferente para ampliar a janela de análise."
+            "Sem imagens Sentinel-2 para o período PRÉ-fogo (3 meses antes). "
+            "Tente um mês diferente."
         )
     if n_pos == 0:
         raise ValueError(
-            "Não há imagens Sentinel-2 sem nuvens para o período PÓS-fogo "
-            f"({ano}-{mes:02d} a {ano}-{mes+2:02d}). "
-            "Tente selecionar um mês mais antigo para que o período pós já tenha imagens disponíveis."
+            "Sem imagens Sentinel-2 para o período PÓS-fogo (até 2 meses após). "
+            "Tente um mês mais antigo."
         )
 
     img_pre = col_pre.median().clip(ee_geom)
@@ -401,35 +399,46 @@ def calcular_nbr_sentinel(geom_json_str, ano, mes):
     nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
     dnbr = nbr_pre.subtract(nbr_pos).rename('dNBR')
 
-    # Classificação padrão USGS
+    return ee_geom, dnbr
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def calcular_stats_nbr(geom_json_str, ano, mes):
+    """
+    Calcula e cacheia APENAS o dicionário de stats (serializável por pickle).
+    Uma única chamada getInfo() server-side para todas as 6 classes.
+    """
+    ee_geom, dnbr = _construir_dnbr(geom_json_str, ano, mes)
+
     severidade = (
         dnbr
-        .where(dnbr.lt(-0.1), 0)                              # Regeneração
-        .where(dnbr.gte(-0.1).And(dnbr.lt(0.1)), 1)          # Não afetado
-        .where(dnbr.gte(0.1).And(dnbr.lt(0.27)), 2)          # Baixa
-        .where(dnbr.gte(0.27).And(dnbr.lt(0.44)), 3)         # Moderada
-        .where(dnbr.gte(0.44).And(dnbr.lt(0.66)), 4)         # Moderada-Alta
-        .where(dnbr.gte(0.66), 5)                             # Alta
+        .where(dnbr.lt(-0.1), 0)
+        .where(dnbr.gte(-0.1).And(dnbr.lt(0.1)), 1)
+        .where(dnbr.gte(0.1).And(dnbr.lt(0.27)), 2)
+        .where(dnbr.gte(0.27).And(dnbr.lt(0.44)), 3)
+        .where(dnbr.gte(0.44).And(dnbr.lt(0.66)), 4)
+        .where(dnbr.gte(0.66), 5)
     ).rename('severidade')
 
-    pixel_area = ee.Image.pixelArea().divide(1000000)
-    labels = {
-        0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa',
-        3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'
-    }
-    stats = {}
-    for classe, nome in labels.items():
-        mascara_cls = severidade.eq(classe)
-        area = (
-            pixel_area.updateMask(mascara_cls)
-            .reduceRegion(
-                reducer=ee.Reducer.sum(), geometry=ee_geom,
-                scale=20, maxPixels=1e11, bestEffort=True
-            ).getInfo()
-        )
-        stats[nome] = round(area.get('area', 0) or 0, 2)
+    pixel_area = ee.Image.pixelArea().divide(1e6)
+    labels = {0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa',
+              3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'}
 
-    return dnbr, severidade, stats
+    # Empilha todas as classes em uma imagem multibanda → 1 único getInfo()
+    bandas = [
+        pixel_area.updateMask(severidade.eq(cls)).rename(nome)
+        for cls, nome in labels.items()
+    ]
+    img_stack = ee.Image.cat(bandas)
+    resultado = img_stack.reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=ee_geom,
+        scale=100,          # 100m: bom equilíbrio precisão/velocidade
+        maxPixels=1e11,
+        bestEffort=True
+    ).getInfo()
+
+    return {nome: round(resultado.get(nome) or 0, 2) for nome in labels.values()}
 
 # =============================================================
 # --- INTERFACE (BARRA LATERAL) ---
@@ -1321,8 +1330,14 @@ if st.session_state.gerar_dashboard:
                     ):
                         nbr_ok = False
                         stats_sev = {}
+                        dnbr_img = None
                         try:
-                            dnbr_img, sev_img, stats_sev = calcular_nbr_sentinel(
+                            # 1) Stats cacheados (pickle-safe — só dict)
+                            stats_sev = calcular_stats_nbr(
+                                geom_json_str, ano_modis, mes_modis
+                            )
+                            # 2) Imagem GEE reconstruída (lazy, sem cache)
+                            _, dnbr_img = _construir_dnbr(
                                 geom_json_str, ano_modis, mes_modis
                             )
                             nbr_ok = True
@@ -1334,7 +1349,7 @@ if st.session_state.gerar_dashboard:
                                 "Tente uma região menor (Por Município) ou um mês diferente."
                             )
 
-                    if nbr_ok:
+                    if nbr_ok and dnbr_img is not None:
                         centro_nbr = limite.geometry.union_all().centroid
                         m_nbr = folium.Map(
                             location=[centro_nbr.y, centro_nbr.x],
