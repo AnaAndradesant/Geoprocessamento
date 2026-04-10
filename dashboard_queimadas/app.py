@@ -87,10 +87,18 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
     
     classes = {0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa', 3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'}
     res_stats = {}
-    if 'groups' not in str(stats): 
-        for k, v in stats.get('constant', stats).items():
-            area = (v * 400) / 1e6 # 20m scale
-            res_stats[classes.get(int(float(k)), 'Outros')] = round(area, 2)
+    
+    # === A CORREÇÃO DO CÁLCULO DE ÁREA ===
+    if stats:
+        # Pega os dados direto ignorando o nome da banda ('nbr', 'constant', etc)
+        hist = list(stats.values())[0] 
+        
+        # Garante que estamos lendo os números corretamente
+        if isinstance(hist, dict):
+            for k, v in hist.items():
+                area = (v * 400) / 1e6 # Aqui o 'v' finalmente é só o número de pixels!
+                res_stats[classes.get(int(float(k)), 'Outros')] = round(area, 2)
+    # =====================================
             
     return res_stats
 
