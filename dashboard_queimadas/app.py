@@ -1044,7 +1044,16 @@ if st.session_state.gerar_dashboard:
                 m.get_root().html.add_child(folium.Element(legenda_modis))
 
             folium.LayerControl(collapsed=False).add_to(m)
-            st_folium(m, width=None, height=700, returned_objects=[])
+
+            # Key dinâmico: muda junto com os dados, forçando re-render automático
+            # sem precisar trocar o estilo do mapa manualmente
+            if "INPE" in fonte_escolhida:
+                _periodo = f"{dt_ini.strftime('%Y%m%d')}_{hoje.strftime('%Y%m%d')}_{'_'.join(sorted(satelites_sel))}"
+            else:
+                _periodo = f"{ano_modis}_{mes_modis}"
+            _map_key = f"mapa_{val_sel}_{_periodo}_{area_protegida}_{estilo_mapa}_{focar_area}"
+
+            st_folium(m, width=None, height=700, returned_objects=[], key=_map_key)
 
         # ----------------------------------------------------------
         # ABA 2 — GRÁFICOS & ANOMALIA
@@ -1366,7 +1375,8 @@ if st.session_state.gerar_dashboard:
                         </div>"""
                         m_nbr.get_root().html.add_child(folium.Element(legenda_html))
                         folium.LayerControl().add_to(m_nbr)
-                        st_folium(m_nbr, width=None, height=620, returned_objects=[])
+                        _nbr_key = f"nbr_{val_sel}_{ano_modis}_{mes_modis}"
+                        st_folium(m_nbr, width=None, height=620, returned_objects=[], key=_nbr_key)
 
                 with col_nbr2:
                     if stats_sev:
