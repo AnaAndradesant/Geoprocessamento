@@ -341,56 +341,83 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
 
 def _construir_dnbr(geom_json_str, ano, mes):
     """
-    Constrói a imagem dNBR no GEE (lazy — sem chamadas de rede).
-    Levanta ValueError se não houver imagens disponíveis.
-    NÃO é cacheada: objetos ee.Image não são serializáveis por pickle.
+    Constrói a imagem dNBR no GEE.
+    Versão melhorada: filtro de nuvem mais flexível + fallback + mensagens claras.
     """
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     data_ref = ee.Date.fromYMD(ano, mes, 1)
-    data_pre = data_ref.advance(-3, 'month')
-    data_pos = data_ref.advance(2, 'month')
+    
+    # Período um pouco mais flexível
+    data_pre = data_ref.advance(-2.5, 'month')   # antes: -3
+    data_pos = data_ref.advance(2.5, 'month')    # antes: +2
 
     def mascara_nuvem(img):
         qa = img.select('QA60')
         mascara = (
-            qa.bitwiseAnd(1 << 10).eq(0)
-            .And(qa.bitwiseAnd(1 << 11).eq(0))
+            qa.bitwiseAnd(1 << 10).eq(0)   # nuvem
+            .And(qa.bitwiseAnd(1 << 11).eq(0))  # sombra de nuvem
         )
         return img.updateMask(mascara).divide(10000)
 
     colecao_base = (
         ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         .filterBounds(ee_geom)
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
         .map(mascara_nuvem)
     )
 
     col_pre = colecao_base.filterDate(data_pre, data_ref)
     col_pos = colecao_base.filterDate(data_ref, data_pos)
 
-    # Verifica disponibilidade — única chamada de rede nesta etapa
-    counts = ee.Dictionary({
-        'n_pre': col_pre.size(),
-        'n_pos': col_pos.size()
-    }).getInfo()
-    n_pre, n_pos = counts['n_pre'], counts['n_pos']
+    # === Verificação de disponibilidade com thresholds progressivos ===
+    thresholds = [40, 60]   # primeiro tenta 40%, depois 60%
+    n_pre = n_pos = 0
+    threshold_usado = None
 
+    for thresh in thresholds:
+        col_pre_f = col_pre.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', thresh))
+        col_pos_f = col_pos.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', thresh))
+        
+        counts = ee.Dictionary({
+            'n_pre': col_pre_f.size(),
+            'n_pos': col_pos_f.size()
+        }).getInfo()
+        
+        n_pre = counts['n_pre']
+        n_pos = counts['n_pos']
+        
+        if n_pre > 0 and n_pos > 0:
+            threshold_usado = thresh
+            col_pre = col_pre_f
+            col_pos = col_pos_f
+            break
+
+    # Mensagens mais amigáveis
     if n_pre == 0 and n_pos == 0:
         raise ValueError(
-            "Nenhuma imagem Sentinel-2 sem nuvens encontrada para esta região no período. "
-            "Isso ocorre quando a cobertura de nuvens supera 20% em todos os dias. "
-            "Tente outro mês ou uma região menor."
+            f"❌ Nenhuma imagem Sentinel-2 encontrada para esta região no período.\n\n"
+            f"• Mês escolhido: {mes:02d}/{ano}\n"
+            f"• Período analisado: {data_pre.format('YYYY-MM').getInfo()} até {data_pos.format('YYYY-MM').getInfo()}\n\n"
+            "Dicas:\n"
+            "• Use escala **Por Município** (áreas menores funcionam muito melhor)\n"
+            "• Escolha meses da estação seca do seu bioma\n"
+            "• Tente um mês diferente (evite meses muito recentes ou chuvosos)"
         )
+    
     if n_pre == 0:
         raise ValueError(
-            "Sem imagens Sentinel-2 para o período PRÉ-fogo (3 meses antes). "
-            "Tente um mês diferente."
+            f"❌ Sem imagens Sentinel-2 **pré-fogo** (antes de {mes:02d}/{ano}).\n"
+            "Tente um mês mais antigo ou uma região menor."
         )
     if n_pos == 0:
         raise ValueError(
-            "Sem imagens Sentinel-2 para o período PÓS-fogo (até 2 meses após). "
+            f"❌ Sem imagens Sentinel-2 **pós-fogo** (após {mes:02d}/{ano}).\n"
             "Tente um mês mais antigo."
         )
+
+    # Se usou threshold maior que 40%, avisa o usuário
+    if threshold_usado > 40:
+        st.warning(f"⚠️ Usando imagens com até **{threshold_usado}%** de nuvem (padrão é 40%). "
+                   "A qualidade pode ser ligeiramente menor em áreas muito nubladas.")
 
     img_pre = col_pre.median().clip(ee_geom)
     img_pos = col_pos.median().clip(ee_geom)
@@ -399,16 +426,18 @@ def _construir_dnbr(geom_json_str, ano, mes):
     nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
     dnbr = nbr_pre.subtract(nbr_pos).rename('dNBR')
 
-    return ee_geom, dnbr
+    return ee_geom, dnbr, threshold_usado   # retornamos também o threshold usado
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_stats_nbr(geom_json_str, ano, mes):
     """
-    Calcula e cacheia APENAS o dicionário de stats (serializável por pickle).
-    Uma única chamada getInfo() server-side para todas as 6 classes.
+    Calcula estatísticas de severidade (cacheável).
     """
-    ee_geom, dnbr = _construir_dnbr(geom_json_str, ano, mes)
+    try:
+        ee_geom, dnbr, threshold_usado = _construir_dnbr(geom_json_str, ano, mes)
+    except ValueError as ve:
+        raise ve  # repassa o erro amigável
 
     severidade = (
         dnbr
@@ -424,21 +453,26 @@ def calcular_stats_nbr(geom_json_str, ano, mes):
     labels = {0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa',
               3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'}
 
-    # Empilha todas as classes em uma imagem multibanda → 1 único getInfo()
     bandas = [
         pixel_area.updateMask(severidade.eq(cls)).rename(nome)
         for cls, nome in labels.items()
     ]
     img_stack = ee.Image.cat(bandas)
+    
     resultado = img_stack.reduceRegion(
         reducer=ee.Reducer.sum(),
         geometry=ee_geom,
-        scale=100,          # 100m: bom equilíbrio precisão/velocidade
+        scale=100,
         maxPixels=1e11,
         bestEffort=True
     ).getInfo()
 
-    return {nome: round(resultado.get(nome) or 0, 2) for nome in labels.values()}
+    stats = {nome: round(resultado.get(nome) or 0, 2) for nome in labels.values()}
+    
+    # Salva o threshold usado para mostrar no dashboard se quiser
+    stats['threshold_nuvem_usado'] = threshold_usado
+    
+    return stats
 
 # =============================================================
 # --- INTERFACE (BARRA LATERAL) ---
