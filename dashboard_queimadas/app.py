@@ -67,6 +67,15 @@ folium.Map.add_ee_layer = add_ee_layer
 # --- FUNÇÕES UTILITÁRIAS ---
 # =============================================================
 
+def normalizar_texto(txt):
+    """Remove acentos e converte para minúsculo para buscas tolerantes."""
+    if pd.isna(txt):
+        return ""
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', str(txt))
+        if unicodedata.category(c) != 'Mn'
+    ).lower()
+
 def gerar_excel(df):
     # 1. Cria uma cópia para não estragar os dados originais do dashboard
     df_export = df.copy()
@@ -141,7 +150,6 @@ from urllib3.util.retry import Retry
 def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satelites):
     url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
     
-    # 1. CRIANDO UMA SESSÃO ROBUSTA COM RETENTATIVAS (Evita quedas por instabilidade do INPE)
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
@@ -174,41 +182,27 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
     dt_ini = datetime.strptime(d_ini, "%Y-%m-%d")
     dt_fim = datetime.strptime(d_fim, "%Y-%m-%d")
     all_dfs = []
-    
     sat_str = "','".join(satelites)
 
-    # 2. BARRA DE PROGRESSO VISUAL
-    progress_text = "📡 Extraindo dados pesados do INPE. Por favor, aguarde..."
-    my_bar = st.progress(0, text=progress_text)
-    
-    total_dias = (dt_fim - dt_ini).days + 1
-    dias_processados = 0
-
-    # LOOP DE BUSCA
     while dt_ini <= dt_fim:
-        # REDUZIDO PARA 1-2 DIAS (Evita que o banco do INPE engasgue com os dados de MT)
         dt_bloco_fim = min(dt_ini + timedelta(days=1), dt_fim)
-        
-        # Consulta CQL corrigida, com aspas no formato ISO para acionar os índices do banco
         cql = (
             f"data_hora_gmt >= '{dt_ini.strftime('%Y-%m-%d')}T00:00:00' "
             f"AND data_hora_gmt <= '{dt_bloco_fim.strftime('%Y-%m-%d')}T23:59:59' "
             f"AND satelite IN ('{sat_str}') AND {filtro_base}"
         )
-        
         try:
             r = session.get(
                 url,
                 params={
                     "service": "WFS", "version": "1.0.0", "request": "GetFeature",
                     "typeName": "bdqueimadas:focos", "outputFormat": "application/json",
-                    "CQL_FILTER": cql, "maxFeatures": 50000  # Aumentado para não cortar o topo do MT
+                    "CQL_FILTER": cql, "maxFeatures": 50000
                 },
                 headers=headers,
-                verify=False, 
-                timeout=90  # AUMENTADO DE 40 PARA 90 SEGUNDOS
+                verify=False,
+                timeout=90
             )
-            
             if r.status_code == 200:
                 dados_json = r.json()
                 if "features" in dados_json and len(dados_json["features"]) > 0:
@@ -219,36 +213,19 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
                         for f in dados_json["features"]
                     ]
                     all_dfs.append(pd.DataFrame(registros))
-            else:
-                st.warning(f"⚠️ O INPE negou conexão no bloco {dt_ini.strftime('%d/%m')} (HTTP {r.status_code}).")
-
-        except requests.exceptions.Timeout:
-            st.warning(f"⚠️ Servidor congestionado. Pulando o dia {dt_ini.strftime('%d/%m')}.")
-        except Exception as e:
-            pass  # Ignora erros menores de conexão para não parar o loop inteiro
+        except Exception:
+            pass  # Ignora erros de conexão para não parar o loop
             
-        # Atualiza a barrinha de progresso na tela
-        dias_processados += (dt_bloco_fim - dt_ini).days + 1
-        progresso = min(dias_processados / total_dias, 1.0)
-        my_bar.progress(progresso, text=f"{progress_text} ({int(progresso*100)}%)")
-
         dt_ini = dt_bloco_fim + timedelta(days=1)
 
-    my_bar.empty()  # Apaga a barra de progresso ao terminar
-
-    # Verifica se conseguiu extrair algo
     if not all_dfs:
-        st.info("ℹ️ Nenhum foco detectado para os filtros selecionados, ou o INPE está totalmente fora do ar no momento.")
         return pd.DataFrame()
 
     df_final = pd.concat(all_dfs, ignore_index=True)
-    
-    # Remove eventuais duplicatas causadas pela emenda dos blocos de dias
     if 'id' in df_final.columns:
         df_final = df_final.drop_duplicates(subset=['id'])
     else:
         df_final = df_final.drop_duplicates()
-        
     return df_final
 
 
