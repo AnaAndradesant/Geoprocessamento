@@ -46,6 +46,76 @@ try:
 except Exception as e:
     st.error("⚠️ Erro ao conectar com o Google Earth Engine. Verifique seus Secrets.")
 
+
+# =====================================================================
+# FUNÇÕES DO SENTINEL-2 (NBR) - OTIMIZADAS COM A MÁSCARA DO MODIS
+# =====================================================================
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def calcular_stats_nbr(geom_json_str, ano, mes, mascara_modis=None):
+    poly = ee.Geometry(json.loads(geom_json_str)['features'][0]['geometry'])
+    
+    # Datas para o Sentinel (1 mês antes e o mês atual)
+    data_fim = datetime(ano, mes, 28)
+    data_ini = data_fim - timedelta(days=60)
+    
+    def get_nbr(img):
+        return img.normalizedDifference(['B8', 'B12']).rename('nbr')
+
+    s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
+           .filterBounds(poly)\
+           .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    
+    pre_fire = s2.filterDate(data_ini.strftime('%Y-%m-%d'), (data_ini + timedelta(days=30)).strftime('%Y-%m-%d')).median()
+    post_fire = s2.filterDate(data_fim.replace(day=1).strftime('%Y-%m-%d'), data_fim.strftime('%Y-%m-%d')).median()
+    
+    dnbr = get_nbr(pre_fire).subtract(get_nbr(post_fire)).multiply(1000).clip(poly)
+    
+    # === A MÁGICA DA OTIMIZAÇÃO (Corta 90% do processamento) ===
+    if mascara_modis is not None:
+        dnbr = dnbr.updateMask(mascara_modis.gt(0))
+    # ===========================================================
+
+    sld_intervals = (dnbr.gt(-100).add(dnbr.gt(100)).add(dnbr.gt(270)).add(dnbr.gt(440)).add(dnbr.gt(660)))
+    stats = sld_intervals.reduceRegion(ee.Reducer.frequencyHistogram(), poly, 20, maxPixels=1e10).getInfo()
+    
+    classes = {0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa', 3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'}
+    res_stats = {}
+    if 'groups' not in str(stats): 
+        for k, v in stats.get('constant', stats).items():
+            area = (v * 400) / 1e6 # 20m scale
+            res_stats[classes.get(int(float(k)), 'Outros')] = round(area, 2)
+            
+    return res_stats
+
+
+def _construir_dnbr(geom_json_str, ano, mes, mascara_modis=None):
+    poly = ee.Geometry(json.loads(geom_json_str)['features'][0]['geometry'])
+    data_fim = datetime(ano, mes, 28)
+    data_ini = data_fim - timedelta(days=60)
+    
+    def get_nbr(img):
+        return img.normalizedDifference(['B8', 'B12']).rename('nbr')
+
+    s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
+           .filterBounds(poly)\
+           .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    
+    pre_fire = s2.filterDate(data_ini.strftime('%Y-%m-%d'), (data_ini + timedelta(days=30)).strftime('%Y-%m-%d')).median()
+    post_fire = s2.filterDate(data_fim.replace(day=1).strftime('%Y-%m-%d'), data_fim.strftime('%Y-%m-%d')).median()
+    
+    dnbr = get_nbr(pre_fire).subtract(get_nbr(post_fire)).multiply(1000).clip(poly)
+    
+    # === A MÁGICA DA OTIMIZAÇÃO APLICADA À IMAGEM ===
+    if mascara_modis is not None:
+        dnbr = dnbr.updateMask(mascara_modis.gt(0))
+    # ================================================
+        
+    sld_intervals = (dnbr.gt(-100).add(dnbr.gt(100)).add(dnbr.gt(270)).add(dnbr.gt(440)).add(dnbr.gt(660)))
+    
+    return sld_intervals, dnbr
+
+
 def add_ee_layer(self, ee_image_object, vis_params, name, show=True, opacity=1.0):
     try:
         map_id_dict = ee.Image(ee_image_object).getMapId(vis_params)
