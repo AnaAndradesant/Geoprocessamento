@@ -402,44 +402,45 @@ def _construir_dnbr(geom_json_str, ano, mes):
     return ee_geom, dnbr
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def calcular_stats_nbr(geom_json_str, ano, mes):
-    """
-    Calcula e cacheia APENAS o dicionário de stats (serializável por pickle).
-    Uma única chamada getInfo() server-side para todas as 6 classes.
-    """
-    ee_geom, dnbr = _construir_dnbr(geom_json_str, ano, mes)
+@st.cache_data
+def calcular_nbr_sentinel(geom_json, ano, mes, mascara_modis=None):
+    poly = ee.Geometry(json.loads(geom_json)['features'][0]['geometry'])
+    
+    # Datas para o Sentinel (1 mês antes e o mês atual)
+    data_fim = datetime(ano, mes, 28)
+    data_ini = data_fim - timedelta(days=60)
+    
+    def get_nbr(img):
+        return img.normalizedDifference(['B8', 'B12']).rename('nbr')
 
-    severidade = (
-        dnbr
-        .where(dnbr.lt(-0.1), 0)
-        .where(dnbr.gte(-0.1).And(dnbr.lt(0.1)), 1)
-        .where(dnbr.gte(0.1).And(dnbr.lt(0.27)), 2)
-        .where(dnbr.gte(0.27).And(dnbr.lt(0.44)), 3)
-        .where(dnbr.gte(0.44).And(dnbr.lt(0.66)), 4)
-        .where(dnbr.gte(0.66), 5)
-    ).rename('severidade')
+    s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
+           .filterBounds(poly)\
+           .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    
+    pre_fire = s2.filterDate(data_ini.strftime('%Y-%m-%d'), (data_ini + timedelta(days=30)).strftime('%Y-%m-%d')).median()
+    post_fire = s2.filterDate(data_fim.replace(day=1).strftime('%Y-%m-%d'), data_fim.strftime('%Y-%m-%d')).median()
+    
+    dnbr = get_nbr(pre_fire).subtract(get_nbr(post_fire)).multiply(1000).clip(poly)
+    
+    # === A MÁGICA DA OTIMIZAÇÃO ENTRA AQUI ===
+    if mascara_modis is not None:
+        # Faz o Sentinel-2 olhar APENAS para os pixels que o MODIS disse que queimaram
+        dnbr = dnbr.updateMask(mascara_modis.gt(0))
+    # =========================================
 
-    pixel_area = ee.Image.pixelArea().divide(1e6)
-    labels = {0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa',
-              3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'}
-
-    # Empilha todas as classes em uma imagem multibanda → 1 único getInfo()
-    bandas = [
-        pixel_area.updateMask(severidade.eq(cls)).rename(nome)
-        for cls, nome in labels.items()
-    ]
-    img_stack = ee.Image.cat(bandas)
-    resultado = img_stack.reduceRegion(
-        reducer=ee.Reducer.sum(),
-        geometry=ee_geom,
-        scale=100,          # 100m: bom equilíbrio precisão/velocidade
-        maxPixels=1e11,
-        bestEffort=True
-    ).getInfo()
-
-    return {nome: round(resultado.get(nome) or 0, 2) for nome in labels.values()}
-
+    # Classificação
+    sld_intervals = (dnbr.gt(-100).add(dnbr.gt(100)).add(dnbr.gt(270)).add(dnbr.gt(440)).add(dnbr.gt(660)))
+    
+    stats = sld_intervals.reduceRegion(ee.Reducer.frequencyHistogram(), poly, 20, maxPixels=1e10).getInfo()
+    
+    classes = {0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa', 3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'}
+    res_stats = {}
+    if 'groups' not in str(stats): 
+        for k, v in stats.get('constant', stats).items():
+            area = (v * 400) / 1e6 # 20m scale
+            res_stats[classes.get(int(float(k)), 'Outros')] = round(area, 2)
+            
+    return dnbr, sld_intervals, res_stats
 # =============================================================
 # --- INTERFACE (BARRA LATERAL) ---
 # =============================================================
@@ -1333,12 +1334,15 @@ if st.session_state.gerar_dashboard:
                         dnbr_img = None
                         try:
                             # 1) Stats cacheados (pickle-safe — só dict)
+                            # === ADICIONAMOS A img_queimada NO FINAL ===
                             stats_sev = calcular_stats_nbr(
-                                geom_json_str, ano_modis, mes_modis
+                                geom_json_str, ano_modis, mes_modis, img_queimada
                             )
+                            
                             # 2) Imagem GEE reconstruída (lazy, sem cache)
+                            # === ADICIONAMOS A img_queimada NO FINAL ===
                             _, dnbr_img = _construir_dnbr(
-                                geom_json_str, ano_modis, mes_modis
+                                geom_json_str, ano_modis, mes_modis, img_queimada
                             )
                             nbr_ok = True
                         except ValueError as ve:
