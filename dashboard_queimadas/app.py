@@ -10,6 +10,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests, warnings, time, unicodedata, re, json, io
 import ee
+from io import BytesIO
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
@@ -67,18 +68,24 @@ folium.Map.add_ee_layer = add_ee_layer
 # =============================================================
 
 def gerar_excel(df):
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Dados')
-    return buffer.getvalue()
+    # 1. Cria uma cópia para não estragar os dados originais do dashboard
+    df_export = df.copy()
+    
+    # 2. Varre as colunas procurando datas com Fuso Horário e remove o fuso
+    for col in df_export.select_dtypes(include=['datetimetz']).columns:
+        df_export[col] = df_export[col].dt.tz_localize(None)
+        
+    # 3. Varre as colunas procurando listas/dicionários (que o Excel também odeia) e vira texto
+    for col in df_export.select_dtypes(include=['object']).columns:
+        if any(isinstance(x, (list, dict)) for x in df_export[col].dropna()):
+            df_export[col] = df_export[col].astype(str)
 
-def normalizar_texto(txt):
-    if pd.isna(txt):
-        return ""
-    return ''.join(
-        c for c in unicodedata.normalize('NFD', str(txt))
-        if unicodedata.category(c) != 'Mn'
-    ).lower()
+    # 4. Gera o arquivo Excel em memória
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_export.to_excel(writer, index=False, sheet_name='Dados')
+    
+    return output.getvalue()
 
 # =============================================================
 # --- FUNÇÕES COM CACHE ---
