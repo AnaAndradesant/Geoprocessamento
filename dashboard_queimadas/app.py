@@ -1404,15 +1404,15 @@ if st.session_state.gerar_dashboard:
                         dnbr_img = None
                         try:
                             # 1) Stats cacheados (pickle-safe — só dict)
-                            # === ADICIONAMOS A img_queimada NO FINAL ===
+                            # === NOME CORRETO DA VARIÁVEL AQUI ===
                             stats_sev = calcular_stats_nbr(
-                                geom_json_str, ano_modis, mes_modis, img_queimada
+                                geom_json_str, ano_modis, mes_modis, area_queimada_img
                             )
                             
                             # 2) Imagem GEE reconstruída (lazy, sem cache)
-                            # === ADICIONAMOS A img_queimada NO FINAL ===
+                            # === NOME CORRETO DA VARIÁVEL AQUI ===
                             _, dnbr_img = _construir_dnbr(
-                                geom_json_str, ano_modis, mes_modis, img_queimada
+                                geom_json_str, ano_modis, mes_modis, area_queimada_img
                             )
                             nbr_ok = True
                         except ValueError as ve:
