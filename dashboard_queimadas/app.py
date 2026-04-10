@@ -361,7 +361,7 @@ def _construir_dnbr(geom_json_str, ano, mes):
     colecao_base = (
         ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         .filterBounds(ee_geom)
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
         .map(mascara_nuvem)
     )
 
