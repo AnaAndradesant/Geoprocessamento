@@ -127,41 +127,6 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     sld_intervals = (dnbr.gt(-100).add(dnbr.gt(100)).add(dnbr.gt(270)).add(dnbr.gt(440)).add(dnbr.gt(660)))
     
     return sld_intervals, dnbr
-    
-    # === A MÁGICA DA OTIMIZAÇÃO (Agora com o _ na frente) ===
-    if _mascara_modis is not None:
-        dnbr = dnbr.updateMask(_mascara_modis.gt(0))
-    # =========================================================
-        
-    sld_intervals = (dnbr.gt(-100).add(dnbr.gt(100)).add(dnbr.gt(270)).add(dnbr.gt(440)).add(dnbr.gt(660)))
-    
-    return sld_intervals, dnbr
-    # === A MÁGICA DA OTIMIZAÇÃO APLICADA À IMAGEM ===
-    if mascara_modis is not None:
-        dnbr = dnbr.updateMask(mascara_modis.gt(0))
-    # ================================================
-        
-    sld_intervals = (dnbr.gt(-100).add(dnbr.gt(100)).add(dnbr.gt(270)).add(dnbr.gt(440)).add(dnbr.gt(660)))
-    
-    return sld_intervals, dnbr
-
-
-def add_ee_layer(self, ee_image_object, vis_params, name, show=True, opacity=1.0):
-    try:
-        map_id_dict = ee.Image(ee_image_object).getMapId(vis_params)
-        tiles_url = (
-            map_id_dict.get('tile_fetcher', {}).url_format
-            if 'tile_fetcher' in map_id_dict
-            else map_id_dict.get('urlFormat', map_id_dict.get('url_format', ''))
-        )
-        folium.raster_layers.TileLayer(
-            tiles=tiles_url, attr='Map Data © Google Earth Engine', name=name,
-            overlay=True, control=True, show=show, opacity=opacity
-        ).add_to(self)
-    except Exception as e:
-        st.error(f"🚨 Erro crítico ao desenhar a camada: {e}")
-
-folium.Map.add_ee_layer = add_ee_layer
 
 # =============================================================
 # --- FUNÇÕES UTILITÁRIAS ---
