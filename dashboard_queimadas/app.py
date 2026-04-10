@@ -289,75 +289,93 @@ if st.session_state.gerar_dashboard:
     # ... [mantive todo o bloco de processamento que você já tinha]
     # Para não ficar excessivamente longo aqui, assuma que o bloco de processamento (from "with st.status..." até o final do else: dados_indisponiveis) é o mesmo do seu arquivo original.
 
-    # =============================================================
-    # ABA 3 — NBR (FINAL - CORRIGIDA E OTIMIZADA)
-    # =============================================================
-    with aba_nbr:
-        if "INPE" in fonte_escolhida:
-            st.info("💡 A análise de severidade NBR funciona melhor com a fonte **🗺️ Área Queimada (NASA MODIS)**.")
-        else:
-            st.subheader("🔬 Análise de Severidade da Queimada — dNBR (Sentinel-2)")
-            st.caption("Calculando **apenas onde há cicatriz de queimada** (otimizado com máscara MODIS)")
+           # =============================================================
+        # ABA 3 — NBR SENTINEL-2 (VERSÃO FINAL - TOTALMENTE CORRIGIDA)
+        # =============================================================
+        aba_mapa, aba_graficos, aba_nbr, aba_export = st.tabs([
+            "🗺️ Mapa de Focos",
+            "📈 Gráficos & Anomalia",
+            "🔬 Severidade (NBR Sentinel-2)",
+            "⬇️ Exportar Dados"
+        ])
 
-            col_nbr1, col_nbr2 = st.columns([1, 1])
+        with aba_nbr:
+            if "INPE" in fonte_escolhida:
+                st.info("💡 A análise de severidade NBR funciona melhor com a fonte **🗺️ Área Queimada (NASA MODIS)**.")
+            else:
+                st.subheader("🔬 Análise de Severidade da Queimada — dNBR (Sentinel-2)")
+                st.caption("Calculando **apenas onde há cicatriz de queimada** (otimizado)")
 
-            with col_nbr1:
-                calcular_nbr = st.button("🚀 Calcular Severidade dNBR agora", type="primary", use_container_width=True, help="Processa apenas a área queimada (mais rápido)")
+                col_nbr1, col_nbr2 = st.columns([1, 1])
 
-                if calcular_nbr:
-                    with st.spinner("🛰️ Processando imagens Sentinel-2 na área queimada... (15–45s)"):
-                        nbr_ok = False
-                        stats_sev = {}
-                        dnbr_img = None
-                        try:
-                            mask_queimada = None
-                            if 'area_queimada_img' in locals() and area_queimada_img is not None:
-                                mask_queimada = area_queimada_img.gt(0)
+                with col_nbr1:
+                    calcular_nbr = st.button(
+                        "🚀 Calcular Severidade dNBR agora",
+                        type="primary",
+                        use_container_width=True,
+                        help="Processa apenas a área queimada (mais rápido)"
+                    )
 
-                            stats_sev = calcular_stats_nbr(geom_json_str, ano_modis, mes_modis, mask_queimada=mask_queimada)
-                            _, dnbr_img, threshold = _construir_dnbr(geom_json_str, ano_modis, mes_modis, mask_queimada=mask_queimada)
-                            nbr_ok = True
+                    if calcular_nbr:
+                        with st.spinner("🛰️ Processando imagens Sentinel-2 na área queimada... (15–45s)"):
+                            nbr_ok = False
+                            stats_sev = {}
+                            dnbr_img = None
+                            try:
+                                mask_queimada = None
+                                if 'area_queimada_img' in locals() and area_queimada_img is not None:
+                                    mask_queimada = area_queimada_img.gt(0)
 
-                            if threshold > 40:
-                                st.warning(f"⚠️ Usamos imagens com até **{threshold}%** de nuvem (qualidade ligeiramente menor).")
-                        except ValueError as ve:
-                            st.error(str(ve))
-                        except Exception as e:
-                            st.error(f"🚨 Erro ao processar Sentinel-2: {e}")
+                                stats_sev = calcular_stats_nbr(geom_json_str, ano_modis, mes_modis, mask_queimada=mask_queimada)
+                                _, dnbr_img, threshold = _construir_dnbr(geom_json_str, ano_modis, mes_modis, mask_queimada=mask_queimada)
+                                nbr_ok = True
 
-                    if nbr_ok and dnbr_img is not None:
-                        # mapa dNBR
-                        centro_nbr = limite.geometry.union_all().centroid
-                        m_nbr = folium.Map(location=[centro_nbr.y, centro_nbr.x], zoom_start=9 if tipo_analise == "Por Município" else 7, tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google')
-                        folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'color': '#00d4ff', 'weight': 2.5, 'fillOpacity': 0}).add_to(m_nbr)
-                        vis_dnbr = {'min': -0.5, 'max': 1.3, 'palette': ['#1a9850', '#91cf60', '#d9ef8b', '#ffffbf', '#fee08b', '#fc8d59', '#d73027', '#7a0403']}
-                        m_nbr.add_ee_layer(dnbr_img, vis_dnbr, 'dNBR Severidade', opacity=0.85)
-                        # legenda e layer control (igual ao anterior)
-                        legenda_html = """<div style="position:fixed; bottom:30px; right:15px; z-index:9999; background:rgba(20,20,20,0.9); padding:12px 16px; border-radius:10px; font-size:12.5px; color:white; line-height:1.9;"><b>Severidade dNBR (USGS)</b><br><span style="color:#1a9850;">■</span> Regeneração / Recuperação<br><span style="color:#91cf60;">■</span> Não afetado<br><span style="color:#fee08b;">■</span> Baixa severidade<br><span style="color:#fc8d59;">■</span> Moderada<br><span style="color:#d73027;">■</span> Moderada-Alta<br><span style="color:#7a0403;">■</span> Alta severidade</div>"""
-                        m_nbr.get_root().html.add_child(folium.Element(legenda_html))
-                        folium.LayerControl().add_to(m_nbr)
-                        st_folium(m_nbr, width=None, height=650, key=f"nbr_map_{val_sel}_{ano_modis}_{mes_modis}")
+                                if threshold > 40:
+                                    st.warning(f"⚠️ Usamos imagens com até **{threshold}%** de nuvem.")
+                            except ValueError as ve:
+                                st.error(str(ve))
+                            except Exception as e:
+                                st.error(f"🚨 Erro ao processar Sentinel-2: {e}")
 
-            with col_nbr2:
-                if 'nbr_ok' in locals() and nbr_ok and stats_sev:
-                    # gráficos de severidade (igual ao anterior)
-                    df_sev = pd.DataFrame(list(stats_sev.items()), columns=['Classe', 'Área (km²)'])
-                    df_sev = df_sev[df_sev['Área (km²)'] > 0].sort_values('Área (km²)', ascending=False)
-                    cores_sev = {'Regeneração': '#1a9850', 'Não afetado': '#91cf60', 'Baixa': '#fee08b', 'Moderada': '#fc8d59', 'Moderada-Alta': '#d73027', 'Alta': '#7a0403'}
-                    fig_pizza = px.pie(df_sev, values='Área (km²)', names='Classe', color='Classe', color_discrete_map=cores_sev, hole=0.45)
-                    fig_pizza.update_layout(template='plotly_dark', height=280)
-                    st.plotly_chart(fig_pizza, use_container_width=True)
-                    fig_bar_sev = px.bar(df_sev, x='Área (km²)', y='Classe', orientation='h', color='Classe', color_discrete_map=cores_sev, text='Área (km²)')
-                    fig_bar_sev.update_layout(template='plotly_dark', showlegend=False, yaxis={'categoryorder': 'total ascending'}, height=260)
-                    st.plotly_chart(fig_bar_sev, use_container_width=True)
-                    area_alta = stats_sev.get('Alta', 0) + stats_sev.get('Moderada-Alta', 0)
-                    area_total_afetada = sum(v for k, v in stats_sev.items() if k not in ['Não afetado', 'Regeneração'])
-                    col_m1, col_m2 = st.columns(2)
-                    with col_m1: st.metric("🔴 Alta Severidade", f"{area_alta:.2f} km²")
-                    with col_m2: st.metric("🔥 Total Afetado", f"{area_total_afetada:.2f} km²")
-                else:
-                    st.info("👆 Clique no botão azul à esquerda para gerar a análise de severidade.")
+                        if nbr_ok and dnbr_img is not None:
+                            centro_nbr = limite.geometry.union_all().centroid
+                            m_nbr = folium.Map(
+                                location=[centro_nbr.y, centro_nbr.x],
+                                zoom_start=9 if tipo_analise == "Por Município" else 7,
+                                tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
+                                attr='Google'
+                            )
+                            folium.GeoJson(limite.__geo_interface__, style_function=lambda x: {'color': '#00d4ff', 'weight': 2.5, 'fillOpacity': 0}).add_to(m_nbr)
+                            vis_dnbr = {'min': -0.5, 'max': 1.3, 'palette': ['#1a9850','#91cf60','#d9ef8b','#ffffbf','#fee08b','#fc8d59','#d73027','#7a0403']}
+                            m_nbr.add_ee_layer(dnbr_img, vis_dnbr, 'dNBR Severidade', opacity=0.85)
 
+                            legenda_html = """<div style="position:fixed; bottom:30px; right:15px; z-index:9999; background:rgba(20,20,20,0.9); padding:12px 16px; border-radius:10px; font-size:12.5px; color:white; line-height:1.9;"><b>Severidade dNBR (USGS)</b><br><span style="color:#1a9850;">■</span> Regeneração<br><span style="color:#91cf60;">■</span> Não afetado<br><span style="color:#fee08b;">■</span> Baixa<br><span style="color:#fc8d59;">■</span> Moderada<br><span style="color:#d73027;">■</span> Moderada-Alta<br><span style="color:#7a0403;">■</span> Alta</div>"""
+                            m_nbr.get_root().html.add_child(folium.Element(legenda_html))
+                            folium.LayerControl().add_to(m_nbr)
+
+                            st_folium(m_nbr, width=None, height=650, key=f"nbr_map_{val_sel}_{ano_modis}_{mes_modis}")
+
+                with col_nbr2:
+                    if 'nbr_ok' in locals() and nbr_ok and stats_sev:
+                        st.markdown("### 📊 Distribuição de Severidade")
+                        df_sev = pd.DataFrame(list(stats_sev.items()), columns=['Classe', 'Área (km²)'])
+                        df_sev = df_sev[df_sev['Área (km²)'] > 0].sort_values('Área (km²)', ascending=False)
+                        cores_sev = {'Regeneração':'#1a9850','Não afetado':'#91cf60','Baixa':'#fee08b','Moderada':'#fc8d59','Moderada-Alta':'#d73027','Alta':'#7a0403'}
+                        fig_pizza = px.pie(df_sev, values='Área (km²)', names='Classe', color='Classe', color_discrete_map=cores_sev, hole=0.45)
+                        fig_pizza.update_layout(template='plotly_dark', height=280)
+                        st.plotly_chart(fig_pizza, use_container_width=True)
+
+                        fig_bar_sev = px.bar(df_sev, x='Área (km²)', y='Classe', orientation='h', color='Classe', color_discrete_map=cores_sev, text='Área (km²)')
+                        fig_bar_sev.update_layout(template='plotly_dark', showlegend=False, yaxis={'categoryorder': 'total ascending'}, height=260)
+                        st.plotly_chart(fig_bar_sev, use_container_width=True)
+
+                        area_alta = stats_sev.get('Alta', 0) + stats_sev.get('Moderada-Alta', 0)
+                        area_total_afetada = sum(v for k, v in stats_sev.items() if k not in ['Não afetado', 'Regeneração'])
+                        col_m1, col_m2 = st.columns(2)
+                        with col_m1: st.metric("🔴 Alta Severidade", f"{area_alta:.2f} km²")
+                        with col_m2: st.metric("🔥 Total Afetado", f"{area_total_afetada:.2f} km²")
+                    else:
+                        st.info("👆 Clique no botão azul à esquerda para gerar a análise de severidade.")
     # As outras abas (Mapa, Gráficos, Exportar) permanecem iguais ao seu código original
     # (não alterei nada nelas)
 
