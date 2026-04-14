@@ -30,9 +30,6 @@ def add_ee_layer(self, ee_image_object, vis_params, name, opacity=1):
 # Adiciona o método à classe folium.Map para que ele possa ser chamado como m.add_ee_layer
 folium.Map.add_ee_layer = add_ee_layer
 
-
-
-
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
     page_title="Monitor de Queimadas Brasil",
