@@ -1489,16 +1489,13 @@ if st.session_state.gerar_dashboard:
                         st_folium(m_nbr, width=None, height=620, returned_objects=[], key=_nbr_key)
 
                 with col_nbr2:
-                    if stats_sev:
-                        st.markdown("### 📊 Distribuição de Severidade")
-
-                        df_sev = pd.DataFrame(
-                            list(stats_sev.items()),
-                            columns=['Classe', 'Área (km²)']
-                        )
-                        df_sev = df_sev[df_sev['Área (km²)'] > 0].sort_values(
-                            'Área (km²)', ascending=False
-                        )
+                   # NBR Severidade
+                if stats_sev:  
+                    st.markdown("---")
+                    st.markdown("**Distribuição de Severidade NBR (Sentinel-2):**")
+                    df_sev_exp = pd.DataFrame(
+                        list(stats_sev.items()), columns=['Classe', 'Área (km²)']
+                    )
 
                         cores_sev = {
                             'Regeneração':   '#1a9850',
