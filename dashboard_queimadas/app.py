@@ -1688,7 +1688,7 @@ if st.session_state.gerar_dashboard:
                         pass
 
                 # NBR Severidade
-                if stats_sev if 'stats_sev' in dir() else False:
+                if stats_sev:  # <-- DEIXE ASSIM, SIMPLES
                     st.markdown("---")
                     st.markdown("**Distribuição de Severidade NBR (Sentinel-2):**")
                     df_sev_exp = pd.DataFrame(
