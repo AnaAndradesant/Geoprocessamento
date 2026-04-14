@@ -12,6 +12,27 @@ import requests, warnings, time, unicodedata, re, json, io, calendar
 import ee
 from io import BytesIO
 
+# Define o método para adicionar a camada do Earth Engine ao Folium
+def add_ee_layer(self, ee_image_object, vis_params, name, opacity=1):
+    # Gera as informações do tile a partir da imagem do EE
+    map_id_dict = ee.Image(ee_image_object).getMapId(vis_params)
+    
+    # Cria uma camada de mapa com os tiles obtidos do EE
+    folium.raster_layers.TileLayer(
+        tiles=map_id_dict['tile_fetcher'].url_format,
+        attr='Map Data &copy; <a href="https://earthengine.google.com/">Google Earth Engine</a>',
+        name=name,
+        overlay=True,
+        control=True,
+        opacity=opacity
+    ).add_to(self)
+
+# Adiciona o método à classe folium.Map para que ele possa ser chamado como m.add_ee_layer
+folium.Map.add_ee_layer = add_ee_layer
+
+
+
+
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
     page_title="Monitor de Queimadas Brasil",
