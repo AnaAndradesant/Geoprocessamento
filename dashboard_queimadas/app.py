@@ -430,7 +430,7 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
 
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
-def _construir_dnbr(geom_json_str, ano, mes):
+def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     """
     Constrói a imagem dNBR no GEE (lazy — sem chamadas de rede).
     Levanta ValueError se não houver imagens disponíveis.
@@ -1507,7 +1507,7 @@ if st.session_state.gerar_dashboard:
 
                         # Gráfico de pizza
                         fig_pizza = px.pie(
-                            df_sev, values='Área (km²)', names='Classe',
+                            df_sev_exp, values='Área (km²)', names='Classe',
                             color='Classe', color_discrete_map=cores_sev, hole=0.45
                         )
                         fig_pizza.update_layout(
