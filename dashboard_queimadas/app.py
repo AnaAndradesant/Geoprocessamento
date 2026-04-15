@@ -95,10 +95,9 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
 
 
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
-    """Versão simples e estável usando L1C (funciona melhor em Corumbá)"""
+    """Versão corrigida - mensagem genérica + maior tolerância"""
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     
-    # Período bem amplo
     data_ref = ee.Date.fromYMD(ano, mes, 15)
     pre_ini = data_ref.advance(-6, 'month')
     pre_fim = data_ref.advance(-0.1, 'month')
@@ -106,15 +105,14 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     pos_fim = data_ref.advance(5, 'month')
 
     def mask_l1c(img):
-        # Máscara simples e confiável para L1C
         cirrus = img.select('B10').divide(10000).lt(0.015)
-        blue = img.select('B2').divide(10000).lt(0.20)
+        blue = img.select('B2').divide(10000).lt(0.22)
         mask = cirrus.And(blue)
         return img.updateMask(mask).divide(10000)
 
-    colecao = (ee.ImageCollection('COPERNICUS/S2')          # L1C
+    colecao = (ee.ImageCollection('COPERNICUS/S2')
                .filterBounds(ee_geom)
-               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 95))
+               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 97))   # quase sem filtro
                .map(mask_l1c))
 
     col_pre = colecao.filterDate(pre_ini, pre_fim)
@@ -124,12 +122,11 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     n_pos = col_pos.size().getInfo()
 
     if n_pre < 1 or n_pos < 1:
-        raise ValueError(f"Ainda sem imagens suficientes.\n"
+        raise ValueError(f"Ainda sem imagens Sentinel-2 suficientes.\n"
                          f"Pré: {n_pre} | Pós: {n_pos}\n\n"
-                         "Corumbá é muito grande. Tente Agosto ou Setembro 2022, "
-                         "ou um município menor (ex: Ladário ou Miranda).")
+                         f"Região: {val_sel} | Mês {mes}/{ano}\n"
+                         "Tente **Agosto ou Setembro** do mesmo ano (melhor cobertura).")
 
-    # Redutor para recuperar o máximo possível
     img_pre = col_pre.reduce(ee.Reducer.percentile([5])).select(['B8_p5', 'B12_p5']).rename(['B8', 'B12'])
     img_pos = col_pos.reduce(ee.Reducer.percentile([5])).select(['B8_p5', 'B12_p5']).rename(['B8', 'B12'])
 
