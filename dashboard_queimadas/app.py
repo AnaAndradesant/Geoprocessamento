@@ -95,7 +95,7 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
 
 
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
-    """Versão corrigida - mensagem genérica + maior tolerância"""
+    """Versão mínima e mais estável possível (só L1C)"""
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     
     data_ref = ee.Date.fromYMD(ano, mes, 15)
@@ -104,16 +104,9 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     pos_ini = data_ref.advance(-0.5, 'month')
     pos_fim = data_ref.advance(5, 'month')
 
-    def mask_l1c(img):
-        cirrus = img.select('B10').divide(10000).lt(0.015)
-        blue = img.select('B2').divide(10000).lt(0.22)
-        mask = cirrus.And(blue)
-        return img.updateMask(mask).divide(10000)
-
-    colecao = (ee.ImageCollection('COPERNICUS/S2')
+    colecao = (ee.ImageCollection('COPERNICUS/S2')   # L1C - mais imagens disponíveis
                .filterBounds(ee_geom)
-               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 97))   # quase sem filtro
-               .map(mask_l1c))
+               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 98)))
 
     col_pre = colecao.filterDate(pre_ini, pre_fim)
     col_pos = colecao.filterDate(pos_ini, pos_fim)
@@ -122,13 +115,13 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     n_pos = col_pos.size().getInfo()
 
     if n_pre < 1 or n_pos < 1:
-        raise ValueError(f"Ainda sem imagens Sentinel-2 suficientes.\n"
+        raise ValueError(f"Sem imagens disponíveis.\n"
                          f"Pré: {n_pre} | Pós: {n_pos}\n\n"
-                         f"Região: {val_sel} | Mês {mes}/{ano}\n"
-                         "Tente **Agosto ou Setembro** do mesmo ano (melhor cobertura).")
+                         f"Testado: {val_sel} - {mes}/{ano}\n"
+                         "Tente um município **menor** ou mude para Agosto/Setembro.")
 
-    img_pre = col_pre.reduce(ee.Reducer.percentile([5])).select(['B8_p5', 'B12_p5']).rename(['B8', 'B12'])
-    img_pos = col_pos.reduce(ee.Reducer.percentile([5])).select(['B8_p5', 'B12_p5']).rename(['B8', 'B12'])
+    img_pre = col_pre.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
+    img_pos = col_pos.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
 
     nbr_pre = img_pre.normalizedDifference(['B8', 'B12']).rename('NBR_pre')
     nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
