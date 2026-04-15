@@ -1454,49 +1454,66 @@ if st.session_state.gerar_dashboard:
                                 "Tente uma região menor (Por Município) ou um mês diferente."
                             )
 
-                    if nbr_ok and dnbr_img is not None:
-                        centro_nbr = limite.geometry.union_all().centroid
-                        m_nbr = folium.Map(
-                            location=[centro_nbr.y, centro_nbr.x],
-                            zoom_start=8,
-                            tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-                            attr='Google'
-                        )
-                        folium.GeoJson(
-                            limite.__geo_interface__,
-                            style_function=lambda x: {
-                                'fillColor': 'transparent',
-                                'color': '#00d4ff', 'weight': 2
+                   if nbr_ok and dnbr_img is not None:
+                        try:
+                            # 1. Correção do centro do mapa (usando unary_union que é universal)
+                            centro_nbr = limite.geometry.unary_union.centroid
+                            m_nbr = folium.Map(
+                                location=[centro_nbr.y, centro_nbr.x],
+                                zoom_start=8,
+                                tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
+                                attr='Google'
+                            )
+                            
+                            # 2. Contorno do Município/Estado
+                            folium.GeoJson(
+                                limite.__geo_interface__,
+                                style_function=lambda x: {
+                                    'fillColor': 'transparent',
+                                    'color': '#00d4ff', 'weight': 2
+                                }
+                            ).add_to(m_nbr)
+                            
+                            # 3. Parâmetros de Cor do dNBR
+                            vis_dnbr = {
+                                'min': -0.5, 'max': 1.3,
+                                'palette': [
+                                    '#1a9850', '#91cf60', '#d9ef8b', '#ffffbf',
+                                    '#fee08b', '#fc8d59', '#d73027', '#7a0403'
+                                ]
                             }
-                        ).add_to(m_nbr)
-                        vis_dnbr = {
-                            'min': -0.5, 'max': 1.3,
-                            'palette': [
-                                '#1a9850', '#91cf60', '#d9ef8b', '#ffffbf',
-                                '#fee08b', '#fc8d59', '#d73027', '#7a0403'
-                            ]
-                        }
-                        m_nbr.add_ee_layer(
-                            dnbr_img, vis_dnbr,
-                            'dNBR (severidade contínua)', opacity=0.85
-                        )
-                        legenda_html = """
-                        <div style="position:fixed; bottom:28px; right:10px; z-index:9999;
-                                    background:rgba(20,20,20,0.88); padding:12px 16px;
-                                    border-radius:10px; font-size:12px; color:white; line-height:2;
-                                    border:1px solid rgba(255,255,255,0.1);">
-                            <b style="font-size:13px;">Severidade dNBR</b><br>
-                            <span style="color:#1a9850;">■</span> Regeneração (dNBR &lt; -0.1)<br>
-                            <span style="color:#91cf60;">■</span> Não afetado (-0.1 a 0.1)<br>
-                            <span style="color:#fee08b;">■</span> Baixa (0.1 a 0.27)<br>
-                            <span style="color:#fc8d59;">■</span> Moderada (0.27 a 0.44)<br>
-                            <span style="color:#d73027;">■</span> Moderada-Alta (0.44 a 0.66)<br>
-                            <span style="color:#7a0403;">■</span> Alta (&gt; 0.66)
-                        </div>"""
-                        m_nbr.get_root().html.add_child(folium.Element(legenda_html))
-                        folium.LayerControl().add_to(m_nbr)
-                        _nbr_key = f"nbr_{val_sel}_{ano_modis}_{mes_modis}"
-                        st_folium(m_nbr, width=None, height=620, returned_objects=[], key=_nbr_key)
+                            
+                            # 4. Adicionando a camada do Satélite
+                            m_nbr.add_ee_layer(
+                                dnbr_img, vis_dnbr,
+                                'dNBR (severidade contínua)', opacity=0.85
+                            )
+                            
+                            # 5. Legenda em HTML
+                            legenda_html = """
+                            <div style="position:fixed; bottom:28px; right:10px; z-index:9999;
+                                        background:rgba(20,20,20,0.88); padding:12px 16px;
+                                        border-radius:10px; font-size:12px; color:white; line-height:2;
+                                        border:1px solid rgba(255,255,255,0.1);">
+                                <b style="font-size:13px;">Severidade dNBR</b><br>
+                                <span style="color:#1a9850;">■</span> Regeneração (dNBR &lt; -0.1)<br>
+                                <span style="color:#91cf60;">■</span> Não afetado (-0.1 a 0.1)<br>
+                                <span style="color:#fee08b;">■</span> Baixa (0.1 a 0.27)<br>
+                                <span style="color:#fc8d59;">■</span> Moderada (0.27 a 0.44)<br>
+                                <span style="color:#d73027;">■</span> Moderada-Alta (0.44 a 0.66)<br>
+                                <span style="color:#7a0403;">■</span> Alta (&gt; 0.66)
+                            </div>"""
+                            m_nbr.get_root().html.add_child(folium.Element(legenda_html))
+                            
+                            folium.LayerControl().add_to(m_nbr)
+                            
+                            # 6. Renderizando no Streamlit
+                            _nbr_key = f"nbr_{val_sel}_{ano_modis}_{mes_modis}"
+                            st_folium(m_nbr, width=None, height=620, returned_objects=[], key=_nbr_key)
+                            
+                        except Exception as erro_mapa:
+                            # Se o mapa quebrar agora, ele vai nos avisar exatamente o porquê!
+                            st.error(f"⚠️ Os dados foram calculados, mas ocorreu um erro ao desenhar o mapa Folium: {erro_mapa}")
 
                 with col_nbr2:
                     if stats_sev:       
