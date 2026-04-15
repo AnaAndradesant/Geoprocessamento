@@ -469,8 +469,6 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     if n_pre == 0 and n_pos == 0:
         raise ValueError(
             "Nenhuma imagem Sentinel-2 sem nuvens encontrada para esta região no período. "
-            "Isso ocorre quando a cobertura de nuvens supera 20% em todos os dias. "
-            "Tente outro mês ou uma região menor."
         )
     if n_pre == 0:
         raise ValueError(
@@ -506,7 +504,7 @@ def calcular_nbr_sentinel(geom_json, ano, mes, mascara_modis=None):
 
     s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
            .filterBounds(poly)\
-           .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
+           .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
     
     pre_fire = s2.filterDate(data_ini.strftime('%Y-%m-%d'), (data_ini + timedelta(days=30)).strftime('%Y-%m-%d')).median()
     post_fire = s2.filterDate(data_fim.replace(day=1).strftime('%Y-%m-%d'), data_fim.strftime('%Y-%m-%d')).median()
@@ -1418,7 +1416,7 @@ if st.session_state.gerar_dashboard:
 
                 with col_nbr1:
                     with st.spinner(
-                        "🛰️ Processando imagens Sentinel-2... (~30s na 1ª vez)"
+                        "🛰️ Processando imagens Sentinel-2..."
                     ):
                         nbr_ok = False
                         stats_sev = {}
