@@ -1453,8 +1453,7 @@ if st.session_state.gerar_dashboard:
                                 f"⚠️ Erro inesperado ao processar Sentinel-2: {e}\n\n"
                                 "Tente uma região menor (Por Município) ou um mês diferente."
                             )
-
-                   if nbr_ok and dnbr_img is not None:
+                    if nbr_ok and dnbr_img is not None:
                         try:
                             # 1. Correção do centro do mapa (usando unary_union que é universal)
                             centro_nbr = limite.geometry.unary_union.centroid
