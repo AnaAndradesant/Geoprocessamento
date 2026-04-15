@@ -95,7 +95,7 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
 
 
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
-    """Versão FINAL e corrigida - funciona com L2A e L1C"""
+    """Versão com s2cloudless - a mais eficaz para áreas nubladas do Brasil"""
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     
     data_ref = ee.Date.fromYMD(ano, mes, 15)
@@ -104,57 +104,43 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     pos_ini = data_ref.advance(-0.5, 'month')
     pos_fim = data_ref.advance(5, 'month')
 
-    # ====================== MÁSCARA PARA L2A ======================
-    def mask_l2a(img):
-        qa = img.select('QA60')
-        cloud = qa.bitwiseAnd(1 << 10).eq(0)
-        cirrus = qa.bitwiseAnd(1 << 11).eq(0)
-        blue = img.select('B2').divide(10000)
-        mask = cloud.And(cirrus).And(blue.lt(0.18))
+    # Coleção de nuvem (s2cloudless)
+    s2_clouds = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
+
+    # Base de imagens (L2A quando possível)
+    s2 = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+          .filterBounds(ee_geom)
+          .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 90)))
+
+    # Join com probabilidade de nuvem
+    def add_cloud_probability(img):
+        cloud_img = ee.Image(s2_clouds.filter(ee.Filter.eq('system:index', img.get('system:index'))).first())
+        return img.addBands(cloud_img.select('probability').rename('cloud_probability'))
+
+    s2_with_cloud = s2.map(add_cloud_probability)
+
+    # Máscara final
+    def mask_s2cloudless(img):
+        cloud_prob = img.select('cloud_probability')
+        mask = cloud_prob.lt(30)  # < 30% de probabilidade de nuvem
         return img.updateMask(mask).divide(10000)
 
-    # ====================== MÁSCARA PARA L1C ======================
-    def mask_l1c(img):
-        # L1C não tem QA60, então usamos máscara simples baseada em B10 (cirrus) e threshold
-        cirrus = img.select('B10').divide(10000).lt(0.015)   # cirrus baixo = limpo
-        blue = img.select('B2').divide(10000).lt(0.20)
-        mask = cirrus.And(blue)
-        return img.updateMask(mask).divide(10000)
+    colecao = s2_with_cloud.map(mask_s2cloudless)
 
-    # ====================== TENTA PRIMEIRO L2A ======================
-    colecao_l2a = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-                   .filterBounds(ee_geom)
-                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 95))
-                   .map(mask_l2a))
-
-    col_pre = colecao_l2a.filterDate(pre_ini, pre_fim)
-    col_pos = colecao_l2a.filterDate(pos_ini, pos_fim)
+    col_pre = colecao.filterDate(pre_ini, pre_fim)
+    col_pos = colecao.filterDate(pos_ini, pos_fim)
 
     n_pre = col_pre.size().getInfo()
     n_pos = col_pos.size().getInfo()
 
-    # Se L2A falhar, tenta L1C
-    if n_pre == 0 or n_pos == 0:
-        st.warning("⚠️ L2A sem imagens → tentando L1C (Top of Atmosphere)")
-        colecao_l1c = (ee.ImageCollection('COPERNICUS/S2')
-                       .filterBounds(ee_geom)
-                       .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 95))
-                       .map(mask_l1c))
-
-        col_pre = colecao_l1c.filterDate(pre_ini, pre_fim)
-        col_pos = colecao_l1c.filterDate(pos_ini, pos_fim)
-        n_pre = col_pre.size().getInfo()
-        n_pos = col_pos.size().getInfo()
-
     if n_pre < 1 or n_pos < 1:
-        raise ValueError(f"Ainda sem imagens suficientes.\n"
+        raise ValueError(f"Ainda sem imagens suficientes mesmo com s2cloudless.\n"
                          f"Pré: {n_pre} | Pós: {n_pos}\n\n"
-                         f"Região testada: Corumbá-MS / Julho-2022\n"
-                         "Tente Agosto ou Setembro de 2022 (melhor chance).")
+                         "Corumbá é muito grande. Tente um município menor ou mude para Agosto/Setembro 2022.")
 
-    # Usa percentile baixo para recuperar o máximo possível
-    img_pre = col_pre.reduce(ee.Reducer.percentile([5])).select(['B8_p5', 'B12_p5']).rename(['B8', 'B12'])
-    img_pos = col_pos.reduce(ee.Reducer.percentile([5])).select(['B8_p5', 'B12_p5']).rename(['B8', 'B12'])
+    # Redutor robusto
+    img_pre = col_pre.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
+    img_pos = col_pos.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
 
     nbr_pre = img_pre.normalizedDifference(['B8', 'B12']).rename('NBR_pre')
     nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
