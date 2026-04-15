@@ -95,32 +95,33 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
 
 
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
-    """Versão robusta do dNBR com melhor máscara de nuvens"""
+    """Versão ULTRA TOLERANTE do dNBR - para regiões muito nubladas do Brasil"""
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     
-    # Período ampliado
+    # Período ainda mais amplo
     data_ref = ee.Date.fromYMD(ano, mes, 15)
-    pre_ini = data_ref.advance(-4, 'month')
-    pre_fim = data_ref.advance(-0.5, 'month')
-    pos_ini = data_ref.advance(0, 'month')
-    pos_fim = data_ref.advance(3, 'month')
+    pre_ini = data_ref.advance(-5, 'month')   # 5 meses antes
+    pre_fim = data_ref.advance(-0.2, 'month')
+    pos_ini = data_ref.advance(-0.5, 'month')
+    pos_fim = data_ref.advance(4, 'month')    # 4 meses depois
 
-    def mask_s2_better(img):
+    def mask_s2_ultra_tolerant(img):
+        """Máscara mínima - quase só remove nuvens grossas"""
         qa = img.select('QA60')
         cloud = qa.bitwiseAnd(1 << 10).eq(0)
         cirrus = qa.bitwiseAnd(1 << 11).eq(0)
         
+        # Máscara muito leve contra sombras/nuvens finas
         blue = img.select('B2').divide(10000)
-        swir = img.select('B12').divide(10000)
-        shadow_mask = blue.gt(0.12).Or(swir.lt(0.06))
+        shadow_mask = blue.gt(0.15)   # threshold mais alto
         
         mask = cloud.And(cirrus).And(shadow_mask.Not())
         return img.updateMask(mask).divide(10000)
 
     colecao = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                .filterBounds(ee_geom)
-               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 85))
-               .map(mask_s2_better))
+               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 92))  # quase sem filtro
+               .map(mask_s2_ultra_tolerant))
 
     col_pre = colecao.filterDate(pre_ini, pre_fim)
     col_pos = colecao.filterDate(pos_ini, pos_fim)
@@ -129,12 +130,14 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     n_pos = col_pos.size().getInfo()
 
     if n_pre < 1 or n_pos < 1:
-        raise ValueError(f"Imagens insuficientes para calcular dNBR.\n"
-                         f"Pré-fogo: {n_pre} | Pós-fogo: {n_pos}\n"
-                         "Tente um mês da estação seca ou use 'Por Município'.")
+        raise ValueError(f"Ainda sem imagens suficientes.\n"
+                         f"Pré: {n_pre} | Pós: {n_pos}\n\n"
+                         "Isso geralmente acontece em meses chuvosos ou regiões com cobertura de nuvens muito alta.\n"
+                         "Tente os meses de **Junho a Setembro** (estação seca).")
 
-    img_pre = col_pre.reduce(ee.Reducer.percentile([20])).select(['B8_p20', 'B12_p20']).rename(['B8', 'B12'])
-    img_pos = col_pos.reduce(ee.Reducer.percentile([20])).select(['B8_p20', 'B12_p20']).rename(['B8', 'B12'])
+    # Usa percentile ainda mais baixo para tentar recuperar algo
+    img_pre = col_pre.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
+    img_pos = col_pos.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
 
     nbr_pre = img_pre.normalizedDifference(['B8', 'B12']).rename('NBR_pre')
     nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
