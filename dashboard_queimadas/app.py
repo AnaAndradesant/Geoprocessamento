@@ -126,53 +126,37 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
 
 
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
-    """Versão estável para grandes municípios do Pantanal (Miranda, Corumbá, etc.)"""
-    ee_geom = ee.Geometry(json.loads(geom_json_str))
+    # === CORREÇÃO: LEITURA INTELIGENTE DE GEOJSON ===
+    geom_dict = json.loads(geom_json_str)
+    if 'features' in geom_dict:
+        poly = ee.Geometry(geom_dict['features'][0]['geometry'])
+    else:
+        poly = ee.Geometry(geom_dict)
+    # ================================================
+
+    data_fim = datetime(ano, mes, 28)
+    data_ini = data_fim - timedelta(days=60)
     
-    data_ref = ee.Date.fromYMD(ano, mes, 15)
-    pre_ini = data_ref.advance(-6, 'month')
-    pre_fim = data_ref.advance(-0.1, 'month')
-    pos_ini = data_ref.advance(-0.5, 'month')
-    pos_fim = data_ref.advance(5, 'month')
+    def get_nbr(img):
+        return img.normalizedDifference(['B8', 'B12']).rename('nbr')
 
-    # Usando L1C (mais imagens disponíveis) + seleção explícita de bandas
-    colecao = (ee.ImageCollection('COPERNICUS/S2')
-               .filterBounds(ee_geom)
-               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 98))
-               .select(['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B9','B10','B11','B12']))
-
-    def mask_l1c(img):
-        cirrus = img.select('B10').divide(10000).lt(0.02)
-        blue = img.select('B2').divide(10000).lt(0.22)
-        mask = cirrus.And(blue)
-        return img.updateMask(mask).divide(10000)
-
-    colecao = colecao.map(mask_l1c)
-
-    col_pre = colecao.filterDate(pre_ini, pre_fim)
-    col_pos = colecao.filterDate(pos_ini, pos_fim)
-
-    n_pre = col_pre.size().getInfo()
-    n_pos = col_pos.size().getInfo()
-
-    if n_pre < 1 or n_pos < 1:
-        raise ValueError(f"Sem imagens Sentinel-2 disponíveis para esta região.\n"
-                         f"Pré: {n_pre} | Pós: {n_pos}\n\n"
-                         "Tente Agosto ou Setembro do mesmo ano.")
-
-    # Redutor
-    img_pre = col_pre.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
-    img_pos = col_pos.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
-
-    nbr_pre = img_pre.normalizedDifference(['B8', 'B12']).rename('NBR_pre')
-    nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
+    s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
+           .filterBounds(poly)\
+           .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
     
-    dnbr = nbr_pre.subtract(nbr_pos).rename('dNBR').clip(ee_geom).multiply(1000)
-
+    pre_fire = s2.filterDate(data_ini.strftime('%Y-%m-%d'), (data_ini + timedelta(days=30)).strftime('%Y-%m-%d')).median()
+    post_fire = s2.filterDate(data_fim.replace(day=1).strftime('%Y-%m-%d'), data_fim.strftime('%Y-%m-%d')).median()
+    
+    dnbr = get_nbr(pre_fire).subtract(get_nbr(post_fire)).multiply(1000).clip(poly)
+    
+    # === A MÁGICA DA OTIMIZAÇÃO (Agora com o _ na frente) ===
     if _mascara_modis is not None:
         dnbr = dnbr.updateMask(_mascara_modis.gt(0))
-
-    return ee_geom, dnbr
+    # =========================================================
+        
+    sld_intervals = (dnbr.gt(-100).add(dnbr.gt(100)).add(dnbr.gt(270)).add(dnbr.gt(440)).add(dnbr.gt(660)))
+    
+    return sld_intervals, dnbr
 
 # =============================================================
 # --- FUNÇÕES UTILITÁRIAS ---
