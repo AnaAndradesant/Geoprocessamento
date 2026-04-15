@@ -1427,21 +1427,17 @@ if st.session_state.gerar_dashboard:
                 col_nbr1, col_nbr2 = st.columns([1.4, 1])
 
                 with col_nbr1:
-                    with st.spinner(
-                        "🛰️ Processando imagens Sentinel-2..."
-                    ):
+                    with st.spinner("🛰️ Processando imagens Sentinel-2..."):
                         nbr_ok = False
                         stats_sev = {}
                         dnbr_img = None
                         try:
-                            # 1) Stats cacheados (pickle-safe — só dict)
-                            # === NOME CORRETO DA VARIÁVEL AQUI ===
+                            # 1) Stats cacheados
                             stats_sev = calcular_stats_nbr(
                                 geom_json_str, ano_modis, mes_modis, area_queimada_img
                             )
                             
-                            # 2) Imagem GEE reconstruída (lazy, sem cache)
-                            # === NOME CORRETO DA VARIÁVEL AQUI ===
+                            # 2) Imagem GEE reconstruída
                             _, dnbr_img = _construir_dnbr(
                                 geom_json_str, ano_modis, mes_modis, area_queimada_img
                             )
@@ -1449,13 +1445,10 @@ if st.session_state.gerar_dashboard:
                         except ValueError as ve:
                             st.warning(f"⚠️ {ve}")
                         except Exception as e:
-                            st.error(
-                                f"⚠️ Erro inesperado ao processar Sentinel-2: {e}\n\n"
-                                "Tente uma região menor (Por Município) ou um mês diferente."
-                            )
+                            st.error(f"⚠️ Erro inesperado ao processar Sentinel-2: {e}\n\nTente uma região menor ou um mês diferente.")
+
                     if nbr_ok and dnbr_img is not None:
                         try:
-                            # 1. Correção do centro do mapa (usando unary_union que é universal)
                             centro_nbr = limite.geometry.unary_union.centroid
                             m_nbr = folium.Map(
                                 location=[centro_nbr.y, centro_nbr.x],
@@ -1464,7 +1457,6 @@ if st.session_state.gerar_dashboard:
                                 attr='Google'
                             )
                             
-                            # 2. Contorno do Município/Estado
                             folium.GeoJson(
                                 limite.__geo_interface__,
                                 style_function=lambda x: {
@@ -1473,7 +1465,6 @@ if st.session_state.gerar_dashboard:
                                 }
                             ).add_to(m_nbr)
                             
-                            # 3. Parâmetros de Cor do dNBR
                             vis_dnbr = {
                                 'min': -0.5, 'max': 1.3,
                                 'palette': [
@@ -1482,13 +1473,11 @@ if st.session_state.gerar_dashboard:
                                 ]
                             }
                             
-                            # 4. Adicionando a camada do Satélite
                             m_nbr.add_ee_layer(
                                 dnbr_img, vis_dnbr,
                                 'dNBR (severidade contínua)', opacity=0.85
                             )
                             
-                            # 5. Legenda em HTML
                             legenda_html = """
                             <div style="position:fixed; bottom:28px; right:10px; z-index:9999;
                                         background:rgba(20,20,20,0.88); padding:12px 16px;
@@ -1506,12 +1495,10 @@ if st.session_state.gerar_dashboard:
                             
                             folium.LayerControl().add_to(m_nbr)
                             
-                            # 6. Renderizando no Streamlit
                             _nbr_key = f"nbr_{val_sel}_{ano_modis}_{mes_modis}"
                             st_folium(m_nbr, width=None, height=620, returned_objects=[], key=_nbr_key)
                             
                         except Exception as erro_mapa:
-                            # Se o mapa quebrar agora, ele vai nos avisar exatamente o porquê!
                             st.error(f"⚠️ Os dados foram calculados, mas ocorreu um erro ao desenhar o mapa Folium: {erro_mapa}")
 
                 with col_nbr2:
