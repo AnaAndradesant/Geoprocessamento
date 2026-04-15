@@ -13,10 +13,7 @@ import ee
 from io import BytesIO
 
 
-if st.button("Limpar Cache"):
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    st.success("Cache limpo com sucesso!")
+
 
 
 # Define o método para adicionar a camada do Earth Engine ao Folium
@@ -615,6 +612,16 @@ if "qa" in st.query_params and st.query_params["qa"].lower() == "true":
 
 if st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True):
     st.session_state.gerar_dashboard = True
+
+
+# Adicione isso na seção da barra lateral (sidebar)
+if st.sidebar.button("♻️ Limpar Cache do Sistema"):
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.sidebar.success("Cache limpo com sucesso!")
+
+
+
 
 # --- SEÇÃO DE CONTATO ---
 st.sidebar.markdown("---")
