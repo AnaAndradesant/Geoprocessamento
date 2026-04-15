@@ -95,33 +95,29 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
 
 
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
-    """Versão ULTRA TOLERANTE do dNBR - para regiões muito nubladas do Brasil"""
+    """Versão FINAL ULTRA-TOLERANTE para grandes municípios como Corumbá"""
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     
     # Período ainda mais amplo
     data_ref = ee.Date.fromYMD(ano, mes, 15)
-    pre_ini = data_ref.advance(-5, 'month')   # 5 meses antes
-    pre_fim = data_ref.advance(-0.2, 'month')
+    pre_ini = data_ref.advance(-6, 'month')
+    pre_fim = data_ref.advance(-0.1, 'month')
     pos_ini = data_ref.advance(-0.5, 'month')
-    pos_fim = data_ref.advance(4, 'month')    # 4 meses depois
+    pos_fim = data_ref.advance(5, 'month')
 
-    def mask_s2_ultra_tolerant(img):
-        """Máscara mínima - quase só remove nuvens grossas"""
+    def mask_s2_ultra(img):
         qa = img.select('QA60')
         cloud = qa.bitwiseAnd(1 << 10).eq(0)
         cirrus = qa.bitwiseAnd(1 << 11).eq(0)
-        
-        # Máscara muito leve contra sombras/nuvens finas
         blue = img.select('B2').divide(10000)
-        shadow_mask = blue.gt(0.15)   # threshold mais alto
-        
-        mask = cloud.And(cirrus).And(shadow_mask.Not())
+        mask = cloud.And(cirrus).And(blue.lt(0.18))   # threshold mais relaxado
         return img.updateMask(mask).divide(10000)
 
+    # Tenta primeiro L2A (melhor qualidade)
     colecao = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                .filterBounds(ee_geom)
-               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 92))  # quase sem filtro
-               .map(mask_s2_ultra_tolerant))
+               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 95))
+               .map(mask_s2_ultra))
 
     col_pre = colecao.filterDate(pre_ini, pre_fim)
     col_pos = colecao.filterDate(pos_ini, pos_fim)
@@ -129,15 +125,26 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     n_pre = col_pre.size().getInfo()
     n_pos = col_pos.size().getInfo()
 
-    if n_pre < 1 or n_pos < 1:
-        raise ValueError(f"Ainda sem imagens suficientes.\n"
-                         f"Pré: {n_pre} | Pós: {n_pos}\n\n"
-                         "Isso geralmente acontece em meses chuvosos ou regiões com cobertura de nuvens muito alta.\n"
-                         "Tente os meses de **Junho a Setembro** (estação seca).")
+    # Se ainda não tiver imagens, tenta a coleção L1C (mais imagens disponíveis)
+    if n_pre == 0 or n_pos == 0:
+        st.warning("⚠️ L2A sem imagens → tentando L1C (menos preciso mas mais disponível)")
+        colecao = (ee.ImageCollection('COPERNICUS/S2')
+                   .filterBounds(ee_geom)
+                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 95))
+                   .map(mask_s2_ultra))
 
-    # Usa percentile ainda mais baixo para tentar recuperar algo
-    img_pre = col_pre.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
-    img_pos = col_pos.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
+        col_pre = colecao.filterDate(pre_ini, pre_fim)
+        col_pos = colecao.filterDate(pos_ini, pos_fim)
+        n_pre = col_pre.size().getInfo()
+        n_pos = col_pos.size().getInfo()
+
+    if n_pre < 1 or n_pos < 1:
+        raise ValueError(f"Ainda sem imagens suficientes (Pré: {n_pre} | Pós: {n_pos}).\n"
+                         f"Corumbá é muito grande. Tente um município menor ou mês de Agosto/Setembro.")
+
+    # Usa percentile baixo para recuperar o máximo possível
+    img_pre = col_pre.reduce(ee.Reducer.percentile([5])).select(['B8_p5', 'B12_p5']).rename(['B8', 'B12'])
+    img_pos = col_pos.reduce(ee.Reducer.percentile([5])).select(['B8_p5', 'B12_p5']).rename(['B8', 'B12'])
 
     nbr_pre = img_pre.normalizedDifference(['B8', 'B12']).rename('NBR_pre')
     nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
@@ -148,7 +155,6 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
         dnbr = dnbr.updateMask(_mascara_modis.gt(0))
 
     return ee_geom, dnbr
-
 
 # =============================================================
 # --- FUNÇÕES UTILITÁRIAS ---
