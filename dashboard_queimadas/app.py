@@ -95,52 +95,62 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
 
 
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
-    """Versão FINAL ULTRA-TOLERANTE para grandes municípios como Corumbá"""
+    """Versão FINAL e corrigida - funciona com L2A e L1C"""
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     
-    # Período ainda mais amplo
     data_ref = ee.Date.fromYMD(ano, mes, 15)
     pre_ini = data_ref.advance(-6, 'month')
     pre_fim = data_ref.advance(-0.1, 'month')
     pos_ini = data_ref.advance(-0.5, 'month')
     pos_fim = data_ref.advance(5, 'month')
 
-    def mask_s2_ultra(img):
+    # ====================== MÁSCARA PARA L2A ======================
+    def mask_l2a(img):
         qa = img.select('QA60')
         cloud = qa.bitwiseAnd(1 << 10).eq(0)
         cirrus = qa.bitwiseAnd(1 << 11).eq(0)
         blue = img.select('B2').divide(10000)
-        mask = cloud.And(cirrus).And(blue.lt(0.18))   # threshold mais relaxado
+        mask = cloud.And(cirrus).And(blue.lt(0.18))
         return img.updateMask(mask).divide(10000)
 
-    # Tenta primeiro L2A (melhor qualidade)
-    colecao = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-               .filterBounds(ee_geom)
-               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 95))
-               .map(mask_s2_ultra))
+    # ====================== MÁSCARA PARA L1C ======================
+    def mask_l1c(img):
+        # L1C não tem QA60, então usamos máscara simples baseada em B10 (cirrus) e threshold
+        cirrus = img.select('B10').divide(10000).lt(0.015)   # cirrus baixo = limpo
+        blue = img.select('B2').divide(10000).lt(0.20)
+        mask = cirrus.And(blue)
+        return img.updateMask(mask).divide(10000)
 
-    col_pre = colecao.filterDate(pre_ini, pre_fim)
-    col_pos = colecao.filterDate(pos_ini, pos_fim)
+    # ====================== TENTA PRIMEIRO L2A ======================
+    colecao_l2a = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                   .filterBounds(ee_geom)
+                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 95))
+                   .map(mask_l2a))
+
+    col_pre = colecao_l2a.filterDate(pre_ini, pre_fim)
+    col_pos = colecao_l2a.filterDate(pos_ini, pos_fim)
 
     n_pre = col_pre.size().getInfo()
     n_pos = col_pos.size().getInfo()
 
-    # Se ainda não tiver imagens, tenta a coleção L1C (mais imagens disponíveis)
+    # Se L2A falhar, tenta L1C
     if n_pre == 0 or n_pos == 0:
-        st.warning("⚠️ L2A sem imagens → tentando L1C (menos preciso mas mais disponível)")
-        colecao = (ee.ImageCollection('COPERNICUS/S2')
-                   .filterBounds(ee_geom)
-                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 95))
-                   .map(mask_s2_ultra))
+        st.warning("⚠️ L2A sem imagens → tentando L1C (Top of Atmosphere)")
+        colecao_l1c = (ee.ImageCollection('COPERNICUS/S2')
+                       .filterBounds(ee_geom)
+                       .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 95))
+                       .map(mask_l1c))
 
-        col_pre = colecao.filterDate(pre_ini, pre_fim)
-        col_pos = colecao.filterDate(pos_ini, pos_fim)
+        col_pre = colecao_l1c.filterDate(pre_ini, pre_fim)
+        col_pos = colecao_l1c.filterDate(pos_ini, pos_fim)
         n_pre = col_pre.size().getInfo()
         n_pos = col_pos.size().getInfo()
 
     if n_pre < 1 or n_pos < 1:
-        raise ValueError(f"Ainda sem imagens suficientes (Pré: {n_pre} | Pós: {n_pos}).\n"
-                         f"Corumbá é muito grande. Tente um município menor ou mês de Agosto/Setembro.")
+        raise ValueError(f"Ainda sem imagens suficientes.\n"
+                         f"Pré: {n_pre} | Pós: {n_pos}\n\n"
+                         f"Região testada: Corumbá-MS / Julho-2022\n"
+                         "Tente Agosto ou Setembro de 2022 (melhor chance).")
 
     # Usa percentile baixo para recuperar o máximo possível
     img_pre = col_pre.reduce(ee.Reducer.percentile([5])).select(['B8_p5', 'B12_p5']).rename(['B8', 'B12'])
@@ -155,7 +165,6 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
         dnbr = dnbr.updateMask(_mascara_modis.gt(0))
 
     return ee_geom, dnbr
-
 # =============================================================
 # --- FUNÇÕES UTILITÁRIAS ---
 # =============================================================
