@@ -121,38 +121,7 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
     return res_stats
 
 
-def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
-    # === CORREÇÃO: LEITURA INTELIGENTE DE GEOJSON ===
-    geom_dict = json.loads(geom_json_str)
-    if 'features' in geom_dict:
-        poly = ee.Geometry(geom_dict['features'][0]['geometry'])
-    else:
-        poly = ee.Geometry(geom_dict)
-    # ================================================
 
-    data_fim = datetime(ano, mes, 28)
-    data_ini = data_fim - timedelta(days=60)
-    
-    def get_nbr(img):
-        return img.normalizedDifference(['B8', 'B12']).rename('nbr')
-
-    s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
-           .filterBounds(poly)\
-           .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-    
-    pre_fire = s2.filterDate(data_ini.strftime('%Y-%m-%d'), (data_ini + timedelta(days=30)).strftime('%Y-%m-%d')).median()
-    post_fire = s2.filterDate(data_fim.replace(day=1).strftime('%Y-%m-%d'), data_fim.strftime('%Y-%m-%d')).median()
-    
-    dnbr = get_nbr(pre_fire).subtract(get_nbr(post_fire)).multiply(1000).clip(poly)
-    
-    # === A MÁGICA DA OTIMIZAÇÃO (Agora com o _ na frente) ===
-    if _mascara_modis is not None:
-        dnbr = dnbr.updateMask(_mascara_modis.gt(0))
-    # =========================================================
-        
-    sld_intervals = (dnbr.gt(-100).add(dnbr.gt(100)).add(dnbr.gt(270)).add(dnbr.gt(440)).add(dnbr.gt(660)))
-    
-    return sld_intervals, dnbr
 
 # =============================================================
 # --- FUNÇÕES UTILITÁRIAS ---
@@ -436,7 +405,13 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     Levanta ValueError se não houver imagens disponíveis.
     NÃO é cacheada: objetos ee.Image não são serializáveis por pickle.
     """
-    ee_geom = ee.Geometry(json.loads(geom_json_str))
+    # === CORREÇÃO: LEITURA INTELIGENTE DE GEOJSON ===
+    geom_dict = json.loads(geom_json_str)
+    if 'features' in geom_dict:
+        ee_geom = ee.Geometry(geom_dict['features'][0]['geometry'])
+    else:
+        ee_geom = ee.Geometry(geom_dict)
+
     data_ref = ee.Date.fromYMD(ano, mes, 1)
     data_pre = data_ref.advance(-3, 'month')
     data_pos = data_ref.advance(2, 'month')
@@ -489,6 +464,10 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     nbr_pre = img_pre.normalizedDifference(['B8', 'B12']).rename('NBR_pre')
     nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
     dnbr = nbr_pre.subtract(nbr_pos).rename('dNBR')
+
+    # === MÁSCARA DO MODIS APLICADA AQUI ===
+    if _mascara_modis is not None:
+        dnbr = dnbr.updateMask(_mascara_modis.gt(0))
 
     return ee_geom, dnbr
 
