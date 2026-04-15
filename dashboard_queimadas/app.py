@@ -95,37 +95,27 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
 
 
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
-    """Versão com s2cloudless - a mais eficaz para áreas nubladas do Brasil"""
+    """Versão simples e estável usando L1C (funciona melhor em Corumbá)"""
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     
+    # Período bem amplo
     data_ref = ee.Date.fromYMD(ano, mes, 15)
     pre_ini = data_ref.advance(-6, 'month')
     pre_fim = data_ref.advance(-0.1, 'month')
     pos_ini = data_ref.advance(-0.5, 'month')
     pos_fim = data_ref.advance(5, 'month')
 
-    # Coleção de nuvem (s2cloudless)
-    s2_clouds = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
-
-    # Base de imagens (L2A quando possível)
-    s2 = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-          .filterBounds(ee_geom)
-          .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 90)))
-
-    # Join com probabilidade de nuvem
-    def add_cloud_probability(img):
-        cloud_img = ee.Image(s2_clouds.filter(ee.Filter.eq('system:index', img.get('system:index'))).first())
-        return img.addBands(cloud_img.select('probability').rename('cloud_probability'))
-
-    s2_with_cloud = s2.map(add_cloud_probability)
-
-    # Máscara final
-    def mask_s2cloudless(img):
-        cloud_prob = img.select('cloud_probability')
-        mask = cloud_prob.lt(30)  # < 30% de probabilidade de nuvem
+    def mask_l1c(img):
+        # Máscara simples e confiável para L1C
+        cirrus = img.select('B10').divide(10000).lt(0.015)
+        blue = img.select('B2').divide(10000).lt(0.20)
+        mask = cirrus.And(blue)
         return img.updateMask(mask).divide(10000)
 
-    colecao = s2_with_cloud.map(mask_s2cloudless)
+    colecao = (ee.ImageCollection('COPERNICUS/S2')          # L1C
+               .filterBounds(ee_geom)
+               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 95))
+               .map(mask_l1c))
 
     col_pre = colecao.filterDate(pre_ini, pre_fim)
     col_pos = colecao.filterDate(pos_ini, pos_fim)
@@ -134,13 +124,14 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     n_pos = col_pos.size().getInfo()
 
     if n_pre < 1 or n_pos < 1:
-        raise ValueError(f"Ainda sem imagens suficientes mesmo com s2cloudless.\n"
+        raise ValueError(f"Ainda sem imagens suficientes.\n"
                          f"Pré: {n_pre} | Pós: {n_pos}\n\n"
-                         "Corumbá é muito grande. Tente um município menor ou mude para Agosto/Setembro 2022.")
+                         "Corumbá é muito grande. Tente Agosto ou Setembro 2022, "
+                         "ou um município menor (ex: Ladário ou Miranda).")
 
-    # Redutor robusto
-    img_pre = col_pre.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
-    img_pos = col_pos.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
+    # Redutor para recuperar o máximo possível
+    img_pre = col_pre.reduce(ee.Reducer.percentile([5])).select(['B8_p5', 'B12_p5']).rename(['B8', 'B12'])
+    img_pos = col_pos.reduce(ee.Reducer.percentile([5])).select(['B8_p5', 'B12_p5']).rename(['B8', 'B12'])
 
     nbr_pre = img_pre.normalizedDifference(['B8', 'B12']).rename('NBR_pre')
     nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
