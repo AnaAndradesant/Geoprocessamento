@@ -12,6 +12,13 @@ import requests, warnings, time, unicodedata, re, json, io, calendar
 import ee
 from io import BytesIO
 
+
+if st.button("Limpar Cache"):
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.success("Cache limpo com sucesso!")
+
+
 # Define o método para adicionar a camada do Earth Engine ao Folium
 def add_ee_layer(self, ee_image_object, vis_params, name, opacity=1):
     # Gera as informações do tile a partir da imagem do EE
