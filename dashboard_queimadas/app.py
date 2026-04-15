@@ -95,7 +95,7 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
 
 
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
-    """Versão mínima e mais estável possível (só L1C)"""
+    """Versão corrigida - força bandas comuns + L1C para evitar erro de bandas incompatíveis"""
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     
     data_ref = ee.Date.fromYMD(ano, mes, 15)
@@ -104,9 +104,25 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     pos_ini = data_ref.advance(-0.5, 'month')
     pos_fim = data_ref.advance(5, 'month')
 
-    colecao = (ee.ImageCollection('COPERNICUS/S2')   # L1C - mais imagens disponíveis
+    # Usando L1C (mais estável em regiões grandes como Miranda/Corumbá)
+    colecao = (ee.ImageCollection('COPERNICUS/S2')
                .filterBounds(ee_geom)
                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 98)))
+
+    # FORÇA apenas as bandas espectrais comuns (evita erro de bandas diferentes)
+    def select_common_bands(img):
+        return img.select(['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B9','B10','B11','B12'])
+
+    colecao = colecao.map(select_common_bands)
+
+    # Máscara simples para L1C
+    def mask_l1c(img):
+        cirrus = img.select('B10').divide(10000).lt(0.015)
+        blue = img.select('B2').divide(10000).lt(0.22)
+        mask = cirrus.And(blue)
+        return img.updateMask(mask).divide(10000)
+
+    colecao = colecao.map(mask_l1c)
 
     col_pre = colecao.filterDate(pre_ini, pre_fim)
     col_pos = colecao.filterDate(pos_ini, pos_fim)
@@ -115,11 +131,12 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     n_pos = col_pos.size().getInfo()
 
     if n_pre < 1 or n_pos < 1:
-        raise ValueError(f"Sem imagens disponíveis.\n"
+        raise ValueError(f"Sem imagens Sentinel-2 disponíveis.\n"
                          f"Pré: {n_pre} | Pós: {n_pos}\n\n"
-                         f"Testado: {val_sel} - {mes}/{ano}\n"
-                         "Tente um município **menor** ou mude para Agosto/Setembro.")
+                         f"Região: {val_sel} | Mês {mes}/{ano}\n"
+                         "Tente Agosto ou Setembro do mesmo ano.")
 
+    # Redutor
     img_pre = col_pre.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
     img_pos = col_pos.reduce(ee.Reducer.percentile([10])).select(['B8_p10', 'B12_p10']).rename(['B8', 'B12'])
 
