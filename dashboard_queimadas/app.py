@@ -387,7 +387,24 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
         })
 
     meses_ee = ee.List.sequence(1, 12)
-    resultado = ee.FeatureCollection(meses_ee.map(calc_mes_feature)).getInfo()
+    # Vamos criar um dicionário vazio que simula o resultado do Earth Engine
+    resultado = {'features': []}
+    
+    # Cria uma barrinha de progresso no Streamlit para distrair o usuário
+    texto_progresso = f"Processando anomalia ({val_sel}). Isso pode levar alguns segundos..."
+    barra_progresso = st.progress(0, text=texto_progresso)
+    
+    # Fazemos o loop no Python (1 a 12) em vez de usar o .map() do GEE
+    for mes in range(1, 13):
+        # Calcula um único mês por vez
+        feature_mes = ee.Feature(calc_mes_feature(mes)).getInfo()
+        resultado['features'].append(feature_mes)
+        
+        # Atualiza a barrinha de progresso
+        barra_progresso.progress(mes / 12, text=f"Calculado mês {mes}/12 para {val_sel}...")
+        
+    # Remove a barra de progresso da tela quando terminar
+    barra_progresso.empty()
 
     registros = []
     for feat in resultado['features']:
