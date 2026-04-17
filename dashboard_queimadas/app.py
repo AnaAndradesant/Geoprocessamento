@@ -340,8 +340,9 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
             .reduceRegion(
                 reducer=ee.Reducer.sum(),
                 geometry=ee_geom,
-                scale=1000,
-                maxPixels=1e10,
+                scale=2500,           # Pode tentar 2000 ou 5000 se ainda assim ficar lento
+                maxPixels=1e13,       # <-- AUMENTADO de 1e10 para 1e13
+                tileScale=16,         # <-- ADICIONADO AQUI! (O segredo para a Amazônia não travar)
                 bestEffort=True
             ).get('area')
         )
