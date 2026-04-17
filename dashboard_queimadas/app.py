@@ -1378,7 +1378,7 @@ if st.session_state.gerar_dashboard:
                             ).add_to(m_nbr)
                             
                             vis_dnbr = {
-                                'min': -0.5, 'max': 1.3,
+                                'min': -100, 'max': 1000,
                                 'palette': [
                                     '#1a9850', '#91cf60', '#d9ef8b', '#ffffbf',
                                     '#fee08b', '#fc8d59', '#d73027', '#7a0403'
