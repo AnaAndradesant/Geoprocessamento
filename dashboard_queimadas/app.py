@@ -403,63 +403,57 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
-    try:
-        st.info("🔍 Passo 1: Iniciando _construir_dnbr. Lendo geometria...")
-        ee_geom = ee.Geometry(json.loads(geom_json_str))
+    # 1. LEITURA CORRETA DA GEOMETRIA (Igual ao seu calcular_stats_nbr)
+    geom_dict = json.loads(geom_json_str)
+    if 'features' in geom_dict:
+        poly = ee.Geometry(geom_dict['features'][0]['geometry'])
+    else:
+        poly = ee.Geometry(geom_dict)
+
+    # 2. JANELA TEMPORAL EXPANDIDA (Garante que sempre ache imagens limpas)
+    data_ref = datetime(ano, mes, 1)
+    data_ini_pre = data_ref - timedelta(days=90)  # 3 meses antes
+    data_fim_pre = data_ref
+    
+    data_ini_pos = data_ref
+    data_fim_pos = data_ref + timedelta(days=60)  # 2 meses depois
+
+    def get_nbr(img):
+        return img.normalizedDifference(['B8', 'B12']).rename('nbr')
+
+    # 3. BUSCA DO SENTINEL (Sem filtro estrito de nuvens para não esvaziar a coleção)
+    s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterBounds(poly)
+    
+    col_pre = s2.filterDate(data_ini_pre.strftime('%Y-%m-%d'), data_fim_pre.strftime('%Y-%m-%d'))
+    col_pos = s2.filterDate(data_ini_pos.strftime('%Y-%m-%d'), data_fim_pos.strftime('%Y-%m-%d'))
+
+    # 4. TRAVA DE SEGURANÇA SILENCIOSA 
+    # Se, mesmo com 5 meses de janela, não houver imagens, devolve um mapa vazio sem quebrar o app
+    if col_pre.size().getInfo() == 0 or col_pos.size().getInfo() == 0:
+        return poly, ee.Image().constant(0).updateMask(0)
+
+    pre_fire = col_pre.median()
+    post_fire = col_pos.median()
+    
+    # Cálculo bruto do dNBR
+    dnbr = get_nbr(pre_fire).subtract(get_nbr(post_fire)).multiply(1000).clip(poly)
+    
+    # Aplica a máscara do MODIS (Filtro de Fogo)
+    if _mascara_modis is not None:
+        dnbr = dnbr.updateMask(_mascara_modis.gt(0))
         
-        data_ref = ee.Date.fromYMD(ano, mes, 1)
-        data_pre = data_ref.advance(-3, 'month')
-        data_pos = data_ref.advance(2, 'month')
-
-        def mascara_nuvem(img):
-            qa = img.select('QA60')
-            mascara = (qa.bitwiseAnd(1 << 10).eq(0).And(qa.bitwiseAnd(1 << 11).eq(0)))
-            return img.updateMask(mascara).divide(10000)
-
-        st.info("🔍 Passo 2: Acessando coleção do Sentinel-2 (100% nuvens permitido)...")
-        colecao_base = (
-            ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-            .filterBounds(ee_geom)
-            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 100))
-            .map(mascara_nuvem)
-        )
-
-        col_pre = colecao_base.filterDate(data_pre, data_ref)
-        col_pos = colecao_base.filterDate(data_ref, data_pos)
-
-        st.warning("⏳ Passo 3: Solicitando verificação de imagens ao servidor do Google (Isso pode demorar e é onde costuma dar erro)...")
-        counts = ee.Dictionary({
-            'n_pre': col_pre.size(),
-            'n_pos': col_pos.size()
-        }).getInfo() # <--- Muitos erros ocorrem no .getInfo()
-        
-        st.success(f"✅ Passo 3 Concluído! Imagens encontradas: {counts['n_pre']} (Pré) e {counts['n_pos']} (Pós).")
-
-        if counts['n_pre'] == 0 or counts['n_pos'] == 0:
-            raise ValueError(f"O período pré tem {counts['n_pre']} imagens e o pós tem {counts['n_pos']}. Impossível calcular NBR.")
-
-        st.info("🔍 Passo 4: Calculando Medianas e o índice dNBR...")
-        img_pre = col_pre.median().clip(ee_geom)
-        img_pos = col_pos.median().clip(ee_geom)
-
-        nbr_pre = img_pre.normalizedDifference(['B8', 'B12']).rename('NBR_pre')
-        nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
-        dnbr = nbr_pre.subtract(nbr_pos).rename('dNBR')
-
-        if _mascara_modis is not None:
-            dnbr = dnbr.updateMask(_mascara_modis.gt(0))
-            
-        st.success("✅ dNBR montado com sucesso no Earth Engine!")
-        return ee_geom, dnbr
-
-    except Exception as e:
-        st.error("🚨 ERRO CAPTURADO DURANTE A CRIAÇÃO DO MAPA:")
-        st.error(str(e))
-        with st.expander("Ver código do erro técnico (Traceback)"):
-            st.code(traceback.format_exc())
-            
-        # Retorna algo vazio para o aplicativo não travar totalmente
-        return ee.Geometry.Point([0,0]), ee.Image().constant(0)
+    # 5. O SEGREDO DAS CORES: A IMAGEM CLASSIFICADA
+    # Isso transforma os valores de -1000/1000 para as classes 0 a 5 que o seu mapa espera!
+    sld_intervals = (
+        dnbr.gt(-100)
+        .add(dnbr.gt(100))
+        .add(dnbr.gt(270))
+        .add(dnbr.gt(440))
+        .add(dnbr.gt(660))
+    )
+    
+    # Retorna o polígono e a imagem classificada
+    return poly, sld_intervals
 
 # =============================================================
 # --- INTERFACE (BARRA LATERAL) ---
