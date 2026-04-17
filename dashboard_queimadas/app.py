@@ -106,7 +106,14 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
     # =========================================================
 
     sld_intervals = (dnbr.gt(-100).add(dnbr.gt(100)).add(dnbr.gt(270)).add(dnbr.gt(440)).add(dnbr.gt(660)))
-    stats = sld_intervals.reduceRegion(ee.Reducer.frequencyHistogram(), poly, 20, maxPixels=1e10).getInfo()
+    stats = sld_intervals.reduceRegion(
+        reducer=ee.Reducer.frequencyHistogram(), 
+        geometry=poly, 
+        scale=50,             # Aumentado de 20 para 50 (acelera brutalmente sem perder a proporção do gráfico)
+        maxPixels=1e13,       # Limite de pixels ampliado
+        tileScale=16,         # Quebra o cálculo em 16 partes (salva a memória do servidor)
+        bestEffort=True       # Se ainda for grande demais, o próprio Google ajusta a escala pra você
+    ).getInfo()
     
     classes = {0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa', 3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'}
     res_stats = {}
