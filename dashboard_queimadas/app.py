@@ -459,63 +459,6 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
             st.code(traceback.format_exc())
             
         # Retorna algo vazio para o aplicativo não travar totalmente
-        return ee.Geometry.Point([0,0]), ee.Image().constant(0)def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
-    try:
-        st.info("🔍 Passo 1: Iniciando _construir_dnbr. Lendo geometria...")
-        ee_geom = ee.Geometry(json.loads(geom_json_str))
-        
-        data_ref = ee.Date.fromYMD(ano, mes, 1)
-        data_pre = data_ref.advance(-3, 'month')
-        data_pos = data_ref.advance(2, 'month')
-
-        def mascara_nuvem(img):
-            qa = img.select('QA60')
-            mascara = (qa.bitwiseAnd(1 << 10).eq(0).And(qa.bitwiseAnd(1 << 11).eq(0)))
-            return img.updateMask(mascara).divide(10000)
-
-        st.info("🔍 Passo 2: Acessando coleção do Sentinel-2 (100% nuvens permitido)...")
-        colecao_base = (
-            ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-            .filterBounds(ee_geom)
-            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 100))
-            .map(mascara_nuvem)
-        )
-
-        col_pre = colecao_base.filterDate(data_pre, data_ref)
-        col_pos = colecao_base.filterDate(data_ref, data_pos)
-
-        st.warning("⏳ Passo 3: Solicitando verificação de imagens ao servidor do Google (Isso pode demorar e é onde costuma dar erro)...")
-        counts = ee.Dictionary({
-            'n_pre': col_pre.size(),
-            'n_pos': col_pos.size()
-        }).getInfo() # <--- Muitos erros ocorrem no .getInfo()
-        
-        st.success(f"✅ Passo 3 Concluído! Imagens encontradas: {counts['n_pre']} (Pré) e {counts['n_pos']} (Pós).")
-
-        if counts['n_pre'] == 0 or counts['n_pos'] == 0:
-            raise ValueError(f"O período pré tem {counts['n_pre']} imagens e o pós tem {counts['n_pos']}. Impossível calcular NBR.")
-
-        st.info("🔍 Passo 4: Calculando Medianas e o índice dNBR...")
-        img_pre = col_pre.median().clip(ee_geom)
-        img_pos = col_pos.median().clip(ee_geom)
-
-        nbr_pre = img_pre.normalizedDifference(['B8', 'B12']).rename('NBR_pre')
-        nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
-        dnbr = nbr_pre.subtract(nbr_pos).rename('dNBR')
-
-        if _mascara_modis is not None:
-            dnbr = dnbr.updateMask(_mascara_modis.gt(0))
-            
-        st.success("✅ dNBR montado com sucesso no Earth Engine!")
-        return ee_geom, dnbr
-
-    except Exception as e:
-        st.error("🚨 ERRO CAPTURADO DURANTE A CRIAÇÃO DO MAPA:")
-        st.error(str(e))
-        with st.expander("Ver código do erro técnico (Traceback)"):
-            st.code(traceback.format_exc())
-            
-        # Retorna algo vazio para o aplicativo não travar totalmente
         return ee.Geometry.Point([0,0]), ee.Image().constant(0)
 
 # =============================================================
