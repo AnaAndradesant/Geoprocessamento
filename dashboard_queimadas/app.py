@@ -334,16 +334,16 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
     }
 
     def get_area_km2(img):
-        # 1. Simplifica as bordas da geometria (Vital para a Amazônia não travar)
-        geom_simplificada = ee_geom.simplify(maxError=2000)
+        # Simplifica um pouco mais a borda da Amazônia (5000 metros)
+        geom_simplificada = ee_geom.simplify(maxError=5000)
         
         raw = (
             ee.Image.pixelArea().divide(1e6)
             .updateMask(img.gt(0))
             .reduceRegion(
                 reducer=ee.Reducer.sum(),
-                geometry=geom_simplificada,   # <-- Usa a geometria simplificada
-                scale=5000,                   # <-- Escala ampliada para 5km
+                geometry=geom_simplificada,   
+                scale=10000,                  # <-- AUMENTADO PARA 10km (O pulo do gato)
                 maxPixels=1e13,
                 tileScale=16,
                 bestEffort=True
@@ -390,20 +390,30 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
     # Vamos criar um dicionário vazio que simula o resultado do Earth Engine
     resultado = {'features': []}
     
-    # Cria uma barrinha de progresso no Streamlit para distrair o usuário
     texto_progresso = f"Processando anomalia ({val_sel}). Isso pode levar alguns segundos..."
     barra_progresso = st.progress(0, text=texto_progresso)
     
-    # Fazemos o loop no Python (1 a 12) em vez de usar o .map() do GEE
     for mes in range(1, 13):
-        # Calcula um único mês por vez
-        feature_mes = ee.Feature(calc_mes_feature(mes)).getInfo()
-        resultado['features'].append(feature_mes)
+        sucesso = False
         
-        # Atualiza a barrinha de progresso
+        # Tenta pedir os dados para o Google até 3 vezes
+        for tentativa in range(3):
+            try:
+                feature_mes = ee.Feature(calc_mes_feature(mes)).getInfo()
+                resultado['features'].append(feature_mes)
+                sucesso = True
+                break # Se deu certo, sai do loop de tentativas e vai pro próximo mês
+            except Exception as e:
+                # Se falhou, espera 2 segundos para o servidor do Google respirar
+                time.sleep(2) 
+                
+        # Se depois de 3 tentativas ainda falhar, injeta um valor zerado pra não quebrar a tela
+        if not sucesso:
+            st.toast(f"Aviso: O mês {mes} estava muito pesado e os dados podem estar incompletos.")
+            resultado['features'].append({'type': 'Feature', 'properties': {'mes': mes, 'area_ref': 0, 'area_hist': 0}})
+            
         barra_progresso.progress(mes / 12, text=f"Calculado mês {mes}/12 para {val_sel}...")
         
-    # Remove a barra de progresso da tela quando terminar
     barra_progresso.empty()
 
     registros = []
