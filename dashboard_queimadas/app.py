@@ -397,9 +397,6 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
     # Vamos criar um dicionário vazio que simula o resultado do Earth Engine
     resultado = {'features': []}
     
-    texto_progresso = f"Processando anomalia ({val_sel}). Isso pode levar alguns segundos..."
-    barra_progresso = st.progress(0, text=texto_progresso)
-    
     for mes in range(1, 13):
         sucesso = False
         
@@ -409,19 +406,16 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
                 feature_mes = ee.Feature(calc_mes_feature(mes)).getInfo()
                 resultado['features'].append(feature_mes)
                 sucesso = True
-                break # Se deu certo, sai do loop de tentativas e vai pro próximo mês
+                break # Se deu certo, sai do loop
             except Exception as e:
-                # Se falhou, espera 2 segundos para o servidor do Google respirar
-                time.sleep(2) 
+                time.sleep(2) # Espera 2 segundos se o Google engasgar
                 
-        # Se depois de 3 tentativas ainda falhar, injeta um valor zerado pra não quebrar a tela
+        # Se depois de 3 tentativas falhar, injeta um valor zerado pra não quebrar o gráfico
         if not sucesso:
-            st.toast(f"Aviso: O mês {mes} estava muito pesado e os dados podem estar incompletos.")
             resultado['features'].append({'type': 'Feature', 'properties': {'mes': mes, 'area_ref': 0, 'area_hist': 0}})
             
-        barra_progresso.progress(mes / 12, text=f"Calculado mês {mes}/12 para {val_sel}...")
-        
-    barra_progresso.empty()
+        # Tira o st.progress e usa print (Isso não quebra o cache do Streamlit)
+        print(f"Calculado mês {mes}/12 para {val_sel}...")
 
     registros = []
     for feat in resultado['features']:
