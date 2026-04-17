@@ -403,12 +403,12 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
 
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     """
-    Constrói a imagem dNBR no GEE (lazy — sem chamadas de rede).
-    Levanta ValueError se não houver imagens disponíveis.
-    NÃO é cacheada: objetos ee.Image não são serializáveis por pickle.
+    Constrói a imagem dNBR no GEE para o Mapa.
     """
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     data_ref = ee.Date.fromYMD(ano, mes, 1)
+    
+    # Busca 3 meses para trás e 2 para frente para garantir que SEMPRE ache imagens
     data_pre = data_ref.advance(-3, 'month')
     data_pos = data_ref.advance(2, 'month')
 
@@ -423,35 +423,25 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     colecao_base = (
         ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         .filterBounds(ee_geom)
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 100)) # <-- LIBERADO PARA 100%
         .map(mascara_nuvem)
     )
 
     col_pre = colecao_base.filterDate(data_pre, data_ref)
     col_pos = colecao_base.filterDate(data_ref, data_pos)
 
-    # Verifica disponibilidade — única chamada de rede nesta etapa
+    # Verifica se encontrou alguma coisa
     counts = ee.Dictionary({
         'n_pre': col_pre.size(),
         'n_pos': col_pos.size()
     }).getInfo()
-    n_pre, n_pos = counts['n_pre'], counts['n_pos']
 
-    if n_pre == 0 and n_pos == 0:
+    if counts['n_pre'] == 0 or counts['n_pos'] == 0:
         raise ValueError(
-            "Nenhuma imagem Sentinel-2 sem nuvens encontrada para esta região no período. "
-        )
-    if n_pre == 0:
-        raise ValueError(
-            "Sem imagens Sentinel-2 para o período PRÉ-fogo (3 meses antes). "
-            "Tente um mês diferente."
-        )
-    if n_pos == 0:
-        raise ValueError(
-            "Sem imagens Sentinel-2 para o período PÓS-fogo (até 2 meses após). "
-            "Tente um mês mais antigo."
+            "Não há dados do Sentinel-2 para esta região no período selecionado."
         )
 
+    # A mediana se encarrega de limpar as nuvens que restaram
     img_pre = col_pre.median().clip(ee_geom)
     img_pos = col_pos.median().clip(ee_geom)
 
@@ -459,53 +449,12 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     nbr_pos = img_pos.normalizedDifference(['B8', 'B12']).rename('NBR_pos')
     dnbr = nbr_pre.subtract(nbr_pos).rename('dNBR')
 
-    # Aplica a máscara do MODIS: restringe o dNBR apenas aos pixels que
-    # efetivamente queimaram, evitando que toda a região seja renderizada
+    # Aplica a máscara do MODIS (área queimada)
     if _mascara_modis is not None:
         dnbr = dnbr.updateMask(_mascara_modis.gt(0))
 
     return ee_geom, dnbr
 
-
-@st.cache_data
-def calcular_nbr_sentinel(geom_json, ano, mes, mascara_modis=None):
-    poly = ee.Geometry(json.loads(geom_json)['features'][0]['geometry'])
-    
-    # Datas para o Sentinel (1 mês antes e o mês atual)
-    data_fim = datetime(ano, mes, 28)
-    data_ini = data_fim - timedelta(days=60)
-    
-    def get_nbr(img):
-        return img.normalizedDifference(['B8', 'B12']).rename('nbr')
-
-    s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
-           .filterBounds(poly)\
-           .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
-    
-    pre_fire = s2.filterDate(data_ini.strftime('%Y-%m-%d'), (data_ini + timedelta(days=30)).strftime('%Y-%m-%d')).median()
-    post_fire = s2.filterDate(data_fim.replace(day=1).strftime('%Y-%m-%d'), data_fim.strftime('%Y-%m-%d')).median()
-    
-    dnbr = get_nbr(pre_fire).subtract(get_nbr(post_fire)).multiply(1000).clip(poly)
-    
-    # === A MÁGICA DA OTIMIZAÇÃO ENTRA AQUI ===
-    if mascara_modis is not None:
-        # Faz o Sentinel-2 olhar APENAS para os pixels que o MODIS disse que queimaram
-        dnbr = dnbr.updateMask(mascara_modis.gt(0))
-    # =========================================
-
-    # Classificação
-    sld_intervals = (dnbr.gt(-100).add(dnbr.gt(100)).add(dnbr.gt(270)).add(dnbr.gt(440)).add(dnbr.gt(660)))
-    
-    stats = sld_intervals.reduceRegion(ee.Reducer.frequencyHistogram(), poly, 20, maxPixels=1e10).getInfo()
-    
-    classes = {0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa', 3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'}
-    res_stats = {}
-    if 'groups' not in str(stats): 
-        for k, v in stats.get('constant', stats).items():
-            area = (v * 400) / 1e6 # 20m scale
-            res_stats[classes.get(int(float(k)), 'Outros')] = round(area, 2)
-            
-    return dnbr, sld_intervals, res_stats
 # =============================================================
 # --- INTERFACE (BARRA LATERAL) ---
 # =============================================================
