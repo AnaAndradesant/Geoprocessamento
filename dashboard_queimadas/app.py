@@ -442,18 +442,9 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     if _mascara_modis is not None:
         dnbr = dnbr.updateMask(_mascara_modis.gt(0))
         
-    # 5. O SEGREDO DAS CORES: A IMAGEM CLASSIFICADA
-    # Isso transforma os valores de -1000/1000 para as classes 0 a 5 que o seu mapa espera!
-    sld_intervals = (
-        dnbr.gt(-100)
-        .add(dnbr.gt(100))
-        .add(dnbr.gt(270))
-        .add(dnbr.gt(440))
-        .add(dnbr.gt(660))
-    )
-    
-    # Retorna o polígono e a imagem classificada
-    return poly, sld_intervals
+    # RETORNA O DNBR ORIGINAL!
+    # Isso fará as cores do mapa combinarem perfeitamente com as do gráfico
+    return poly, dnbr
 
 # =============================================================
 # --- INTERFACE (BARRA LATERAL) ---
