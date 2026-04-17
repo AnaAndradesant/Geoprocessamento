@@ -334,15 +334,18 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
     }
 
     def get_area_km2(img):
+        # 1. Simplifica as bordas da geometria (Vital para a Amazônia não travar)
+        geom_simplificada = ee_geom.simplify(maxError=2000)
+        
         raw = (
             ee.Image.pixelArea().divide(1e6)
             .updateMask(img.gt(0))
             .reduceRegion(
                 reducer=ee.Reducer.sum(),
-                geometry=ee_geom,
-                scale=2500,           # Pode tentar 2000 ou 5000 se ainda assim ficar lento
-                maxPixels=1e13,       # <-- AUMENTADO de 1e10 para 1e13
-                tileScale=16,         # <-- ADICIONADO AQUI! (O segredo para a Amazônia não travar)
+                geometry=geom_simplificada,   # <-- Usa a geometria simplificada
+                scale=5000,                   # <-- Escala ampliada para 5km
+                maxPixels=1e13,
+                tileScale=16,
                 bestEffort=True
             ).get('area')
         )
