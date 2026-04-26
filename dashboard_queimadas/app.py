@@ -76,60 +76,79 @@ except Exception as e:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
-    # === CORREÇÃO: LEITURA INTELIGENTE DE GEOJSON ===
+    # === LEITURA INTELIGENTE DE GEOJSON ===
     geom_dict = json.loads(geom_json_str)
     if 'features' in geom_dict:
         poly = ee.Geometry(geom_dict['features'][0]['geometry'])
     else:
         poly = ee.Geometry(geom_dict)
-    # ================================================
-    
+    # ======================================
+
+    # === ESCALA DINÂMICA baseada na área real da geometria ===
+    # Amazônia (~5,5M km²) com scale=50 geraria bilhões de pixels → timeout garantido.
+    # Aumentar a escala resolve sem perder a proporção do gráfico de severidade.
+    area_km2 = poly.area().divide(1e6).getInfo()
+    if area_km2 > 1_500_000:       # Biomas gigantes (ex: Amazônia)
+        scale = 500
+    elif area_km2 > 500_000:       # Estados grandes (AM, PA, MT)
+        scale = 300
+    elif area_km2 > 100_000:       # Estados médios
+        scale = 150
+    elif area_km2 > 10_000:        # Estados pequenos / regiões
+        scale = 100
+    else:                          # Municípios e áreas pequenas
+        scale = 50
+    # =========================================================
+
     # Datas para o Sentinel (1 mês antes e o mês atual)
     data_fim = datetime(ano, mes, 28)
     data_ini = data_fim - timedelta(days=60)
-    
+
     def get_nbr(img):
         return img.normalizedDifference(['B8', 'B12']).rename('nbr')
 
     s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
            .filterBounds(poly)\
            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
-    
-    pre_fire = s2.filterDate(data_ini.strftime('%Y-%m-%d'), (data_ini + timedelta(days=30)).strftime('%Y-%m-%d')).median()
-    post_fire = s2.filterDate(data_fim.replace(day=1).strftime('%Y-%m-%d'), data_fim.strftime('%Y-%m-%d')).median()
-    
+
+    pre_fire  = s2.filterDate(data_ini.strftime('%Y-%m-%d'),
+                              (data_ini + timedelta(days=30)).strftime('%Y-%m-%d')).median()
+    post_fire = s2.filterDate(data_fim.replace(day=1).strftime('%Y-%m-%d'),
+                              data_fim.strftime('%Y-%m-%d')).median()
+
     dnbr = get_nbr(pre_fire).subtract(get_nbr(post_fire)).multiply(1000).clip(poly)
-    
-    # === A MÁGICA DA OTIMIZAÇÃO (Agora com o _ na frente) ===
+
     if _mascara_modis is not None:
         dnbr = dnbr.updateMask(_mascara_modis.gt(0))
-    # =========================================================
 
-    sld_intervals = (dnbr.gt(-100).add(dnbr.gt(100)).add(dnbr.gt(270)).add(dnbr.gt(440)).add(dnbr.gt(660)))
+    sld_intervals = (
+        dnbr.gt(-100).add(dnbr.gt(100)).add(dnbr.gt(270))
+            .add(dnbr.gt(440)).add(dnbr.gt(660))
+    )
+
     stats = sld_intervals.reduceRegion(
-        reducer=ee.Reducer.frequencyHistogram(), 
-        geometry=poly, 
-        scale=50,             # Aumentado de 20 para 50 (acelera brutalmente sem perder a proporção do gráfico)
-        maxPixels=1e13,       # Limite de pixels ampliado
-        tileScale=16,         # Quebra o cálculo em 16 partes (salva a memória do servidor)
-        bestEffort=True       # Se ainda for grande demais, o próprio Google ajusta a escala pra você
+        reducer=ee.Reducer.frequencyHistogram(),
+        geometry=poly,
+        scale=scale,      # ✅ escala dinâmica conforme tamanho da região
+        maxPixels=1e13,
+        tileScale=16,
+        bestEffort=True
     ).getInfo()
-    
-    classes = {0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa', 3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'}
+
+    classes = {0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa',
+               3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'}
     res_stats = {}
-    
-    # === A CORREÇÃO DO CÁLCULO DE ÁREA ===
+
     if stats:
-        # Pega os dados direto ignorando o nome da banda ('nbr', 'constant', etc)
-        hist = list(stats.values())[0] 
-        
-        # Garante que estamos lendo os números corretamente
+        hist = list(stats.values())[0]
         if isinstance(hist, dict):
+            # ✅ Área correta: usa scale² m²/pixel (antes era fixo 400 = 20²,
+            #    incorreto para escalas maiores que 20m)
+            pixel_area_km2 = (scale * scale) / 1e6
             for k, v in hist.items():
-                area = (v * 400) / 1e6 # Aqui o 'v' finalmente é só o número de pixels!
+                area = v * pixel_area_km2
                 res_stats[classes.get(int(float(k)), 'Outros')] = round(area, 2)
-    # =====================================
-            
+
     return res_stats
 
 
@@ -459,13 +478,14 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     col_pre = s2.filterDate(data_ini_pre.strftime('%Y-%m-%d'), data_fim_pre.strftime('%Y-%m-%d'))
     col_pos = s2.filterDate(data_ini_pos.strftime('%Y-%m-%d'), data_fim_pos.strftime('%Y-%m-%d'))
 
-    # 4. TRAVA DE SEGURANÇA SILENCIOSA 
-    # Se, mesmo com 5 meses de janela, não houver imagens, devolve um mapa vazio sem quebrar o app
-    if col_pre.size().getInfo() == 0 or col_pos.size().getInfo() == 0:
+    # 4. TRAVA DE SEGURANÇA SILENCIOSA
+    # Removidas as chamadas .size().getInfo() — eram bloqueantes e lentas em regiões grandes.
+    # Se não houver imagens, o .median() retornará uma imagem vazia e o try/except externo captura.
+    try:
+        pre_fire  = col_pre.median()
+        post_fire = col_pos.median()
+    except Exception:
         return poly, ee.Image().constant(0).updateMask(0)
-
-    pre_fire = col_pre.median()
-    post_fire = col_pos.median()
     
     # Cálculo bruto do dNBR
     dnbr = get_nbr(pre_fire).subtract(get_nbr(post_fire)).multiply(1000).clip(poly)
