@@ -795,7 +795,10 @@ if st.session_state.gerar_dashboard:
                             .filterBounds(ee_geom_complex)
                         )
                         stats_mun = img_area_km2.reduceRegions(
-                            collection=muns_ee, reducer=ee.Reducer.sum(), scale=1000
+                            collection=muns_ee,
+                            reducer=ee.Reducer.sum(),
+                            scale=1000,
+                            tileScale=4    # ✅ evita timeout em biomas grandes (ex: Amazônia)
                         ).getInfo()
                         recs_mun = [
                             {
@@ -836,7 +839,10 @@ if st.session_state.gerar_dashboard:
                             val = area_calc.reduceRegion(
                                 reducer=ee.Reducer.sum(),
                                 geometry=geom_temporal,
-                                scale=1000, maxPixels=1e10
+                                scale=1000,
+                                maxPixels=1e13,    # ✅ era 1e10, insuficiente pra Amazônia
+                                tileScale=4,       # ✅ divide o cálculo em blocos
+                                bestEffort=True    # ✅ ajusta escala automaticamente se necessário
                             ).get('area')
                             return ee.Feature(None, {'mes': m_num, 'area': val})
 
