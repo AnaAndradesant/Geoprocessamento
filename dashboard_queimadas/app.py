@@ -350,6 +350,11 @@ def calcular_area_queimada_modis(geom_json, ano, mes=None):
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_anomalia_modis(geom_json_str, ano_ref):
     ee_geom = ee.Geometry(json.loads(geom_json_str))
+
+    # ✅ Simplifica a geometria UMA VEZ aqui fora — antes era recalculada
+    #    dentro de get_area_km2 a cada imagem processada (muito desperdício)
+    geom_simplificada = ee_geom.simplify(maxError=5000)
+
     anos_historico = list(range(2001, ano_ref))
     anos_ee = ee.List(anos_historico)
     n_anos = len(anos_historico)
@@ -360,16 +365,13 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
     }
 
     def get_area_km2(img):
-        # Simplifica um pouco mais a borda da Amazônia (5000 metros)
-        geom_simplificada = ee_geom.simplify(maxError=5000)
-        
         raw = (
             ee.Image.pixelArea().divide(1e6)
             .updateMask(img.gt(0))
             .reduceRegion(
                 reducer=ee.Reducer.sum(),
-                geometry=geom_simplificada,   
-                scale=10000,                  # <-- AUMENTADO PARA 10km (O pulo do gato)
+                geometry=geom_simplificada,
+                scale=10000,
                 maxPixels=1e13,
                 tileScale=16,
                 bestEffort=True
@@ -383,8 +385,8 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
         img_ref = (
             ee.ImageCollection('MODIS/061/MCD64A1')
             .filterDate(ini_ref, ini_ref.advance(1, 'month'))
-            .filterBounds(ee_geom)
-            .select('BurnDate').max().clip(ee_geom)
+            .filterBounds(geom_simplificada)   # ✅ usa geom simplificada no filterBounds também
+            .select('BurnDate').max().clip(geom_simplificada)
         )
         area_ref = ee.Number(get_area_km2(img_ref))
 
@@ -394,8 +396,8 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
             img_h = (
                 ee.ImageCollection('MODIS/061/MCD64A1')
                 .filterDate(ini_h, ini_h.advance(1, 'month'))
-                .filterBounds(ee_geom)
-                .select('BurnDate').max().clip(ee_geom)
+                .filterBounds(geom_simplificada)
+                .select('BurnDate').max().clip(geom_simplificada)
             )
             return get_area_km2(img_h)
 
@@ -412,29 +414,11 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
             'media_hist': media_hist
         })
 
+    # ✅ OTIMIZAÇÃO PRINCIPAL: 1 única chamada .getInfo() no lugar de 12 sequenciais
+    # Antes: loop Python com getInfo() por mês → até 36 roundtrips ao EE (12 meses × 3 tentativas)
+    # Agora: todo o cálculo dos 12 meses vai pro servidor de uma vez, volta num único resultado
     meses_ee = ee.List.sequence(1, 12)
-    # Vamos criar um dicionário vazio que simula o resultado do Earth Engine
-    resultado = {'features': []}
-    
-    for mes in range(1, 13):
-        sucesso = False
-        
-        # Tenta pedir os dados para o Google até 3 vezes
-        for tentativa in range(3):
-            try:
-                feature_mes = ee.Feature(calc_mes_feature(mes)).getInfo()
-                resultado['features'].append(feature_mes)
-                sucesso = True
-                break # Se deu certo, sai do loop
-            except Exception as e:
-                time.sleep(2) # Espera 2 segundos se o Google engasgar
-                
-        # Se depois de 3 tentativas falhar, injeta um valor zerado pra não quebrar o gráfico
-        if not sucesso:
-            resultado['features'].append({'type': 'Feature', 'properties': {'mes': mes, 'area_ref': 0, 'area_hist': 0}})
-            
-        # Tira o st.progress e usa print (Isso não quebra o cache do Streamlit)
-        print(f"Calculado mês {mes}/12 para {val_sel}...")
+    resultado = ee.FeatureCollection(meses_ee.map(calc_mes_feature)).getInfo()
 
     registros = []
     for feat in resultado['features']:
