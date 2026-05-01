@@ -91,7 +91,7 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hi
     if area_km2 > 1_500_000:       # Biomas gigantes (ex: Amazônia ~5,5M km²)
         scale = 1000
         max_error_simplify = 10000
-        tile_scale = 32
+        tile_scale = 16
     elif area_km2 > 500_000:       # Estados grandes (AM, PA, MT) / Cerrado
         scale = 500
         max_error_simplify = 5000
