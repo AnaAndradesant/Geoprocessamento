@@ -372,8 +372,7 @@ def calcular_area_queimada_modis(geom_json, ano, mes=None):
 def calcular_anomalia_modis(geom_json_str, ano_ref):
     ee_geom = ee.Geometry(json.loads(geom_json_str))
 
-    # ✅ Simplifica a geometria UMA VEZ aqui fora — antes era recalculada
-    #    dentro de get_area_km2 a cada imagem processada (muito desperdício)
+    # Simplifica a geometria UMA VEZ aqui fora
     geom_simplificada = ee_geom.simplify(maxError=5000)
 
     anos_historico = list(range(2001, ano_ref))
@@ -406,7 +405,7 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
         img_ref = (
             ee.ImageCollection('MODIS/061/MCD64A1')
             .filterDate(ini_ref, ini_ref.advance(1, 'month'))
-            .filterBounds(geom_simplificada)   # ✅ usa geom simplificada no filterBounds também
+            .filterBounds(geom_simplificada)
             .select('BurnDate').max().clip(geom_simplificada)
         )
         area_ref = ee.Number(get_area_km2(img_ref))
@@ -435,26 +434,50 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
             'media_hist': media_hist
         })
 
-    # ✅ OTIMIZAÇÃO PRINCIPAL: 1 única chamada .getInfo() no lugar de 12 sequenciais
-    # Antes: loop Python com getInfo() por mês → até 36 roundtrips ao EE (12 meses × 3 tentativas)
-    # Agora: todo o cálculo dos 12 meses vai pro servidor de uma vez, volta num único resultado
-    meses_ee = ee.List.sequence(1, 12)
-    resultado = ee.FeatureCollection(meses_ee.map(calc_mes_feature)).getInfo()
-
+    # ── PROCESSAMENTO EM LOTES com retry/backoff ──────────────────────────────
+    # Problema: 1 único getInfo() com 12 meses × ~23 anos = ~276 reduceRegion
+    # simultâneos excede o limite de agregações concorrentes do Earth Engine (429).
+    # Solução: processar BATCH_SIZE meses por vez (~92 agregações/lote com 4 meses)
+    # e aplicar retry com backoff exponencial em caso de sobrecarga transitória.
+    BATCH_SIZE = 4   # reduzir para 2 se o erro persistir
+    MAX_RETRIES = 4
     registros = []
-    for feat in resultado['features']:
-        p = feat['properties']
-        mes      = int(p['mes'])
-        val_ref  = round(float(p.get('area_ref')  or 0), 2)
-        media    = round(float(p.get('media_hist') or 0), 2)
-        anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
-        registros.append({
-            'Mês': mes,
-            'Mês Nome': meses_map[mes],
-            f'Área {ano_ref} (km²)': val_ref,
-            'Média Histórica (km²)': media,
-            'Anomalia (%)': anomalia
-        })
+
+    for batch_start in range(1, 13, BATCH_SIZE):
+        batch_meses = list(range(batch_start, min(batch_start + BATCH_SIZE, 13)))
+        meses_ee_batch = ee.List(batch_meses)
+
+        for tentativa in range(1, MAX_RETRIES + 1):
+            try:
+                resultado = ee.FeatureCollection(
+                    meses_ee_batch.map(calc_mes_feature)
+                ).getInfo()
+                break  # sucesso — sai do loop de retry
+            except Exception as e:
+                msg = str(e)
+                if 'Too many concurrent aggregations' in msg or '429' in msg:
+                    if tentativa < MAX_RETRIES:
+                        wait = 2 ** tentativa  # 2s, 4s, 8s, 16s
+                        time.sleep(wait)
+                        continue
+                raise  # outro tipo de erro ou esgotou tentativas → propaga
+
+        for feat in resultado['features']:
+            p = feat['properties']
+            mes      = int(p['mes'])
+            val_ref  = round(float(p.get('area_ref')  or 0), 2)
+            media    = round(float(p.get('media_hist') or 0), 2)
+            anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
+            registros.append({
+                'Mês': mes,
+                'Mês Nome': meses_map[mes],
+                f'Área {ano_ref} (km²)': val_ref,
+                'Média Histórica (km²)': media,
+                'Anomalia (%)': anomalia
+            })
+
+        # Pausa entre lotes para não sobrecarregar a fila do EE
+        time.sleep(1)
 
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
