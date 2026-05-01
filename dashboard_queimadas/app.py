@@ -75,7 +75,7 @@ except Exception as e:
 # =====================================================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
+def calcular_stats_nbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=None):
     # === LEITURA INTELIGENTE DE GEOJSON ===
     geom_dict = json.loads(geom_json_str)
     if 'features' in geom_dict:
@@ -84,21 +84,40 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
         poly = ee.Geometry(geom_dict)
     # ======================================
 
-    # === ESCALA DINÂMICA baseada na área real da geometria ===
-    # Amazônia (~5,5M km²) com scale=50 geraria bilhões de pixels → timeout garantido.
-    # Aumentar a escala resolve sem perder a proporção do gráfico de severidade.
-    area_km2 = poly.area().divide(1e6).getInfo()
-    if area_km2 > 1_500_000:       # Biomas gigantes (ex: Amazônia)
+    # === ESCALA DINÂMICA baseada em area_km2_hint (calculada localmente, sem getInfo()) ===
+    # Amazônia (~5,5M km²): scale=500 ainda causava timeout porque a geometria complexa
+    # mais o composito Sentinel-2 ultrapassavam o limite de 5min do getInfo().
+    # Solução: escala 1000m para biomas gigantes + simplificação da geometria no GEE.
+    area_km2 = area_km2_hint  # recebido de fora, calculado via Shapely (sem chamada GEE)
+    if area_km2 > 1_500_000:       # Biomas gigantes (ex: Amazônia ~5,5M km²)
+        scale = 1000
+        max_error_simplify = 10000  # ~10 km de tolerância — sem impacto visual em 1000m
+        tile_scale = 32
+    elif area_km2 > 500_000:       # Estados grandes (AM, PA, MT) / Cerrado
         scale = 500
-    elif area_km2 > 500_000:       # Estados grandes (AM, PA, MT)
-        scale = 300
+        max_error_simplify = 5000
+        tile_scale = 16
     elif area_km2 > 100_000:       # Estados médios
-        scale = 150
+        scale = 200
+        max_error_simplify = 1000
+        tile_scale = 8
     elif area_km2 > 10_000:        # Estados pequenos / regiões
         scale = 100
+        max_error_simplify = 500
+        tile_scale = 4
     else:                          # Municípios e áreas pequenas
         scale = 50
-    # =========================================================
+        max_error_simplify = 100
+        tile_scale = 2
+    # ========================================================================================
+
+    # === SIMPLIFICAÇÃO DA GEOMETRIA NO GEE ===
+    # Amazônia do geobr tem milhares de vértices. Enviar geometria complexa ao GEE
+    # lentifica filterBounds, clip e reduceRegion. Simplificar com max_error adequado
+    # não afeta o resultado a escalas de centenas de metros.
+    if area_km2 > 10_000:
+        poly = poly.simplify(maxError=max_error_simplify)
+    # ==========================================
 
     # Datas para o Sentinel (1 mês antes e o mês atual)
     data_fim = datetime(ano, mes, 28)
@@ -129,9 +148,9 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
     stats = sld_intervals.reduceRegion(
         reducer=ee.Reducer.frequencyHistogram(),
         geometry=poly,
-        scale=scale,      # ✅ escala dinâmica conforme tamanho da região
+        scale=scale,           # ✅ escala dinâmica conforme tamanho da região
         maxPixels=1e13,
-        tileScale=16,
+        tileScale=tile_scale,  # ✅ também dinâmico: 32 para Amazônia evita OOM no GEE
         bestEffort=True
     ).getInfo()
 
@@ -142,12 +161,14 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
     if stats:
         hist = list(stats.values())[0]
         if isinstance(hist, dict):
-            # ✅ Área correta: usa scale² m²/pixel (antes era fixo 400 = 20²,
-            #    incorreto para escalas maiores que 20m)
+            # ✅ Área correta: usa scale² m²/pixel
             pixel_area_km2 = (scale * scale) / 1e6
             for k, v in hist.items():
                 area = v * pixel_area_km2
                 res_stats[classes.get(int(float(k)), 'Outros')] = round(area, 2)
+        elif not hist:
+            # Histograma vazio = nenhum pixel queimado no período — retorna vazio graciosamente
+            pass
 
     return res_stats
 
@@ -437,13 +458,23 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
 
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
-def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
+def _construir_dnbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=None):
     # 1. LEITURA CORRETA DA GEOMETRIA (Igual ao seu calcular_stats_nbr)
     geom_dict = json.loads(geom_json_str)
     if 'features' in geom_dict:
         poly = ee.Geometry(geom_dict['features'][0]['geometry'])
     else:
         poly = ee.Geometry(geom_dict)
+
+    # 1b. SIMPLIFICAÇÃO DA GEOMETRIA — crítico para Amazônia
+    # Geometria complexa do geobr tem milhares de vértices; simplificar
+    # reduz o tempo de getMapId() e torna o mapa renderizável em ~2s.
+    if area_km2_hint > 1_500_000:
+        poly = poly.simplify(maxError=10000)
+    elif area_km2_hint > 500_000:
+        poly = poly.simplify(maxError=5000)
+    elif area_km2_hint > 10_000:
+        poly = poly.simplify(maxError=1000)
 
     # 2. JANELA TEMPORAL EXPANDIDA (Garante que sempre ache imagens limpas)
     data_ref = datetime(ano, mes, 1)
@@ -621,6 +652,11 @@ if st.session_state.gerar_dashboard:
         geom_unida = limite.geometry.union_all()
         ee_geom_complex = ee.Geometry(geom_unida.__geo_interface__)
         geom_json_str = json.dumps(geom_unida.__geo_interface__, sort_keys=True)
+
+        # ✅ Área calculada localmente (via GeoPandas/Shapely) — sem nenhuma chamada GEE
+        # Isso elimina o poly.area().getInfo() que antes travava por 30-60s na Amazônia
+        _limite_proj = limite.to_crs("EPSG:6933")          # projeção equal-area mundial
+        area_km2_local = float(_limite_proj.geometry.union_all().area / 1e6)
 
         df_ranking_areas = pd.DataFrame()
         areas_afetadas = gpd.GeoDataFrame()
@@ -1385,15 +1421,28 @@ if st.session_state.gerar_dashboard:
                         nbr_ok = False
                         stats_sev = {}
                         dnbr_img = None
+
+                        # Aviso antecipado para Amazônia (> 1,5 M km²)
+                        if area_km2_local > 1_500_000:
+                            st.info(
+                                "🌿 **Amazônia detectada:** o cálculo usa resolução de 1 km "
+                                "para evitar timeout no GEE. Os gráficos de severidade "
+                                "são estatisticamente representativos mesmo nessa escala."
+                            )
+
                         try:
                             # 1) Stats cacheados
                             stats_sev = calcular_stats_nbr(
-                                geom_json_str, ano_modis, mes_modis, area_queimada_img
+                                geom_json_str, ano_modis, mes_modis,
+                                area_km2_hint=area_km2_local,
+                                _mascara_modis=area_queimada_img
                             )
-                            
+
                             # 2) Imagem GEE reconstruída
                             _, dnbr_img = _construir_dnbr(
-                                geom_json_str, ano_modis, mes_modis, area_queimada_img
+                                geom_json_str, ano_modis, mes_modis,
+                                area_km2_hint=area_km2_local,
+                                _mascara_modis=area_queimada_img
                             )
                             nbr_ok = True
                         except ValueError as ve:
