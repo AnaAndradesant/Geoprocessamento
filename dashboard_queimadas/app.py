@@ -75,7 +75,7 @@ except Exception as e:
 # =====================================================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def calcular_stats_nbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=None):
+def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
     # === LEITURA INTELIGENTE DE GEOJSON ===
     geom_dict = json.loads(geom_json_str)
     if 'features' in geom_dict:
@@ -84,40 +84,21 @@ def calcular_stats_nbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=
         poly = ee.Geometry(geom_dict)
     # ======================================
 
-    # === ESCALA DINÂMICA baseada em area_km2_hint (calculada localmente, sem getInfo()) ===
-    # Amazônia (~5,5M km²): scale=500 ainda causava timeout porque a geometria complexa
-    # mais o composito Sentinel-2 ultrapassavam o limite de 5min do getInfo().
-    # Solução: escala 1000m para biomas gigantes + simplificação da geometria no GEE.
-    area_km2 = area_km2_hint  # recebido de fora, calculado via Shapely (sem chamada GEE)
-    if area_km2 > 1_500_000:       # Biomas gigantes (ex: Amazônia ~5,5M km²)
-        scale = 1000
-        max_error_simplify = 10000  # ~10 km de tolerância — sem impacto visual em 1000m
-        tile_scale = 32
-    elif area_km2 > 500_000:       # Estados grandes (AM, PA, MT) / Cerrado
+    # === ESCALA DINÂMICA baseada na área real da geometria ===
+    # Amazônia (~5,5M km²) com scale=50 geraria bilhões de pixels → timeout garantido.
+    # Aumentar a escala resolve sem perder a proporção do gráfico de severidade.
+    area_km2 = poly.area().divide(1e6).getInfo()
+    if area_km2 > 1_500_000:       # Biomas gigantes (ex: Amazônia)
         scale = 500
-        max_error_simplify = 5000
-        tile_scale = 16
+    elif area_km2 > 500_000:       # Estados grandes (AM, PA, MT)
+        scale = 300
     elif area_km2 > 100_000:       # Estados médios
-        scale = 200
-        max_error_simplify = 1000
-        tile_scale = 8
+        scale = 150
     elif area_km2 > 10_000:        # Estados pequenos / regiões
         scale = 100
-        max_error_simplify = 500
-        tile_scale = 4
     else:                          # Municípios e áreas pequenas
         scale = 50
-        max_error_simplify = 100
-        tile_scale = 2
-    # ========================================================================================
-
-    # === SIMPLIFICAÇÃO DA GEOMETRIA NO GEE ===
-    # Amazônia do geobr tem milhares de vértices. Enviar geometria complexa ao GEE
-    # lentifica filterBounds, clip e reduceRegion. Simplificar com max_error adequado
-    # não afeta o resultado a escalas de centenas de metros.
-    if area_km2 > 10_000:
-        poly = poly.simplify(maxError=max_error_simplify)
-    # ==========================================
+    # =========================================================
 
     # Datas para o Sentinel (1 mês antes e o mês atual)
     data_fim = datetime(ano, mes, 28)
@@ -148,9 +129,9 @@ def calcular_stats_nbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=
     stats = sld_intervals.reduceRegion(
         reducer=ee.Reducer.frequencyHistogram(),
         geometry=poly,
-        scale=scale,           # ✅ escala dinâmica conforme tamanho da região
+        scale=scale,      # ✅ escala dinâmica conforme tamanho da região
         maxPixels=1e13,
-        tileScale=tile_scale,  # ✅ também dinâmico: 32 para Amazônia evita OOM no GEE
+        tileScale=16,
         bestEffort=True
     ).getInfo()
 
@@ -161,14 +142,12 @@ def calcular_stats_nbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=
     if stats:
         hist = list(stats.values())[0]
         if isinstance(hist, dict):
-            # ✅ Área correta: usa scale² m²/pixel
+            # ✅ Área correta: usa scale² m²/pixel (antes era fixo 400 = 20²,
+            #    incorreto para escalas maiores que 20m)
             pixel_area_km2 = (scale * scale) / 1e6
             for k, v in hist.items():
                 area = v * pixel_area_km2
                 res_stats[classes.get(int(float(k)), 'Outros')] = round(area, 2)
-        elif not hist:
-            # Histograma vazio = nenhum pixel queimado no período — retorna vazio graciosamente
-            pass
 
     return res_stats
 
@@ -371,10 +350,6 @@ def calcular_area_queimada_modis(geom_json, ano, mes=None):
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_anomalia_modis(geom_json_str, ano_ref):
     ee_geom = ee.Geometry(json.loads(geom_json_str))
-
-    # Simplifica a geometria UMA VEZ aqui fora
-    geom_simplificada = ee_geom.simplify(maxError=5000)
-
     anos_historico = list(range(2001, ano_ref))
     anos_ee = ee.List(anos_historico)
     n_anos = len(anos_historico)
@@ -385,13 +360,16 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
     }
 
     def get_area_km2(img):
+        # Simplifica um pouco mais a borda da Amazônia (5000 metros)
+        geom_simplificada = ee_geom.simplify(maxError=5000)
+        
         raw = (
             ee.Image.pixelArea().divide(1e6)
             .updateMask(img.gt(0))
             .reduceRegion(
                 reducer=ee.Reducer.sum(),
-                geometry=geom_simplificada,
-                scale=10000,
+                geometry=geom_simplificada,   
+                scale=10000,                  # <-- AUMENTADO PARA 10km (O pulo do gato)
                 maxPixels=1e13,
                 tileScale=16,
                 bestEffort=True
@@ -405,8 +383,8 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
         img_ref = (
             ee.ImageCollection('MODIS/061/MCD64A1')
             .filterDate(ini_ref, ini_ref.advance(1, 'month'))
-            .filterBounds(geom_simplificada)
-            .select('BurnDate').max().clip(geom_simplificada)
+            .filterBounds(ee_geom)
+            .select('BurnDate').max().clip(ee_geom)
         )
         area_ref = ee.Number(get_area_km2(img_ref))
 
@@ -416,8 +394,8 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
             img_h = (
                 ee.ImageCollection('MODIS/061/MCD64A1')
                 .filterDate(ini_h, ini_h.advance(1, 'month'))
-                .filterBounds(geom_simplificada)
-                .select('BurnDate').max().clip(geom_simplificada)
+                .filterBounds(ee_geom)
+                .select('BurnDate').max().clip(ee_geom)
             )
             return get_area_km2(img_h)
 
@@ -434,70 +412,54 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
             'media_hist': media_hist
         })
 
-    # ── PROCESSAMENTO EM LOTES com retry/backoff ──────────────────────────────
-    # Problema: 1 único getInfo() com 12 meses × ~23 anos = ~276 reduceRegion
-    # simultâneos excede o limite de agregações concorrentes do Earth Engine (429).
-    # Solução: processar BATCH_SIZE meses por vez (~92 agregações/lote com 4 meses)
-    # e aplicar retry com backoff exponencial em caso de sobrecarga transitória.
-    BATCH_SIZE = 4   # reduzir para 2 se o erro persistir
-    MAX_RETRIES = 4
-    registros = []
-
-    for batch_start in range(1, 13, BATCH_SIZE):
-        batch_meses = list(range(batch_start, min(batch_start + BATCH_SIZE, 13)))
-        meses_ee_batch = ee.List(batch_meses)
-
-        for tentativa in range(1, MAX_RETRIES + 1):
+    meses_ee = ee.List.sequence(1, 12)
+    # Vamos criar um dicionário vazio que simula o resultado do Earth Engine
+    resultado = {'features': []}
+    
+    for mes in range(1, 13):
+        sucesso = False
+        
+        # Tenta pedir os dados para o Google até 3 vezes
+        for tentativa in range(3):
             try:
-                resultado = ee.FeatureCollection(
-                    meses_ee_batch.map(calc_mes_feature)
-                ).getInfo()
-                break  # sucesso — sai do loop de retry
+                feature_mes = ee.Feature(calc_mes_feature(mes)).getInfo()
+                resultado['features'].append(feature_mes)
+                sucesso = True
+                break # Se deu certo, sai do loop
             except Exception as e:
-                msg = str(e)
-                if 'Too many concurrent aggregations' in msg or '429' in msg:
-                    if tentativa < MAX_RETRIES:
-                        wait = 2 ** tentativa  # 2s, 4s, 8s, 16s
-                        time.sleep(wait)
-                        continue
-                raise  # outro tipo de erro ou esgotou tentativas → propaga
+                time.sleep(2) # Espera 2 segundos se o Google engasgar
+                
+        # Se depois de 3 tentativas falhar, injeta um valor zerado pra não quebrar o gráfico
+        if not sucesso:
+            resultado['features'].append({'type': 'Feature', 'properties': {'mes': mes, 'area_ref': 0, 'area_hist': 0}})
+            
+        # Tira o st.progress e usa print (Isso não quebra o cache do Streamlit)
+        print(f"Calculado mês {mes}/12 para {val_sel}...")
 
-        for feat in resultado['features']:
-            p = feat['properties']
-            mes      = int(p['mes'])
-            val_ref  = round(float(p.get('area_ref')  or 0), 2)
-            media    = round(float(p.get('media_hist') or 0), 2)
-            anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
-            registros.append({
-                'Mês': mes,
-                'Mês Nome': meses_map[mes],
-                f'Área {ano_ref} (km²)': val_ref,
-                'Média Histórica (km²)': media,
-                'Anomalia (%)': anomalia
-            })
-
-        # Pausa entre lotes para não sobrecarregar a fila do EE
-        time.sleep(1)
+    registros = []
+    for feat in resultado['features']:
+        p = feat['properties']
+        mes      = int(p['mes'])
+        val_ref  = round(float(p.get('area_ref')  or 0), 2)
+        media    = round(float(p.get('media_hist') or 0), 2)
+        anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
+        registros.append({
+            'Mês': mes,
+            'Mês Nome': meses_map[mes],
+            f'Área {ano_ref} (km²)': val_ref,
+            'Média Histórica (km²)': media,
+            'Anomalia (%)': anomalia
+        })
 
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
-def _construir_dnbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=None):
+def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
     # 1. LEITURA CORRETA DA GEOMETRIA (Igual ao seu calcular_stats_nbr)
     geom_dict = json.loads(geom_json_str)
     if 'features' in geom_dict:
         poly = ee.Geometry(geom_dict['features'][0]['geometry'])
     else:
         poly = ee.Geometry(geom_dict)
-
-    # 1b. SIMPLIFICAÇÃO DA GEOMETRIA — crítico para Amazônia
-    # Geometria complexa do geobr tem milhares de vértices; simplificar
-    # reduz o tempo de getMapId() e torna o mapa renderizável em ~2s.
-    if area_km2_hint > 1_500_000:
-        poly = poly.simplify(maxError=10000)
-    elif area_km2_hint > 500_000:
-        poly = poly.simplify(maxError=5000)
-    elif area_km2_hint > 10_000:
-        poly = poly.simplify(maxError=1000)
 
     # 2. JANELA TEMPORAL EXPANDIDA (Garante que sempre ache imagens limpas)
     data_ref = datetime(ano, mes, 1)
@@ -676,11 +638,6 @@ if st.session_state.gerar_dashboard:
         ee_geom_complex = ee.Geometry(geom_unida.__geo_interface__)
         geom_json_str = json.dumps(geom_unida.__geo_interface__, sort_keys=True)
 
-        # ✅ Área calculada localmente (via GeoPandas/Shapely) — sem nenhuma chamada GEE
-        # Isso elimina o poly.area().getInfo() que antes travava por 30-60s na Amazônia
-        _limite_proj = limite.to_crs("EPSG:6933")          # projeção equal-area mundial
-        area_km2_local = float(_limite_proj.geometry.union_all().area / 1e6)
-
         df_ranking_areas = pd.DataFrame()
         areas_afetadas = gpd.GeoDataFrame()
         df_rec = pd.DataFrame()
@@ -838,10 +795,7 @@ if st.session_state.gerar_dashboard:
                             .filterBounds(ee_geom_complex)
                         )
                         stats_mun = img_area_km2.reduceRegions(
-                            collection=muns_ee,
-                            reducer=ee.Reducer.sum(),
-                            scale=1000,
-                            tileScale=4    # ✅ evita timeout em biomas grandes (ex: Amazônia)
+                            collection=muns_ee, reducer=ee.Reducer.sum(), scale=1000
                         ).getInfo()
                         recs_mun = [
                             {
@@ -882,10 +836,7 @@ if st.session_state.gerar_dashboard:
                             val = area_calc.reduceRegion(
                                 reducer=ee.Reducer.sum(),
                                 geometry=geom_temporal,
-                                scale=1000,
-                                maxPixels=1e13,    # ✅ era 1e10, insuficiente pra Amazônia
-                                tileScale=4,       # ✅ divide o cálculo em blocos
-                                bestEffort=True    # ✅ ajusta escala automaticamente se necessário
+                                scale=1000, maxPixels=1e10
                             ).get('area')
                             return ee.Feature(None, {'mes': m_num, 'area': val})
 
@@ -1264,17 +1215,7 @@ if st.session_state.gerar_dashboard:
                     )
 
                     with st.spinner("Calculando comparação histórica..."):
-                        df_anomalia = pd.DataFrame()
-                        try:
-                            df_anomalia = calcular_anomalia_modis(geom_json_str, ano_modis)
-                        except Exception as _e_anom:
-                            st.error(
-                                f"⚠️ Falha ao calcular anomalia histórica.\n\n"
-                                f"**Tipo:** `{type(_e_anom).__name__}`\n\n"
-                                f"**Mensagem:** {_e_anom}"
-                            )
-                            with st.expander("📋 Traceback completo", expanded=False):
-                                st.code(traceback.format_exc(), language="python")
+                        df_anomalia = calcular_anomalia_modis(geom_json_str, ano_modis)
 
                     if not df_anomalia.empty:
                         col_ano = f'Área {ano_modis} (km²)'
@@ -1447,103 +1388,6 @@ if st.session_state.gerar_dashboard:
                     "Classificação seguindo o padrão **USGS**."
                 )
 
-                with st.expander("📖 Como interpretar as classes de severidade dNBR?", expanded=False):
-                    st.markdown("""
-                    <style>
-                    .dnbr-bar { display:flex; width:100%; height:36px; border-radius:6px; overflow:hidden; margin-bottom:6px; }
-                    .dnbr-bar div { display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:600; }
-                    .dnbr-ticks { display:flex; justify-content:space-between; font-size:11px; color:#888; margin-bottom:18px; padding:0 1px; }
-                    .dnbr-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
-                    .dnbr-card { display:flex; border:0.5px solid rgba(128,128,128,0.25); border-radius:8px; overflow:hidden; }
-                    .dnbr-stripe { width:10px; flex-shrink:0; }
-                    .dnbr-body { padding:8px 10px; }
-                    .dnbr-name { font-size:13px; font-weight:600; margin:0 0 2px; }
-                    .dnbr-range { font-size:11px; color:#888; margin:0 0 4px; font-family:monospace; }
-                    .dnbr-desc { font-size:12px; color:#aaa; margin:0; line-height:1.4; }
-                    .dnbr-formula { background:rgba(128,128,128,0.1); border:0.5px solid rgba(128,128,128,0.2);
-                                    border-radius:8px; padding:10px 14px; font-size:13px;
-                                    margin-bottom:16px; line-height:1.8; }
-                    .dnbr-formula code { background:rgba(128,128,128,0.15); border-radius:4px;
-                                         padding:1px 6px; font-size:12px; font-family:monospace; }
-                    </style>
-
-                    <div class="dnbr-formula">
-                        <b>Como é calculado:</b><br>
-                        <code>NBR = (B8 − B12) ÷ (B8 + B12)</code> &nbsp;→&nbsp; aplicado na imagem <b>pré-fogo</b> e na <b>pós-fogo</b><br>
-                        <code>dNBR = NBR_pré − NBR_pós</code> &nbsp;×&nbsp; 1000 &nbsp;&nbsp;
-                        <span style="color:#888; font-size:12px;">(multiplicado para trabalhar com inteiros)</span>
-                    </div>
-
-                    <div class="dnbr-bar">
-                        <div style="width:13%; background:#1a9850; color:#fff;">Reg.</div>
-                        <div style="width:22%; background:#91cf60; color:#3d5a10;">Não afetado</div>
-                        <div style="width:18%; background:#fee08b; color:#7a5800;">Baixa</div>
-                        <div style="width:18%; background:#fc8d59; color:#5c1a00;">Moderada</div>
-                        <div style="width:15%; background:#d73027; color:#fff;">Mod-Alta</div>
-                        <div style="width:14%; background:#7a0403; color:#fff;">Alta</div>
-                    </div>
-                    <div class="dnbr-ticks">
-                        <span>≪ −100</span>
-                        <span>−100</span>
-                        <span>+100</span>
-                        <span>+270</span>
-                        <span>+440</span>
-                        <span>+660</span>
-                        <span>≫ 660</span>
-                    </div>
-
-                    <div class="dnbr-grid">
-                        <div class="dnbr-card">
-                            <div class="dnbr-stripe" style="background:#1a9850;"></div>
-                            <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#1a9850;">🌱 Regeneração</p>
-                                <p class="dnbr-range">dNBR &lt; −100</p>
-                                <p class="dnbr-desc">Vegetação cresceu após incêndio anterior. NBR aumentou — brotos novos refletem mais NIR.</p>
-                            </div>
-                        </div>
-                        <div class="dnbr-card">
-                            <div class="dnbr-stripe" style="background:#91cf60;"></div>
-                            <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#5a8a20;">🌿 Não afetado</p>
-                                <p class="dnbr-range">−100 a +100</p>
-                                <p class="dnbr-desc">Vegetação intacta ou variação sazonal normal. Fogo não atingiu essa área.</p>
-                            </div>
-                        </div>
-                        <div class="dnbr-card">
-                            <div class="dnbr-stripe" style="background:#fee08b;"></div>
-                            <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#a07000;">🟡 Baixa severidade</p>
-                                <p class="dnbr-range">+100 a +270</p>
-                                <p class="dnbr-desc">Queima superficial de sub-bosque. Dossel parcialmente afetado, recuperação em meses.</p>
-                            </div>
-                        </div>
-                        <div class="dnbr-card">
-                            <div class="dnbr-stripe" style="background:#fc8d59;"></div>
-                            <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#c04010;">🟠 Moderada</p>
-                                <p class="dnbr-range">+270 a +440</p>
-                                <p class="dnbr-desc">Danos significativos ao dossel. Solo parcialmente exposto, recuperação lenta (1–3 anos).</p>
-                            </div>
-                        </div>
-                        <div class="dnbr-card">
-                            <div class="dnbr-stripe" style="background:#d73027;"></div>
-                            <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#d73027;">🔴 Moderada-Alta</p>
-                                <p class="dnbr-range">+440 a +660</p>
-                                <p class="dnbr-desc">Destruição extensa do dossel. Solo exposto, cinzas visíveis. Recuperação de 3–5 anos.</p>
-                            </div>
-                        </div>
-                        <div class="dnbr-card">
-                            <div class="dnbr-stripe" style="background:#7a0403;"></div>
-                            <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#7a0403;">⬛ Alta severidade</p>
-                                <p class="dnbr-range">dNBR &gt; +660</p>
-                                <p class="dnbr-desc">Destruição total da cobertura. Solo nu, carvão, cinzas. Risco de erosão alto.</p>
-                            </div>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
                 col_nbr1, col_nbr2 = st.columns([1.4, 1])
 
                 with col_nbr1:
@@ -1551,57 +1395,21 @@ if st.session_state.gerar_dashboard:
                         nbr_ok = False
                         stats_sev = {}
                         dnbr_img = None
-
-                        # Aviso antecipado para Amazônia (> 1,5 M km²)
-                        if area_km2_local > 1_500_000:
-                            st.info(
-                                "🌿 **Amazônia detectada:** o cálculo usa resolução de 1 km "
-                                "para evitar timeout no GEE. Os gráficos de severidade "
-                                "são estatisticamente representativos mesmo nessa escala."
-                            )
-
-                        _debug_nbr = st.toggle(
-                            "🐛 Mostrar log de depuração do dNBR",
-                            value=False,
-                            key="toggle_debug_nbr"
-                        )
-
-                        def _log(msg):
-                            if _debug_nbr:
-                                st.caption(f"⚙️ {msg}")
-
                         try:
-                            _log(f"Área local estimada: {area_km2_local:,.0f} km²")
-                            _log(f"Parâmetros: ano={ano_modis}, mês={mes_modis}")
-                            _log(f"Máscara MODIS disponível: {area_queimada_img is not None}")
-
                             # 1) Stats cacheados
-                            _log("Passo 1/2 — chamando calcular_stats_nbr()...")
                             stats_sev = calcular_stats_nbr(
-                                geom_json_str, ano_modis, mes_modis,
-                                area_km2_hint=area_km2_local,
-                                _mascara_modis=area_queimada_img
+                                geom_json_str, ano_modis, mes_modis, area_queimada_img
                             )
-                            _log(f"Stats retornados: {stats_sev}")
-
+                            
                             # 2) Imagem GEE reconstruída
-                            _log("Passo 2/2 — chamando _construir_dnbr()...")
                             _, dnbr_img = _construir_dnbr(
-                                geom_json_str, ano_modis, mes_modis,
-                                area_km2_hint=area_km2_local,
-                                _mascara_modis=area_queimada_img
+                                geom_json_str, ano_modis, mes_modis, area_queimada_img
                             )
-                            _log("dNBR construído com sucesso.")
                             nbr_ok = True
-
                         except ValueError as ve:
                             st.warning(f"⚠️ {ve}")
-                            if _debug_nbr:
-                                st.code(traceback.format_exc(), language="python")
                         except Exception as e:
-                            st.error(f"⚠️ Erro ao processar Sentinel-2: **{type(e).__name__}**: {e}")
-                            if _debug_nbr:
-                                st.code(traceback.format_exc(), language="python")
+                            st.error(f"⚠️ Erro inesperado ao processar Sentinel-2: {e}\n\nTente uma região menor ou um mês diferente.")
 
                     if nbr_ok and dnbr_img is not None:
                         try:
@@ -1655,9 +1463,7 @@ if st.session_state.gerar_dashboard:
                             st_folium(m_nbr, width=None, height=620, returned_objects=[], key=_nbr_key)
                             
                         except Exception as erro_mapa:
-                            st.error(f"⚠️ Erro ao desenhar o mapa dNBR: **{type(erro_mapa).__name__}**: {erro_mapa}")
-                            if _debug_nbr:
-                                st.code(traceback.format_exc(), language="python")
+                            st.error(f"⚠️ Os dados foram calculados, mas ocorreu um erro ao desenhar o mapa Folium: {erro_mapa}")
 
                 with col_nbr2:
                     if stats_sev:       
@@ -1717,7 +1523,12 @@ if st.session_state.gerar_dashboard:
                             st.metric("🔥 Total Afetado", f"{area_total_afetada:.2f} km²")
 
                         st.markdown("---")
-                        st.caption("💡 Abra o guia de interpretação acima para detalhes de cada classe.")
+                        st.markdown(
+                            "**Interpretação:**\n\n"
+                            "- **Baixa:** vegetação parcialmente afetada, recuperação rápida\n"
+                            "- **Moderada:** danos significativos ao dossel\n"
+                            "- **Alta:** destruição quase total da cobertura vegetal"
+                        )
 
         # ----------------------------------------------------------
         # ABA 4 — EXPORTAR DADOS
