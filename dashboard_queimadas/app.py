@@ -1527,25 +1527,48 @@ if st.session_state.gerar_dashboard:
                                 "são estatisticamente representativos mesmo nessa escala."
                             )
 
+                        _debug_nbr = st.toggle(
+                            "🐛 Mostrar log de depuração do dNBR",
+                            value=False,
+                            key="toggle_debug_nbr"
+                        )
+
+                        def _log(msg):
+                            if _debug_nbr:
+                                st.caption(f"⚙️ {msg}")
+
                         try:
+                            _log(f"Área local estimada: {area_km2_local:,.0f} km²")
+                            _log(f"Parâmetros: ano={ano_modis}, mês={mes_modis}")
+                            _log(f"Máscara MODIS disponível: {area_queimada_img is not None}")
+
                             # 1) Stats cacheados
+                            _log("Passo 1/2 — chamando calcular_stats_nbr()...")
                             stats_sev = calcular_stats_nbr(
                                 geom_json_str, ano_modis, mes_modis,
                                 area_km2_hint=area_km2_local,
                                 _mascara_modis=area_queimada_img
                             )
+                            _log(f"Stats retornados: {stats_sev}")
 
                             # 2) Imagem GEE reconstruída
+                            _log("Passo 2/2 — chamando _construir_dnbr()...")
                             _, dnbr_img = _construir_dnbr(
                                 geom_json_str, ano_modis, mes_modis,
                                 area_km2_hint=area_km2_local,
                                 _mascara_modis=area_queimada_img
                             )
+                            _log("dNBR construído com sucesso.")
                             nbr_ok = True
+
                         except ValueError as ve:
                             st.warning(f"⚠️ {ve}")
+                            if _debug_nbr:
+                                st.code(traceback.format_exc(), language="python")
                         except Exception as e:
-                            st.error(f"⚠️ Erro inesperado ao processar Sentinel-2: {e}\n\nTente uma região menor ou um mês diferente.")
+                            st.error(f"⚠️ Erro ao processar Sentinel-2: **{type(e).__name__}**: {e}")
+                            if _debug_nbr:
+                                st.code(traceback.format_exc(), language="python")
 
                     if nbr_ok and dnbr_img is not None:
                         try:
@@ -1599,7 +1622,9 @@ if st.session_state.gerar_dashboard:
                             st_folium(m_nbr, width=None, height=620, returned_objects=[], key=_nbr_key)
                             
                         except Exception as erro_mapa:
-                            st.error(f"⚠️ Os dados foram calculados, mas ocorreu um erro ao desenhar o mapa Folium: {erro_mapa}")
+                            st.error(f"⚠️ Erro ao desenhar o mapa dNBR: **{type(erro_mapa).__name__}**: {erro_mapa}")
+                            if _debug_nbr:
+                                st.code(traceback.format_exc(), language="python")
 
                 with col_nbr2:
                     if stats_sev:       
