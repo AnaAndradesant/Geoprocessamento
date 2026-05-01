@@ -427,47 +427,46 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
             'media_hist': media_hist
         })
 
-    # ── PROCESSAMENTO EM LOTES com retry/backoff ──────────────────────────────
-    # Problema: 1 único getInfo() com 12 meses × ~23 anos = ~276 reduceRegion
-    # simultâneos excede o limite de agregações do Earth Engine (erro 429).
-    # Solução: processar BATCH_SIZE meses por vez + retry com backoff exponencial.
-    BATCH_SIZE = 4   # reduzir para 2 se o erro persistir
-    MAX_RETRIES = 4
+    # ── PROCESSAMENTO MÊS A MÊS com retry/backoff ────────────────────────────
+    # Para a Amazônia (~5,5M km²), mesmo lotes de 4 meses geram
+    # 4 × 23 anos = ~92 reduceRegion simultâneos → erro 429.
+    # Processando 1 mês por vez (1 × 23 = ~23 operações), ficamos bem abaixo
+    # do limite do EE para qualquer região do Brasil.
+    MAX_RETRIES = 5
     registros = []
 
-    for batch_start in range(1, 13, BATCH_SIZE):
-        batch_meses = list(range(batch_start, min(batch_start + BATCH_SIZE, 13)))
-        meses_ee_batch = ee.List(batch_meses)
-
+    for mes in range(1, 13):
+        feat_resultado = None
         for tentativa in range(1, MAX_RETRIES + 1):
             try:
-                resultado = ee.FeatureCollection(
-                    meses_ee_batch.map(calc_mes_feature)
-                ).getInfo()
+                feat_resultado = ee.Feature(calc_mes_feature(mes)).getInfo()
                 break
             except Exception as e:
                 msg = str(e)
                 if 'Too many concurrent aggregations' in msg or '429' in msg:
                     if tentativa < MAX_RETRIES:
-                        time.sleep(2 ** tentativa)  # 2s, 4s, 8s, 16s
+                        time.sleep(2 ** tentativa)  # 2s, 4s, 8s, 16s, 32s
                         continue
-                raise
+                # Outro erro ou esgotou tentativas: injeta zero e continua
+                feat_resultado = {
+                    'type': 'Feature',
+                    'properties': {'mes': mes, 'area_ref': 0, 'media_hist': 0}
+                }
+                break
 
-        for feat in resultado['features']:
-            p = feat['properties']
-            mes      = int(p['mes'])
-            val_ref  = round(float(p.get('area_ref')  or 0), 2)
-            media    = round(float(p.get('media_hist') or 0), 2)
-            anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
-            registros.append({
-                'Mês': mes,
-                'Mês Nome': meses_map[mes],
-                f'Área {ano_ref} (km²)': val_ref,
-                'Média Histórica (km²)': media,
-                'Anomalia (%)': anomalia
-            })
+        p = feat_resultado['properties']
+        val_ref  = round(float(p.get('area_ref')  or 0), 2)
+        media    = round(float(p.get('media_hist') or 0), 2)
+        anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
+        registros.append({
+            'Mês': mes,
+            'Mês Nome': meses_map[mes],
+            f'Área {ano_ref} (km²)': val_ref,
+            'Média Histórica (km²)': media,
+            'Anomalia (%)': anomalia
+        })
 
-        time.sleep(1)  # pausa entre lotes para não sobrecarregar a fila do EE
+        time.sleep(0.5)  # pausa entre meses para não sobrecarregar a fila do EE
 
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
