@@ -75,7 +75,7 @@ except Exception as e:
 # =====================================================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
+def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hint=0):
     # === LEITURA INTELIGENTE DE GEOJSON ===
     geom_dict = json.loads(geom_json_str)
     if 'features' in geom_dict:
@@ -84,21 +84,35 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
         poly = ee.Geometry(geom_dict)
     # ======================================
 
-    # === ESCALA DINÂMICA baseada na área real da geometria ===
-    # Amazônia (~5,5M km²) com scale=50 geraria bilhões de pixels → timeout garantido.
-    # Aumentar a escala resolve sem perder a proporção do gráfico de severidade.
-    area_km2 = poly.area().divide(1e6).getInfo()
-    if area_km2 > 1_500_000:       # Biomas gigantes (ex: Amazônia)
+    # === ESCALA E SIMPLIFICAÇÃO DINÂMICAS baseadas em area_km2_hint ===
+    # area_km2_hint é calculado localmente via Shapely — zero chamadas GEE bloqueantes.
+    # Amazônia (~5,5M km²): scale=1000 + simplify 10km evita timeout garantido.
+    area_km2 = area_km2_hint
+    if area_km2 > 1_500_000:       # Biomas gigantes (ex: Amazônia ~5,5M km²)
+        scale = 1000
+        max_error_simplify = 10000
+        tile_scale = 32
+    elif area_km2 > 500_000:       # Estados grandes (AM, PA, MT) / Cerrado
         scale = 500
-    elif area_km2 > 500_000:       # Estados grandes (AM, PA, MT)
-        scale = 300
+        max_error_simplify = 5000
+        tile_scale = 16
     elif area_km2 > 100_000:       # Estados médios
-        scale = 150
+        scale = 200
+        max_error_simplify = 1000
+        tile_scale = 8
     elif area_km2 > 10_000:        # Estados pequenos / regiões
         scale = 100
+        max_error_simplify = 500
+        tile_scale = 4
     else:                          # Municípios e áreas pequenas
         scale = 50
-    # =========================================================
+        max_error_simplify = 100
+        tile_scale = 2
+    # ==================================================================
+
+    # Simplifica a geometria no GEE — crítico para Amazônia (milhares de vértices)
+    if area_km2 > 10_000:
+        poly = poly.simplify(maxError=max_error_simplify)
 
     # Datas para o Sentinel (1 mês antes e o mês atual)
     data_fim = datetime(ano, mes, 28)
@@ -129,9 +143,9 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
     stats = sld_intervals.reduceRegion(
         reducer=ee.Reducer.frequencyHistogram(),
         geometry=poly,
-        scale=scale,      # ✅ escala dinâmica conforme tamanho da região
+        scale=scale,
         maxPixels=1e13,
-        tileScale=16,
+        tileScale=tile_scale,
         bestEffort=True
     ).getInfo()
 
@@ -142,12 +156,12 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None):
     if stats:
         hist = list(stats.values())[0]
         if isinstance(hist, dict):
-            # ✅ Área correta: usa scale² m²/pixel (antes era fixo 400 = 20²,
-            #    incorreto para escalas maiores que 20m)
             pixel_area_km2 = (scale * scale) / 1e6
             for k, v in hist.items():
                 area = v * pixel_area_km2
                 res_stats[classes.get(int(float(k)), 'Outros')] = round(area, 2)
+        elif not hist:
+            pass  # histograma vazio = sem pixels queimados no período
 
     return res_stats
 
@@ -350,6 +364,10 @@ def calcular_area_queimada_modis(geom_json, ano, mes=None):
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_anomalia_modis(geom_json_str, ano_ref):
     ee_geom = ee.Geometry(json.loads(geom_json_str))
+
+    # Simplifica a geometria UMA VEZ fora do loop — evita recriá-la a cada imagem
+    geom_simplificada = ee_geom.simplify(maxError=5000)
+
     anos_historico = list(range(2001, ano_ref))
     anos_ee = ee.List(anos_historico)
     n_anos = len(anos_historico)
@@ -360,16 +378,13 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
     }
 
     def get_area_km2(img):
-        # Simplifica um pouco mais a borda da Amazônia (5000 metros)
-        geom_simplificada = ee_geom.simplify(maxError=5000)
-        
         raw = (
             ee.Image.pixelArea().divide(1e6)
             .updateMask(img.gt(0))
             .reduceRegion(
                 reducer=ee.Reducer.sum(),
-                geometry=geom_simplificada,   
-                scale=10000,                  # <-- AUMENTADO PARA 10km (O pulo do gato)
+                geometry=geom_simplificada,
+                scale=10000,
                 maxPixels=1e13,
                 tileScale=16,
                 bestEffort=True
@@ -383,8 +398,8 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
         img_ref = (
             ee.ImageCollection('MODIS/061/MCD64A1')
             .filterDate(ini_ref, ini_ref.advance(1, 'month'))
-            .filterBounds(ee_geom)
-            .select('BurnDate').max().clip(ee_geom)
+            .filterBounds(geom_simplificada)
+            .select('BurnDate').max().clip(geom_simplificada)
         )
         area_ref = ee.Number(get_area_km2(img_ref))
 
@@ -394,8 +409,8 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
             img_h = (
                 ee.ImageCollection('MODIS/061/MCD64A1')
                 .filterDate(ini_h, ini_h.advance(1, 'month'))
-                .filterBounds(ee_geom)
-                .select('BurnDate').max().clip(ee_geom)
+                .filterBounds(geom_simplificada)
+                .select('BurnDate').max().clip(geom_simplificada)
             )
             return get_area_km2(img_h)
 
@@ -412,54 +427,65 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
             'media_hist': media_hist
         })
 
-    meses_ee = ee.List.sequence(1, 12)
-    # Vamos criar um dicionário vazio que simula o resultado do Earth Engine
-    resultado = {'features': []}
-    
-    for mes in range(1, 13):
-        sucesso = False
-        
-        # Tenta pedir os dados para o Google até 3 vezes
-        for tentativa in range(3):
-            try:
-                feature_mes = ee.Feature(calc_mes_feature(mes)).getInfo()
-                resultado['features'].append(feature_mes)
-                sucesso = True
-                break # Se deu certo, sai do loop
-            except Exception as e:
-                time.sleep(2) # Espera 2 segundos se o Google engasgar
-                
-        # Se depois de 3 tentativas falhar, injeta um valor zerado pra não quebrar o gráfico
-        if not sucesso:
-            resultado['features'].append({'type': 'Feature', 'properties': {'mes': mes, 'area_ref': 0, 'area_hist': 0}})
-            
-        # Tira o st.progress e usa print (Isso não quebra o cache do Streamlit)
-        print(f"Calculado mês {mes}/12 para {val_sel}...")
-
+    # ── PROCESSAMENTO EM LOTES com retry/backoff ──────────────────────────────
+    # Problema: 1 único getInfo() com 12 meses × ~23 anos = ~276 reduceRegion
+    # simultâneos excede o limite de agregações do Earth Engine (erro 429).
+    # Solução: processar BATCH_SIZE meses por vez + retry com backoff exponencial.
+    BATCH_SIZE = 4   # reduzir para 2 se o erro persistir
+    MAX_RETRIES = 4
     registros = []
-    for feat in resultado['features']:
-        p = feat['properties']
-        mes      = int(p['mes'])
-        val_ref  = round(float(p.get('area_ref')  or 0), 2)
-        media    = round(float(p.get('media_hist') or 0), 2)
-        anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
-        registros.append({
-            'Mês': mes,
-            'Mês Nome': meses_map[mes],
-            f'Área {ano_ref} (km²)': val_ref,
-            'Média Histórica (km²)': media,
-            'Anomalia (%)': anomalia
-        })
+
+    for batch_start in range(1, 13, BATCH_SIZE):
+        batch_meses = list(range(batch_start, min(batch_start + BATCH_SIZE, 13)))
+        meses_ee_batch = ee.List(batch_meses)
+
+        for tentativa in range(1, MAX_RETRIES + 1):
+            try:
+                resultado = ee.FeatureCollection(
+                    meses_ee_batch.map(calc_mes_feature)
+                ).getInfo()
+                break
+            except Exception as e:
+                msg = str(e)
+                if 'Too many concurrent aggregations' in msg or '429' in msg:
+                    if tentativa < MAX_RETRIES:
+                        time.sleep(2 ** tentativa)  # 2s, 4s, 8s, 16s
+                        continue
+                raise
+
+        for feat in resultado['features']:
+            p = feat['properties']
+            mes      = int(p['mes'])
+            val_ref  = round(float(p.get('area_ref')  or 0), 2)
+            media    = round(float(p.get('media_hist') or 0), 2)
+            anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
+            registros.append({
+                'Mês': mes,
+                'Mês Nome': meses_map[mes],
+                f'Área {ano_ref} (km²)': val_ref,
+                'Média Histórica (km²)': media,
+                'Anomalia (%)': anomalia
+            })
+
+        time.sleep(1)  # pausa entre lotes para não sobrecarregar a fila do EE
 
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
-def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None):
-    # 1. LEITURA CORRETA DA GEOMETRIA (Igual ao seu calcular_stats_nbr)
+def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hint=0):
+    # 1. LEITURA CORRETA DA GEOMETRIA
     geom_dict = json.loads(geom_json_str)
     if 'features' in geom_dict:
         poly = ee.Geometry(geom_dict['features'][0]['geometry'])
     else:
         poly = ee.Geometry(geom_dict)
+
+    # 1b. SIMPLIFICAÇÃO DA GEOMETRIA — crítico para Amazônia
+    if area_km2_hint > 1_500_000:
+        poly = poly.simplify(maxError=10000)
+    elif area_km2_hint > 500_000:
+        poly = poly.simplify(maxError=5000)
+    elif area_km2_hint > 10_000:
+        poly = poly.simplify(maxError=1000)
 
     # 2. JANELA TEMPORAL EXPANDIDA (Garante que sempre ache imagens limpas)
     data_ref = datetime(ano, mes, 1)
@@ -637,6 +663,10 @@ if st.session_state.gerar_dashboard:
         geom_unida = limite.geometry.union_all()
         ee_geom_complex = ee.Geometry(geom_unida.__geo_interface__)
         geom_json_str = json.dumps(geom_unida.__geo_interface__, sort_keys=True)
+
+        # Área calculada localmente via GeoPandas/Shapely — sem chamada GEE bloqueante
+        _limite_proj = limite.to_crs("EPSG:6933")  # projeção equal-area
+        area_km2_local = float(_limite_proj.geometry.union_all().area / 1e6)
 
         df_ranking_areas = pd.DataFrame()
         areas_afetadas = gpd.GeoDataFrame()
@@ -836,7 +866,10 @@ if st.session_state.gerar_dashboard:
                             val = area_calc.reduceRegion(
                                 reducer=ee.Reducer.sum(),
                                 geometry=geom_temporal,
-                                scale=1000, maxPixels=1e10
+                                scale=1000,
+                                maxPixels=1e13,
+                                tileScale=4,
+                                bestEffort=True
                             ).get('area')
                             return ee.Feature(None, {'mes': m_num, 'area': val})
 
@@ -1398,12 +1431,14 @@ if st.session_state.gerar_dashboard:
                         try:
                             # 1) Stats cacheados
                             stats_sev = calcular_stats_nbr(
-                                geom_json_str, ano_modis, mes_modis, area_queimada_img
+                                geom_json_str, ano_modis, mes_modis, area_queimada_img,
+                                area_km2_hint=area_km2_local
                             )
                             
                             # 2) Imagem GEE reconstruída
                             _, dnbr_img = _construir_dnbr(
-                                geom_json_str, ano_modis, mes_modis, area_queimada_img
+                                geom_json_str, ano_modis, mes_modis, area_queimada_img,
+                                area_km2_hint=area_km2_local
                             )
                             nbr_ok = True
                         except ValueError as ve:
