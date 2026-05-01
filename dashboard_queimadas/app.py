@@ -1420,6 +1420,123 @@ if st.session_state.gerar_dashboard:
                     "Classificação seguindo o padrão **USGS**."
                 )
 
+                with st.expander("📖 Como funciona o dNBR? Clique para entender as classes de severidade", expanded=False):
+                    st.markdown("""
+                    <style>
+                    .dnbr-ruler { display:flex; width:100%; height:38px; border-radius:6px; overflow:hidden; margin-bottom:4px; }
+                    .dnbr-ruler div { display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:600; color:#fff; }
+                    .dnbr-ticks { display:flex; justify-content:space-between; font-size:11px; color:#888; margin-bottom:20px; padding:0 2px; }
+                    .dnbr-cards { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-bottom:20px; }
+                    .dnbr-card { display:flex; border:1px solid rgba(255,255,255,0.08); border-radius:8px; overflow:hidden; background:rgba(255,255,255,0.03); }
+                    .dnbr-stripe { width:8px; flex-shrink:0; }
+                    .dnbr-body { padding:9px 11px; }
+                    .dnbr-name { font-size:13px; font-weight:700; margin:0 0 2px; }
+                    .dnbr-range { font-size:11px; color:#999; margin:0 0 4px; font-family:monospace; }
+                    .dnbr-desc { font-size:12px; color:#bbb; margin:0; line-height:1.4; }
+                    .dnbr-flow { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
+                    .dnbr-box { border-radius:8px; padding:10px 14px; font-size:12px; line-height:1.6; flex:1; min-width:140px; }
+                    .dnbr-arrow { font-size:20px; color:#888; flex-shrink:0; }
+                    .dnbr-formula { background:rgba(255,255,255,0.05); border-radius:8px; padding:10px 14px;
+                                    font-size:12px; color:#ccc; line-height:1.9; margin-bottom:0; }
+                    .dnbr-formula code { background:rgba(255,255,255,0.1); border-radius:4px; padding:1px 6px; font-family:monospace; }
+                    </style>
+
+                    <p style="font-size:13px; color:#aaa; margin-bottom:10px;">
+                        O <b style="color:#eee;">dNBR</b> compara imagens Sentinel-2 antes e depois do fogo usando as bandas
+                        B8 (infravermelho próximo) e B12 (SWIR). Vegetação sã reflete muito em B8 e pouco em B12 —
+                        o inverso ocorre em área queimada.
+                    </p>
+
+                    <div class="dnbr-flow">
+                        <div class="dnbr-box" style="background:rgba(22,101,85,0.35); border:1px solid rgba(22,160,133,0.3);">
+                            <b style="color:#1abc9c;">Imagem pré-fogo</b><br>
+                            Sentinel-2 · 60–90 dias antes<br>
+                            <span style="color:#888; font-size:11px;">NBR_pré = (B8−B12)÷(B8+B12)</span><br>
+                            <span style="color:#999; font-size:11px;">valor típico: +0.4 a +0.8</span>
+                        </div>
+                        <div class="dnbr-arrow">⟶</div>
+                        <div class="dnbr-box" style="background:rgba(120,60,20,0.35); border:1px solid rgba(180,80,20,0.3);">
+                            <b style="color:#e67e22;">Imagem pós-fogo</b><br>
+                            Sentinel-2 · mês do evento<br>
+                            <span style="color:#888; font-size:11px;">NBR_pós = (B8−B12)÷(B8+B12)</span><br>
+                            <span style="color:#999; font-size:11px;">valor típico: −0.1 a +0.2</span>
+                        </div>
+                        <div class="dnbr-arrow">⟶</div>
+                        <div class="dnbr-box" style="background:rgba(150,100,0,0.35); border:1px solid rgba(200,150,0,0.3); text-align:center;">
+                            <b style="color:#f1c40f; font-size:14px;">dNBR × 1000</b><br>
+                            <span style="color:#ddd; font-size:12px;">NBR_pré − NBR_pós</span><br>
+                            <span style="color:#aaa; font-size:11px;">= severidade da queima</span>
+                        </div>
+                    </div>
+
+                    <div style="margin:16px 0 8px; font-size:12px; color:#aaa; font-weight:600; text-transform:uppercase; letter-spacing:0.5px;">
+                        Régua de severidade (padrão USGS)
+                    </div>
+                    <div class="dnbr-ruler">
+                        <div style="width:13%; background:#1a9850;">Reg.</div>
+                        <div style="width:22%; background:#91cf60; color:#2d5010;">Não afetado</div>
+                        <div style="width:18%; background:#fee08b; color:#7a5800;">Baixa</div>
+                        <div style="width:18%; background:#fc8d59; color:#5c1a00;">Moderada</div>
+                        <div style="width:15%; background:#d73027;">Mod-Alta</div>
+                        <div style="width:14%; background:#8c0505;">Alta</div>
+                    </div>
+                    <div class="dnbr-ticks">
+                        <span>≪ 0</span><span>−100</span><span>+100</span>
+                        <span>+270</span><span>+440</span><span>+660</span><span>≫ 1000</span>
+                    </div>
+
+                    <div class="dnbr-cards">
+                        <div class="dnbr-card">
+                            <div class="dnbr-stripe" style="background:#1a9850;"></div>
+                            <div class="dnbr-body">
+                                <p class="dnbr-name" style="color:#1a9850;">🌱 Regeneração</p>
+                                <p class="dnbr-range">dNBR &lt; −100</p>
+                                <p class="dnbr-desc">Vegetação cresceu após incêndio anterior (broto)</p>
+                            </div>
+                        </div>
+                        <div class="dnbr-card">
+                            <div class="dnbr-stripe" style="background:#91cf60;"></div>
+                            <div class="dnbr-body">
+                                <p class="dnbr-name" style="color:#6a9e30;">🌿 Não afetado</p>
+                                <p class="dnbr-range">−100 a +100</p>
+                                <p class="dnbr-desc">Vegetação intacta ou variação sazonal normal</p>
+                            </div>
+                        </div>
+                        <div class="dnbr-card">
+                            <div class="dnbr-stripe" style="background:#fee08b;"></div>
+                            <div class="dnbr-body">
+                                <p class="dnbr-name" style="color:#c9a000;">🟡 Baixa severidade</p>
+                                <p class="dnbr-range">+100 a +270</p>
+                                <p class="dnbr-desc">Queima superficial; dossel parcialmente afetado</p>
+                            </div>
+                        </div>
+                        <div class="dnbr-card">
+                            <div class="dnbr-stripe" style="background:#fc8d59;"></div>
+                            <div class="dnbr-body">
+                                <p class="dnbr-name" style="color:#e05010;">🟠 Moderada</p>
+                                <p class="dnbr-range">+270 a +440</p>
+                                <p class="dnbr-desc">Danos significativos; dossel destruído em parte</p>
+                            </div>
+                        </div>
+                        <div class="dnbr-card">
+                            <div class="dnbr-stripe" style="background:#d73027;"></div>
+                            <div class="dnbr-body">
+                                <p class="dnbr-name" style="color:#d73027;">🔴 Moderada-Alta</p>
+                                <p class="dnbr-range">+440 a +660</p>
+                                <p class="dnbr-desc">Destruição extensa do dossel; solo exposto</p>
+                            </div>
+                        </div>
+                        <div class="dnbr-card">
+                            <div class="dnbr-stripe" style="background:#8c0505;"></div>
+                            <div class="dnbr-body">
+                                <p class="dnbr-name" style="color:#c0392b;">⬛ Alta severidade</p>
+                                <p class="dnbr-range">dNBR &gt; +660</p>
+                                <p class="dnbr-desc">Destruição total; solo nu, cinzas, carvão</p>
+                            </div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
                 col_nbr1, col_nbr2 = st.columns([1.4, 1])
 
                 with col_nbr1:
