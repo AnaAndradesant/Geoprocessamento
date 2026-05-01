@@ -1241,7 +1241,17 @@ if st.session_state.gerar_dashboard:
                     )
 
                     with st.spinner("Calculando comparação histórica..."):
-                        df_anomalia = calcular_anomalia_modis(geom_json_str, ano_modis)
+                        df_anomalia = pd.DataFrame()
+                        try:
+                            df_anomalia = calcular_anomalia_modis(geom_json_str, ano_modis)
+                        except Exception as _e_anom:
+                            st.error(
+                                f"⚠️ Falha ao calcular anomalia histórica.\n\n"
+                                f"**Tipo:** `{type(_e_anom).__name__}`\n\n"
+                                f"**Mensagem:** {_e_anom}"
+                            )
+                            with st.expander("📋 Traceback completo", expanded=False):
+                                st.code(traceback.format_exc(), language="python")
 
                     if not df_anomalia.empty:
                         col_ano = f'Área {ano_modis} (km²)'
