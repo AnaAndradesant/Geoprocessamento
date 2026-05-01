@@ -1414,6 +1414,103 @@ if st.session_state.gerar_dashboard:
                     "Classificação seguindo o padrão **USGS**."
                 )
 
+                with st.expander("📖 Como interpretar as classes de severidade dNBR?", expanded=False):
+                    st.markdown("""
+                    <style>
+                    .dnbr-bar { display:flex; width:100%; height:36px; border-radius:6px; overflow:hidden; margin-bottom:6px; }
+                    .dnbr-bar div { display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:600; }
+                    .dnbr-ticks { display:flex; justify-content:space-between; font-size:11px; color:#888; margin-bottom:18px; padding:0 1px; }
+                    .dnbr-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
+                    .dnbr-card { display:flex; border:0.5px solid rgba(128,128,128,0.25); border-radius:8px; overflow:hidden; }
+                    .dnbr-stripe { width:10px; flex-shrink:0; }
+                    .dnbr-body { padding:8px 10px; }
+                    .dnbr-name { font-size:13px; font-weight:600; margin:0 0 2px; }
+                    .dnbr-range { font-size:11px; color:#888; margin:0 0 4px; font-family:monospace; }
+                    .dnbr-desc { font-size:12px; color:#aaa; margin:0; line-height:1.4; }
+                    .dnbr-formula { background:rgba(128,128,128,0.1); border:0.5px solid rgba(128,128,128,0.2);
+                                    border-radius:8px; padding:10px 14px; font-size:13px;
+                                    margin-bottom:16px; line-height:1.8; }
+                    .dnbr-formula code { background:rgba(128,128,128,0.15); border-radius:4px;
+                                         padding:1px 6px; font-size:12px; font-family:monospace; }
+                    </style>
+
+                    <div class="dnbr-formula">
+                        <b>Como é calculado:</b><br>
+                        <code>NBR = (B8 − B12) ÷ (B8 + B12)</code> &nbsp;→&nbsp; aplicado na imagem <b>pré-fogo</b> e na <b>pós-fogo</b><br>
+                        <code>dNBR = NBR_pré − NBR_pós</code> &nbsp;×&nbsp; 1000 &nbsp;&nbsp;
+                        <span style="color:#888; font-size:12px;">(multiplicado para trabalhar com inteiros)</span>
+                    </div>
+
+                    <div class="dnbr-bar">
+                        <div style="width:13%; background:#1a9850; color:#fff;">Reg.</div>
+                        <div style="width:22%; background:#91cf60; color:#3d5a10;">Não afetado</div>
+                        <div style="width:18%; background:#fee08b; color:#7a5800;">Baixa</div>
+                        <div style="width:18%; background:#fc8d59; color:#5c1a00;">Moderada</div>
+                        <div style="width:15%; background:#d73027; color:#fff;">Mod-Alta</div>
+                        <div style="width:14%; background:#7a0403; color:#fff;">Alta</div>
+                    </div>
+                    <div class="dnbr-ticks">
+                        <span>≪ −100</span>
+                        <span>−100</span>
+                        <span>+100</span>
+                        <span>+270</span>
+                        <span>+440</span>
+                        <span>+660</span>
+                        <span>≫ 660</span>
+                    </div>
+
+                    <div class="dnbr-grid">
+                        <div class="dnbr-card">
+                            <div class="dnbr-stripe" style="background:#1a9850;"></div>
+                            <div class="dnbr-body">
+                                <p class="dnbr-name" style="color:#1a9850;">🌱 Regeneração</p>
+                                <p class="dnbr-range">dNBR &lt; −100</p>
+                                <p class="dnbr-desc">Vegetação cresceu após incêndio anterior. NBR aumentou — brotos novos refletem mais NIR.</p>
+                            </div>
+                        </div>
+                        <div class="dnbr-card">
+                            <div class="dnbr-stripe" style="background:#91cf60;"></div>
+                            <div class="dnbr-body">
+                                <p class="dnbr-name" style="color:#5a8a20;">🌿 Não afetado</p>
+                                <p class="dnbr-range">−100 a +100</p>
+                                <p class="dnbr-desc">Vegetação intacta ou variação sazonal normal. Fogo não atingiu essa área.</p>
+                            </div>
+                        </div>
+                        <div class="dnbr-card">
+                            <div class="dnbr-stripe" style="background:#fee08b;"></div>
+                            <div class="dnbr-body">
+                                <p class="dnbr-name" style="color:#a07000;">🟡 Baixa severidade</p>
+                                <p class="dnbr-range">+100 a +270</p>
+                                <p class="dnbr-desc">Queima superficial de sub-bosque. Dossel parcialmente afetado, recuperação em meses.</p>
+                            </div>
+                        </div>
+                        <div class="dnbr-card">
+                            <div class="dnbr-stripe" style="background:#fc8d59;"></div>
+                            <div class="dnbr-body">
+                                <p class="dnbr-name" style="color:#c04010;">🟠 Moderada</p>
+                                <p class="dnbr-range">+270 a +440</p>
+                                <p class="dnbr-desc">Danos significativos ao dossel. Solo parcialmente exposto, recuperação lenta (1–3 anos).</p>
+                            </div>
+                        </div>
+                        <div class="dnbr-card">
+                            <div class="dnbr-stripe" style="background:#d73027;"></div>
+                            <div class="dnbr-body">
+                                <p class="dnbr-name" style="color:#d73027;">🔴 Moderada-Alta</p>
+                                <p class="dnbr-range">+440 a +660</p>
+                                <p class="dnbr-desc">Destruição extensa do dossel. Solo exposto, cinzas visíveis. Recuperação de 3–5 anos.</p>
+                            </div>
+                        </div>
+                        <div class="dnbr-card">
+                            <div class="dnbr-stripe" style="background:#7a0403;"></div>
+                            <div class="dnbr-body">
+                                <p class="dnbr-name" style="color:#7a0403;">⬛ Alta severidade</p>
+                                <p class="dnbr-range">dNBR &gt; +660</p>
+                                <p class="dnbr-desc">Destruição total da cobertura. Solo nu, carvão, cinzas. Risco de erosão alto.</p>
+                            </div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
                 col_nbr1, col_nbr2 = st.columns([1.4, 1])
 
                 with col_nbr1:
@@ -1562,12 +1659,7 @@ if st.session_state.gerar_dashboard:
                             st.metric("🔥 Total Afetado", f"{area_total_afetada:.2f} km²")
 
                         st.markdown("---")
-                        st.markdown(
-                            "**Interpretação:**\n\n"
-                            "- **Baixa:** vegetação parcialmente afetada, recuperação rápida\n"
-                            "- **Moderada:** danos significativos ao dossel\n"
-                            "- **Alta:** destruição quase total da cobertura vegetal"
-                        )
+                        st.caption("💡 Abra o guia de interpretação acima para detalhes de cada classe.")
 
         # ----------------------------------------------------------
         # ABA 4 — EXPORTAR DADOS
