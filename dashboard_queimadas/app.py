@@ -8,37 +8,10 @@ from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 import plotly.express as px
 import plotly.graph_objects as go
-import requests, warnings, time, unicodedata, re, json, io, calendar
+import requests, warnings, time, unicodedata, re, json, io, calendar, zipfile, tempfile, os
 import ee
 from io import BytesIO
 import traceback
-
-
-# =====================================================================
-# HELPER: retry com backoff exponencial para erros 429 do GEE
-# "Too many concurrent aggregations" acontece quando várias chamadas
-# .getInfo() pesadas são disparadas em sequência rápida.
-# A solução padrão do GEE é esperar e tentar novamente.
-# =====================================================================
-def _gee_retry(fn, max_tentativas=4, espera_inicial=6):
-    """
-    Executa fn() (que deve chamar .getInfo() internamente) com retry
-    exponencial para erros HTTP 429 / 'Too many concurrent aggregations'.
-    Tentativas: 6s → 12s → 24s → desiste.
-    """
-    for tentativa in range(max_tentativas):
-        try:
-            return fn()
-        except Exception as e:
-            eh_ultimo = tentativa == max_tentativas - 1
-            msg = str(e).lower()
-            eh_429 = any(t in msg for t in [
-                "too many concurrent", "429", "quota", "rate limit", "resource exhausted"
-            ])
-            if eh_ultimo or not eh_429:
-                raise   # erro diferente de throttling → propaga imediatamente
-            espera = espera_inicial * (2 ** tentativa)  # 6 → 12 → 24s
-            time.sleep(espera)
 
 
 
@@ -102,7 +75,7 @@ except Exception as e:
 # =====================================================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def calcular_stats_nbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=None):
+def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hint=0):
     # === LEITURA INTELIGENTE DE GEOJSON ===
     geom_dict = json.loads(geom_json_str)
     if 'features' in geom_dict:
@@ -111,15 +84,14 @@ def calcular_stats_nbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=
         poly = ee.Geometry(geom_dict)
     # ======================================
 
-    # === ESCALA DINÂMICA baseada em area_km2_hint (calculada localmente, sem getInfo()) ===
-    # Amazônia (~5,5M km²): scale=500 ainda causava timeout porque a geometria complexa
-    # mais o composito Sentinel-2 ultrapassavam o limite de 5min do getInfo().
-    # Solução: escala 1000m para biomas gigantes + simplificação da geometria no GEE.
-    area_km2 = area_km2_hint  # recebido de fora, calculado via Shapely (sem chamada GEE)
+    # === ESCALA E SIMPLIFICAÇÃO DINÂMICAS baseadas em area_km2_hint ===
+    # area_km2_hint é calculado localmente via Shapely — zero chamadas GEE bloqueantes.
+    # Amazônia (~5,5M km²): scale=1000 + simplify 10km evita timeout garantido.
+    area_km2 = area_km2_hint
     if area_km2 > 1_500_000:       # Biomas gigantes (ex: Amazônia ~5,5M km²)
         scale = 1000
-        max_error_simplify = 10000  # ~10 km de tolerância — sem impacto visual em 1000m
-        tile_scale = 32
+        max_error_simplify = 10000
+        tile_scale = 16
     elif area_km2 > 500_000:       # Estados grandes (AM, PA, MT) / Cerrado
         scale = 500
         max_error_simplify = 5000
@@ -136,15 +108,11 @@ def calcular_stats_nbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=
         scale = 50
         max_error_simplify = 100
         tile_scale = 2
-    # ========================================================================================
+    # ==================================================================
 
-    # === SIMPLIFICAÇÃO DA GEOMETRIA NO GEE ===
-    # Amazônia do geobr tem milhares de vértices. Enviar geometria complexa ao GEE
-    # lentifica filterBounds, clip e reduceRegion. Simplificar com max_error adequado
-    # não afeta o resultado a escalas de centenas de metros.
+    # Simplifica a geometria no GEE — crítico para Amazônia (milhares de vértices)
     if area_km2 > 10_000:
         poly = poly.simplify(maxError=max_error_simplify)
-    # ==========================================
 
     # Datas para o Sentinel (1 mês antes e o mês atual)
     data_fim = datetime(ano, mes, 28)
@@ -175,9 +143,9 @@ def calcular_stats_nbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=
     stats = sld_intervals.reduceRegion(
         reducer=ee.Reducer.frequencyHistogram(),
         geometry=poly,
-        scale=scale,           # ✅ escala dinâmica conforme tamanho da região
+        scale=scale,
         maxPixels=1e13,
-        tileScale=tile_scale,  # ✅ também dinâmico: 32 para Amazônia evita OOM no GEE
+        tileScale=tile_scale,
         bestEffort=True
     ).getInfo()
 
@@ -188,14 +156,12 @@ def calcular_stats_nbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=
     if stats:
         hist = list(stats.values())[0]
         if isinstance(hist, dict):
-            # ✅ Área correta: usa scale² m²/pixel
             pixel_area_km2 = (scale * scale) / 1e6
             for k, v in hist.items():
                 area = v * pixel_area_km2
                 res_stats[classes.get(int(float(k)), 'Outros')] = round(area, 2)
         elif not hist:
-            # Histograma vazio = nenhum pixel queimado no período — retorna vazio graciosamente
-            pass
+            pass  # histograma vazio = sem pixels queimados no período
 
     return res_stats
 
@@ -247,6 +213,132 @@ def buscar_cidades(uf):
     except:
         pass
     return ["Erro ao carregar cidades"]
+
+# =====================================================================
+# ESG / CAR — FUNÇÕES DE ANÁLISE POR PROPRIEDADE RURAL
+# =====================================================================
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def baixar_car_municipio(code_ibge: int) -> gpd.GeoDataFrame:
+    """
+    Baixa os polígonos de imóveis rurais cadastrados no CAR (SICAR)
+    para o município indicado pelo código IBGE de 7 dígitos.
+
+    Fonte: Sistema Nacional de Cadastro Ambiental Rural
+    URL:   https://car.gov.br/publico/municipios/shapefile?municipio[id]={code}&tema=IMOVEL
+    Retorna GeoDataFrame com colunas: cod_imovel, num_area, des_condic, dat_entrad, geometry
+    """
+    url = (
+        f"https://car.gov.br/publico/municipios/shapefile"
+        f"?municipio[id]={code_ibge}&tema=IMOVEL"
+    )
+    try:
+        r = requests.get(url, timeout=90, verify=False)
+        if r.status_code != 200 or len(r.content) < 500:
+            return gpd.GeoDataFrame()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = os.path.join(tmp, "car.zip")
+            with open(zip_path, "wb") as f:
+                f.write(r.content)
+
+            with zipfile.ZipFile(zip_path, "r") as z:
+                z.extractall(tmp)
+
+            # Encontra o .shp dentro de possíveis subpastas
+            shp_files = []
+            for root, _, files in os.walk(tmp):
+                for fname in files:
+                    if fname.endswith(".shp"):
+                        shp_files.append(os.path.join(root, fname))
+
+            if not shp_files:
+                return gpd.GeoDataFrame()
+
+            gdf = gpd.read_file(shp_files[0])
+            gdf = gdf.to_crs("EPSG:4326")
+
+            # Normaliza colunas — o SICAR pode entregar nomes em maiúsculas
+            gdf.columns = [c.lower() for c in gdf.columns]
+
+            # Garante que as colunas essenciais existam
+            for col, default in [
+                ("cod_imovel", "N/D"),
+                ("num_area",   0.0),
+                ("des_condic", "N/D"),
+                ("dat_entrad", None),
+            ]:
+                if col not in gdf.columns:
+                    gdf[col] = default
+
+            gdf["num_area"] = pd.to_numeric(gdf["num_area"], errors="coerce").fillna(0)
+            gdf = gdf[gdf.geometry.notnull()]
+            gdf = gdf[gdf.geometry.is_valid]
+            return gdf[["cod_imovel", "num_area", "des_condic", "dat_entrad", "geometry"]]
+
+    except Exception:
+        return gpd.GeoDataFrame()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def calcular_recorrencia_modis_car(features_geojson: str, anos: list) -> dict:
+    """
+    Para cada imóvel CAR (GeoJSON de FeatureCollection), conta em quantos
+    dos 'anos' fornecidos houve área queimada detectada pelo MODIS MCD64A1.
+
+    Retorna dict {cod_imovel: anos_com_fogo (int)}
+
+    Estratégia: uma chamada reduceRegions por ano → N chamadas GEE no total,
+    mas cada uma é leve pois analisa só a coleção de imóveis afetados.
+    """
+    try:
+        fc = ee.FeatureCollection(json.loads(features_geojson))
+    except Exception:
+        return {}
+
+    recorrencia = {}
+
+    for ano in anos:
+        try:
+            burned = (
+                ee.ImageCollection("MODIS/061/MCD64A1")
+                .filterDate(f"{ano}-01-01", f"{ano}-12-31")
+                .select("BurnDate")
+                .max()
+            )
+            stats = _gee_retry(lambda: burned.reduceRegions(
+                collection=fc,
+                reducer=ee.Reducer.max().setOutputs(["burn_max"]),
+                scale=500,
+                tileScale=4,
+            ).getInfo())
+
+            for feat in stats.get("features", []):
+                props = feat.get("properties", {})
+                cod   = props.get("cod_imovel", feat.get("id", "?"))
+                if props.get("burn_max", 0) and props["burn_max"] > 0:
+                    recorrencia[cod] = recorrencia.get(cod, 0) + 1
+        except Exception:
+            continue   # ano sem dado → ignora, não aborta
+
+    return recorrencia
+
+
+def _gee_retry(fn, max_tentativas=4, espera_inicial=6):
+    """Retry com backoff exponencial para erros 429 do GEE."""
+    for tentativa in range(max_tentativas):
+        try:
+            return fn()
+        except Exception as e:
+            eh_ultimo = tentativa == max_tentativas - 1
+            msg = str(e).lower()
+            eh_429 = any(t in msg for t in [
+                "too many concurrent", "429", "quota", "rate limit", "resource exhausted"
+            ])
+            if eh_ultimo or not eh_429:
+                raise
+            time.sleep(espera_inicial * (2 ** tentativa))
+
 
 @st.cache_data(show_spinner=False)
 def carregar_fronteira(tipo, estado, bioma, municipio):
@@ -395,150 +487,11 @@ def calcular_area_queimada_modis(geom_json, ano, mes=None):
     return burned, area_km2 or 0
 
 
-# =====================================================================
-# SICAR — Consulta pública de imóveis rurais cadastrados
-# Fonte: Sistema Nacional de Cadastro Ambiental Rural (car.gov.br)
-# =====================================================================
-
-# Estatísticas SICAR 2023 por UF (fallback se API indisponível)
-# Fonte: Relatório Anual SICAR 2023 — MAPA/SENAR
-_SICAR_FALLBACK = {
-    "AC": {"imoveis": 37_800,  "area_mha": 8.1},
-    "AL": {"imoveis": 62_100,  "area_mha": 2.0},
-    "AM": {"imoveis": 169_000, "area_mha": 57.2},
-    "AP": {"imoveis": 17_200,  "area_mha": 4.4},
-    "BA": {"imoveis": 456_000, "area_mha": 34.0},
-    "CE": {"imoveis": 212_000, "area_mha": 8.4},
-    "DF": {"imoveis": 4_100,   "area_mha": 0.3},
-    "ES": {"imoveis": 98_000,  "area_mha": 2.9},
-    "GO": {"imoveis": 212_000, "area_mha": 25.8},
-    "MA": {"imoveis": 262_000, "area_mha": 23.4},
-    "MG": {"imoveis": 595_000, "area_mha": 44.6},
-    "MS": {"imoveis": 93_000,  "area_mha": 27.1},
-    "MT": {"imoveis": 271_000, "area_mha": 74.2},
-    "PA": {"imoveis": 593_000, "area_mha": 81.3},
-    "PB": {"imoveis": 118_000, "area_mha": 4.3},
-    "PE": {"imoveis": 164_000, "area_mha": 6.8},
-    "PI": {"imoveis": 155_000, "area_mha": 14.1},
-    "PR": {"imoveis": 288_000, "area_mha": 13.7},
-    "RJ": {"imoveis": 75_000,  "area_mha": 3.2},
-    "RN": {"imoveis": 106_000, "area_mha": 4.5},
-    "RO": {"imoveis": 128_000, "area_mha": 17.2},
-    "RR": {"imoveis": 29_500,  "area_mha": 10.4},
-    "RS": {"imoveis": 362_000, "area_mha": 19.1},
-    "SC": {"imoveis": 194_000, "area_mha": 7.8},
-    "SE": {"imoveis": 55_000,  "area_mha": 2.1},
-    "SP": {"imoveis": 351_000, "area_mha": 19.6},
-    "TO": {"imoveis": 108_000, "area_mha": 22.5},
-}
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def consultar_sicar(uf: str) -> dict:
-    """Tenta obter dados do CAR via API pública do SICAR; usa fallback se indisponível."""
-    try:
-        url = (
-            f"https://car.gov.br/publico/estados/quantidadeImoveis"
-            f"?sigla={uf}&situacao=AT"
-        )
-        r = requests.get(url, timeout=8)
-        if r.status_code == 200:
-            dados = r.json()
-            if isinstance(dados, dict) and "quantidade" in dados:
-                return {
-                    "imoveis": int(dados["quantidade"]),
-                    "area_mha": _SICAR_FALLBACK.get(uf, {}).get("area_mha", 0),
-                    "fonte": "API SICAR (tempo real)"
-                }
-    except Exception:
-        pass
-    fb = _SICAR_FALLBACK.get(uf, {"imoveis": 0, "area_mha": 0})
-    return {**fb, "fonte": "Relatório SICAR 2023 (offline)"}
-
-
-def calcular_score_esg(
-    total_valor: float,
-    area_km2: float,
-    fonte: str,
-    bioma_nome: str,
-    df_anomalia: "pd.DataFrame",
-) -> dict:
-    """
-    Calcula o ESG Risk Score (0–100) em três pilares:
-      • Exposição ao Fogo   (50%) — intensidade relativa ao benchmark do bioma
-      • Recorrência         (30%) — quantos meses acima da média histórica
-      • Sensibilidade       (20%) — fragilidade ecológica do bioma
-
-    Retorna dict com scores parciais, score final e tier (Verde/Amarelo/Laranja/Vermelho).
-    """
-    # ── Benchmarks de % área queimada/ano por bioma (literatura INPE/MapBiomas) ──
-    BENCH_PCT = {
-        "Amazônia": 0.30, "Cerrado": 2.50, "Pantanal": 1.50,
-        "Mata Atlântica": 0.10, "Caatinga": 1.00, "Pampa": 0.20,
-    }
-    # ── Benchmark de densidade de focos/1000km² por bioma ───────────────────────
-    BENCH_FOCOS = {
-        "Amazônia": 40, "Cerrado": 120, "Pantanal": 60,
-        "Mata Atlântica": 20, "Caatinga": 80, "Pampa": 15,
-    }
-    # ── Sensibilidade ecológica (0–100) — IUCN / WWF ─────────────────────────────
-    SENSIB = {
-        "Mata Atlântica": 90, "Pantanal": 82, "Amazônia": 75,
-        "Cerrado": 62, "Caatinga": 48, "Pampa": 38,
-    }
-
-    # Pilar 1 — Exposição
-    if area_km2 > 0:
-        if "MODIS" in fonte:
-            pct = (total_valor / area_km2) * 100
-            bench = BENCH_PCT.get(bioma_nome, 1.0)
-            # > 4× benchmark = score 100
-            score_exp = min(100.0, (pct / bench) * 25)
-        else:                                          # INPE (focos)
-            dens = (total_valor / area_km2) * 1000    # focos / 1000 km²
-            bench = BENCH_FOCOS.get(bioma_nome, 60)
-            score_exp = min(100.0, (dens / bench) * 25)
-    else:
-        score_exp = 0.0
-
-    # Pilar 2 — Recorrência histórica
-    if not df_anomalia.empty and "Anomalia (%)" in df_anomalia.columns:
-        meses_criticos = int((df_anomalia["Anomalia (%)"] > 30).sum())
-        score_rec = min(100.0, meses_criticos * 12.5)   # 8 meses = 100
-    else:
-        score_rec = 50.0   # desconhecido = moderado
-
-    # Pilar 3 — Sensibilidade do bioma
-    score_sens = float(SENSIB.get(bioma_nome, 60))
-
-    # Score final ponderado
-    score_final = 0.50 * score_exp + 0.30 * score_rec + 0.20 * score_sens
-
-    # Tier
-    if score_final < 25:
-        tier, cor = "Verde",    "#27ae60"
-    elif score_final < 50:
-        tier, cor = "Amarelo",  "#f39c12"
-    elif score_final < 75:
-        tier, cor = "Laranja",  "#e67e22"
-    else:
-        tier, cor = "Vermelho", "#e74c3c"
-
-    return {
-        "score_final":  round(score_final, 1),
-        "score_exp":    round(score_exp, 1),
-        "score_rec":    round(score_rec, 1),
-        "score_sens":   round(score_sens, 1),
-        "tier":         tier,
-        "cor":          cor,
-    }
-
-
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_anomalia_modis(geom_json_str, ano_ref):
     ee_geom = ee.Geometry(json.loads(geom_json_str))
 
-    # ✅ Simplifica a geometria UMA VEZ aqui fora — antes era recalculada
-    #    dentro de get_area_km2 a cada imagem processada (muito desperdício)
+    # Simplifica a geometria UMA VEZ fora do loop — evita recriá-la a cada imagem
     geom_simplificada = ee_geom.simplify(maxError=5000)
 
     anos_historico = list(range(2001, ano_ref))
@@ -571,7 +524,7 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
         img_ref = (
             ee.ImageCollection('MODIS/061/MCD64A1')
             .filterDate(ini_ref, ini_ref.advance(1, 'month'))
-            .filterBounds(geom_simplificada)   # ✅ usa geom simplificada no filterBounds também
+            .filterBounds(geom_simplificada)
             .select('BurnDate').max().clip(geom_simplificada)
         )
         area_ref = ee.Number(get_area_km2(img_ref))
@@ -600,17 +553,34 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
             'media_hist': media_hist
         })
 
-    # ✅ OTIMIZAÇÃO PRINCIPAL: 1 única chamada .getInfo() no lugar de 12 sequenciais
-    # Antes: loop Python com getInfo() por mês → até 36 roundtrips ao EE (12 meses × 3 tentativas)
-    # Agora: todo o cálculo dos 12 meses vai pro servidor de uma vez, volta num único resultado
-    meses_ee = ee.List.sequence(1, 12)
-    _fc_anomalia = ee.FeatureCollection(meses_ee.map(calc_mes_feature))
-    resultado = _gee_retry(lambda: _fc_anomalia.getInfo())
-
+    # ── PROCESSAMENTO MÊS A MÊS com retry/backoff ────────────────────────────
+    # Para a Amazônia (~5,5M km²), mesmo lotes de 4 meses geram
+    # 4 × 23 anos = ~92 reduceRegion simultâneos → erro 429.
+    # Processando 1 mês por vez (1 × 23 = ~23 operações), ficamos bem abaixo
+    # do limite do EE para qualquer região do Brasil.
+    MAX_RETRIES = 5
     registros = []
-    for feat in resultado['features']:
-        p = feat['properties']
-        mes      = int(p['mes'])
+
+    for mes in range(1, 13):
+        feat_resultado = None
+        for tentativa in range(1, MAX_RETRIES + 1):
+            try:
+                feat_resultado = ee.Feature(calc_mes_feature(mes)).getInfo()
+                break
+            except Exception as e:
+                msg = str(e)
+                if 'Too many concurrent aggregations' in msg or '429' in msg:
+                    if tentativa < MAX_RETRIES:
+                        time.sleep(2 ** tentativa)  # 2s, 4s, 8s, 16s, 32s
+                        continue
+                # Outro erro ou esgotou tentativas: injeta zero e continua
+                feat_resultado = {
+                    'type': 'Feature',
+                    'properties': {'mes': mes, 'area_ref': 0, 'media_hist': 0}
+                }
+                break
+
+        p = feat_resultado['properties']
         val_ref  = round(float(p.get('area_ref')  or 0), 2)
         media    = round(float(p.get('media_hist') or 0), 2)
         anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
@@ -622,10 +592,12 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
             'Anomalia (%)': anomalia
         })
 
+        time.sleep(0.5)  # pausa entre meses para não sobrecarregar a fila do EE
+
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
-def _construir_dnbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=None):
-    # 1. LEITURA CORRETA DA GEOMETRIA (Igual ao seu calcular_stats_nbr)
+def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hint=0):
+    # 1. LEITURA CORRETA DA GEOMETRIA
     geom_dict = json.loads(geom_json_str)
     if 'features' in geom_dict:
         poly = ee.Geometry(geom_dict['features'][0]['geometry'])
@@ -633,8 +605,6 @@ def _construir_dnbr(geom_json_str, ano, mes, area_km2_hint=0, _mascara_modis=Non
         poly = ee.Geometry(geom_dict)
 
     # 1b. SIMPLIFICAÇÃO DA GEOMETRIA — crítico para Amazônia
-    # Geometria complexa do geobr tem milhares de vértices; simplificar
-    # reduz o tempo de getMapId() e torna o mapa renderizável em ~2s.
     if area_km2_hint > 1_500_000:
         poly = poly.simplify(maxError=10000)
     elif area_km2_hint > 500_000:
@@ -819,9 +789,8 @@ if st.session_state.gerar_dashboard:
         ee_geom_complex = ee.Geometry(geom_unida.__geo_interface__)
         geom_json_str = json.dumps(geom_unida.__geo_interface__, sort_keys=True)
 
-        # ✅ Área calculada localmente (via GeoPandas/Shapely) — sem nenhuma chamada GEE
-        # Isso elimina o poly.area().getInfo() que antes travava por 30-60s na Amazônia
-        _limite_proj = limite.to_crs("EPSG:6933")          # projeção equal-area mundial
+        # Área calculada localmente via GeoPandas/Shapely — sem chamada GEE bloqueante
+        _limite_proj = limite.to_crs("EPSG:6933")  # projeção equal-area
         area_km2_local = float(_limite_proj.geometry.union_all().area / 1e6)
 
         df_ranking_areas = pd.DataFrame()
@@ -981,10 +950,7 @@ if st.session_state.gerar_dashboard:
                             .filterBounds(ee_geom_complex)
                         )
                         stats_mun = img_area_km2.reduceRegions(
-                            collection=muns_ee,
-                            reducer=ee.Reducer.sum(),
-                            scale=1000,
-                            tileScale=4    # ✅ evita timeout em biomas grandes (ex: Amazônia)
+                            collection=muns_ee, reducer=ee.Reducer.sum(), scale=1000
                         ).getInfo()
                         recs_mun = [
                             {
@@ -1026,9 +992,9 @@ if st.session_state.gerar_dashboard:
                                 reducer=ee.Reducer.sum(),
                                 geometry=geom_temporal,
                                 scale=1000,
-                                maxPixels=1e13,    # ✅ era 1e10, insuficiente pra Amazônia
-                                tileScale=4,       # ✅ divide o cálculo em blocos
-                                bestEffort=True    # ✅ ajusta escala automaticamente se necessário
+                                maxPixels=1e13,
+                                tileScale=4,
+                                bestEffort=True
                             ).get('area')
                             return ee.Feature(None, {'mes': m_num, 'area': val})
 
@@ -1149,12 +1115,11 @@ if st.session_state.gerar_dashboard:
         # =============================================================
         # --- ABAS PRINCIPAIS ---
         # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_custos, aba_esg, aba_export = st.tabs([
+        aba_mapa, aba_graficos, aba_nbr, aba_esg, aba_export = st.tabs([
             "🗺️ Mapa de Focos",
             "📈 Gráficos & Anomalia",
             "🔬 Severidade (NBR Sentinel-2)",
-            "💰 Custo de Combate",
-            "🌿 ESG & CAR",
+            "🌿 ESG & CAR — Por Propriedade",
             "⬇️ Exportar Dados"
         ])
 
@@ -1409,17 +1374,7 @@ if st.session_state.gerar_dashboard:
                     )
 
                     with st.spinner("Calculando comparação histórica..."):
-                        df_anomalia = pd.DataFrame()
-                        try:
-                            df_anomalia = calcular_anomalia_modis(geom_json_str, ano_modis)
-                        except Exception as _e_anom:
-                            st.error(
-                                f"⚠️ Falha ao calcular anomalia histórica.\n\n"
-                                f"**Tipo:** `{type(_e_anom).__name__}`\n\n"
-                                f"**Mensagem:** {_e_anom}"
-                            )
-                            with st.expander("📋 Traceback completo", expanded=False):
-                                st.code(traceback.format_exc(), language="python")
+                        df_anomalia = calcular_anomalia_modis(geom_json_str, ano_modis)
 
                     if not df_anomalia.empty:
                         col_ano = f'Área {ano_modis} (km²)'
@@ -1592,82 +1547,102 @@ if st.session_state.gerar_dashboard:
                     "Classificação seguindo o padrão **USGS**."
                 )
 
-                with st.expander("📖 Como interpretar as classes de severidade dNBR?", expanded=False):
+                with st.expander("📖 Como funciona o dNBR? Clique para entender as classes de severidade", expanded=False):
                     st.markdown("""
                     <style>
-                    .dnbr-bar { display:flex; width:100%; height:36px; border-radius:6px; overflow:hidden; margin-bottom:6px; }
-                    .dnbr-bar div { display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:600; }
-                    .dnbr-ticks { display:flex; justify-content:space-between; font-size:11px; color:#888; margin-bottom:18px; padding:0 1px; }
-                    .dnbr-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
-                    .dnbr-card { display:flex; border:0.5px solid rgba(128,128,128,0.25); border-radius:8px; overflow:hidden; }
-                    .dnbr-stripe { width:10px; flex-shrink:0; }
-                    .dnbr-body { padding:8px 10px; }
-                    .dnbr-name { font-size:13px; font-weight:600; margin:0 0 2px; }
-                    .dnbr-range { font-size:11px; color:#888; margin:0 0 4px; font-family:monospace; }
-                    .dnbr-desc { font-size:12px; color:#aaa; margin:0; line-height:1.4; }
-                    .dnbr-formula { background:rgba(128,128,128,0.1); border:0.5px solid rgba(128,128,128,0.2);
-                                    border-radius:8px; padding:10px 14px; font-size:13px;
-                                    margin-bottom:16px; line-height:1.8; }
-                    .dnbr-formula code { background:rgba(128,128,128,0.15); border-radius:4px;
-                                         padding:1px 6px; font-size:12px; font-family:monospace; }
+                    .dnbr-ruler { display:flex; width:100%; height:38px; border-radius:6px; overflow:hidden; margin-bottom:4px; }
+                    .dnbr-ruler div { display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:600; color:#fff; }
+                    .dnbr-ticks { display:flex; justify-content:space-between; font-size:11px; color:#888; margin-bottom:20px; padding:0 2px; }
+                    .dnbr-cards { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-bottom:20px; }
+                    .dnbr-card { display:flex; border:1px solid rgba(255,255,255,0.08); border-radius:8px; overflow:hidden; background:rgba(255,255,255,0.03); }
+                    .dnbr-stripe { width:8px; flex-shrink:0; }
+                    .dnbr-body { padding:9px 11px; }
+                    .dnbr-name { font-size:13px; font-weight:700; margin:0 0 2px; }
+                    .dnbr-range { font-size:11px; color:#999; margin:0 0 4px; font-family:monospace; }
+                    .dnbr-desc { font-size:12px; color:#bbb; margin:0; line-height:1.4; }
+                    .dnbr-flow { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
+                    .dnbr-box { border-radius:8px; padding:10px 14px; font-size:12px; line-height:1.6; flex:1; min-width:140px; }
+                    .dnbr-arrow { font-size:20px; color:#888; flex-shrink:0; }
+                    .dnbr-formula { background:rgba(255,255,255,0.05); border-radius:8px; padding:10px 14px;
+                                    font-size:12px; color:#ccc; line-height:1.9; margin-bottom:0; }
+                    .dnbr-formula code { background:rgba(255,255,255,0.1); border-radius:4px; padding:1px 6px; font-family:monospace; }
                     </style>
 
-                    <div class="dnbr-formula">
-                        <b>Como é calculado:</b><br>
-                        <code>NBR = (B8 − B12) ÷ (B8 + B12)</code> &nbsp;→&nbsp; aplicado na imagem <b>pré-fogo</b> e na <b>pós-fogo</b><br>
-                        <code>dNBR = NBR_pré − NBR_pós</code> &nbsp;×&nbsp; 1000 &nbsp;&nbsp;
-                        <span style="color:#888; font-size:12px;">(multiplicado para trabalhar com inteiros)</span>
+                    <p style="font-size:13px; color:#aaa; margin-bottom:10px;">
+                        O <b style="color:#eee;">dNBR</b> compara imagens Sentinel-2 antes e depois do fogo usando as bandas
+                        B8 (infravermelho próximo) e B12 (SWIR). Vegetação sã reflete muito em B8 e pouco em B12 —
+                        o inverso ocorre em área queimada.
+                    </p>
+
+                    <div class="dnbr-flow">
+                        <div class="dnbr-box" style="background:rgba(22,101,85,0.35); border:1px solid rgba(22,160,133,0.3);">
+                            <b style="color:#1abc9c;">Imagem pré-fogo</b><br>
+                            Sentinel-2 · 60–90 dias antes<br>
+                            <span style="color:#888; font-size:11px;">NBR_pré = (B8−B12)÷(B8+B12)</span><br>
+                            <span style="color:#999; font-size:11px;">valor típico: +0.4 a +0.8</span>
+                        </div>
+                        <div class="dnbr-arrow">⟶</div>
+                        <div class="dnbr-box" style="background:rgba(120,60,20,0.35); border:1px solid rgba(180,80,20,0.3);">
+                            <b style="color:#e67e22;">Imagem pós-fogo</b><br>
+                            Sentinel-2 · mês do evento<br>
+                            <span style="color:#888; font-size:11px;">NBR_pós = (B8−B12)÷(B8+B12)</span><br>
+                            <span style="color:#999; font-size:11px;">valor típico: −0.1 a +0.2</span>
+                        </div>
+                        <div class="dnbr-arrow">⟶</div>
+                        <div class="dnbr-box" style="background:rgba(150,100,0,0.35); border:1px solid rgba(200,150,0,0.3); text-align:center;">
+                            <b style="color:#f1c40f; font-size:14px;">dNBR × 1000</b><br>
+                            <span style="color:#ddd; font-size:12px;">NBR_pré − NBR_pós</span><br>
+                            <span style="color:#aaa; font-size:11px;">= severidade da queima</span>
+                        </div>
                     </div>
 
-                    <div class="dnbr-bar">
-                        <div style="width:13%; background:#1a9850; color:#fff;">Reg.</div>
-                        <div style="width:22%; background:#91cf60; color:#3d5a10;">Não afetado</div>
+                    <div style="margin:16px 0 8px; font-size:12px; color:#aaa; font-weight:600; text-transform:uppercase; letter-spacing:0.5px;">
+                        Régua de severidade (padrão USGS)
+                    </div>
+                    <div class="dnbr-ruler">
+                        <div style="width:13%; background:#1a9850;">Reg.</div>
+                        <div style="width:22%; background:#91cf60; color:#2d5010;">Não afetado</div>
                         <div style="width:18%; background:#fee08b; color:#7a5800;">Baixa</div>
                         <div style="width:18%; background:#fc8d59; color:#5c1a00;">Moderada</div>
-                        <div style="width:15%; background:#d73027; color:#fff;">Mod-Alta</div>
-                        <div style="width:14%; background:#7a0403; color:#fff;">Alta</div>
+                        <div style="width:15%; background:#d73027;">Mod-Alta</div>
+                        <div style="width:14%; background:#8c0505;">Alta</div>
                     </div>
                     <div class="dnbr-ticks">
-                        <span>≪ −100</span>
-                        <span>−100</span>
-                        <span>+100</span>
-                        <span>+270</span>
-                        <span>+440</span>
-                        <span>+660</span>
-                        <span>≫ 660</span>
+                        <span>≪ 0</span><span>−100</span><span>+100</span>
+                        <span>+270</span><span>+440</span><span>+660</span><span>≫ 1000</span>
                     </div>
 
-                    <div class="dnbr-grid">
+                    <div class="dnbr-cards">
                         <div class="dnbr-card">
                             <div class="dnbr-stripe" style="background:#1a9850;"></div>
                             <div class="dnbr-body">
                                 <p class="dnbr-name" style="color:#1a9850;">🌱 Regeneração</p>
                                 <p class="dnbr-range">dNBR &lt; −100</p>
-                                <p class="dnbr-desc">Vegetação cresceu após incêndio anterior. NBR aumentou — brotos novos refletem mais NIR.</p>
+                                <p class="dnbr-desc">Vegetação cresceu após incêndio anterior (broto)</p>
                             </div>
                         </div>
                         <div class="dnbr-card">
                             <div class="dnbr-stripe" style="background:#91cf60;"></div>
                             <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#5a8a20;">🌿 Não afetado</p>
+                                <p class="dnbr-name" style="color:#6a9e30;">🌿 Não afetado</p>
                                 <p class="dnbr-range">−100 a +100</p>
-                                <p class="dnbr-desc">Vegetação intacta ou variação sazonal normal. Fogo não atingiu essa área.</p>
+                                <p class="dnbr-desc">Vegetação intacta ou variação sazonal normal</p>
                             </div>
                         </div>
                         <div class="dnbr-card">
                             <div class="dnbr-stripe" style="background:#fee08b;"></div>
                             <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#a07000;">🟡 Baixa severidade</p>
+                                <p class="dnbr-name" style="color:#c9a000;">🟡 Baixa severidade</p>
                                 <p class="dnbr-range">+100 a +270</p>
-                                <p class="dnbr-desc">Queima superficial de sub-bosque. Dossel parcialmente afetado, recuperação em meses.</p>
+                                <p class="dnbr-desc">Queima superficial; dossel parcialmente afetado</p>
                             </div>
                         </div>
                         <div class="dnbr-card">
                             <div class="dnbr-stripe" style="background:#fc8d59;"></div>
                             <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#c04010;">🟠 Moderada</p>
+                                <p class="dnbr-name" style="color:#e05010;">🟠 Moderada</p>
                                 <p class="dnbr-range">+270 a +440</p>
-                                <p class="dnbr-desc">Danos significativos ao dossel. Solo parcialmente exposto, recuperação lenta (1–3 anos).</p>
+                                <p class="dnbr-desc">Danos significativos; dossel destruído em parte</p>
                             </div>
                         </div>
                         <div class="dnbr-card">
@@ -1675,15 +1650,15 @@ if st.session_state.gerar_dashboard:
                             <div class="dnbr-body">
                                 <p class="dnbr-name" style="color:#d73027;">🔴 Moderada-Alta</p>
                                 <p class="dnbr-range">+440 a +660</p>
-                                <p class="dnbr-desc">Destruição extensa do dossel. Solo exposto, cinzas visíveis. Recuperação de 3–5 anos.</p>
+                                <p class="dnbr-desc">Destruição extensa do dossel; solo exposto</p>
                             </div>
                         </div>
                         <div class="dnbr-card">
-                            <div class="dnbr-stripe" style="background:#7a0403;"></div>
+                            <div class="dnbr-stripe" style="background:#8c0505;"></div>
                             <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#7a0403;">⬛ Alta severidade</p>
+                                <p class="dnbr-name" style="color:#c0392b;">⬛ Alta severidade</p>
                                 <p class="dnbr-range">dNBR &gt; +660</p>
-                                <p class="dnbr-desc">Destruição total da cobertura. Solo nu, carvão, cinzas. Risco de erosão alto.</p>
+                                <p class="dnbr-desc">Destruição total; solo nu, cinzas, carvão</p>
                             </div>
                         </div>
                     </div>
@@ -1696,57 +1671,23 @@ if st.session_state.gerar_dashboard:
                         nbr_ok = False
                         stats_sev = {}
                         dnbr_img = None
-
-                        # Aviso antecipado para Amazônia (> 1,5 M km²)
-                        if area_km2_local > 1_500_000:
-                            st.info(
-                                "🌿 **Amazônia detectada:** o cálculo usa resolução de 1 km "
-                                "para evitar timeout no GEE. Os gráficos de severidade "
-                                "são estatisticamente representativos mesmo nessa escala."
-                            )
-
-                        _debug_nbr = st.toggle(
-                            "🐛 Mostrar log de depuração do dNBR",
-                            value=False,
-                            key="toggle_debug_nbr"
-                        )
-
-                        def _log(msg):
-                            if _debug_nbr:
-                                st.caption(f"⚙️ {msg}")
-
                         try:
-                            _log(f"Área local estimada: {area_km2_local:,.0f} km²")
-                            _log(f"Parâmetros: ano={ano_modis}, mês={mes_modis}")
-                            _log(f"Máscara MODIS disponível: {area_queimada_img is not None}")
-
                             # 1) Stats cacheados
-                            _log("Passo 1/2 — chamando calcular_stats_nbr()...")
                             stats_sev = calcular_stats_nbr(
-                                geom_json_str, ano_modis, mes_modis,
-                                area_km2_hint=area_km2_local,
-                                _mascara_modis=area_queimada_img
+                                geom_json_str, ano_modis, mes_modis, area_queimada_img,
+                                area_km2_hint=area_km2_local
                             )
-                            _log(f"Stats retornados: {stats_sev}")
-
+                            
                             # 2) Imagem GEE reconstruída
-                            _log("Passo 2/2 — chamando _construir_dnbr()...")
                             _, dnbr_img = _construir_dnbr(
-                                geom_json_str, ano_modis, mes_modis,
-                                area_km2_hint=area_km2_local,
-                                _mascara_modis=area_queimada_img
+                                geom_json_str, ano_modis, mes_modis, area_queimada_img,
+                                area_km2_hint=area_km2_local
                             )
-                            _log("dNBR construído com sucesso.")
                             nbr_ok = True
-
                         except ValueError as ve:
                             st.warning(f"⚠️ {ve}")
-                            if _debug_nbr:
-                                st.code(traceback.format_exc(), language="python")
                         except Exception as e:
-                            st.error(f"⚠️ Erro ao processar Sentinel-2: **{type(e).__name__}**: {e}")
-                            if _debug_nbr:
-                                st.code(traceback.format_exc(), language="python")
+                            st.error(f"⚠️ Erro inesperado ao processar Sentinel-2: {e}\n\nTente uma região menor ou um mês diferente.")
 
                     if nbr_ok and dnbr_img is not None:
                         try:
@@ -1800,9 +1741,7 @@ if st.session_state.gerar_dashboard:
                             st_folium(m_nbr, width=None, height=620, returned_objects=[], key=_nbr_key)
                             
                         except Exception as erro_mapa:
-                            st.error(f"⚠️ Erro ao desenhar o mapa dNBR: **{type(erro_mapa).__name__}**: {erro_mapa}")
-                            if _debug_nbr:
-                                st.code(traceback.format_exc(), language="python")
+                            st.error(f"⚠️ Os dados foram calculados, mas ocorreu um erro ao desenhar o mapa Folium: {erro_mapa}")
 
                 with col_nbr2:
                     if stats_sev:       
@@ -1862,514 +1801,456 @@ if st.session_state.gerar_dashboard:
                             st.metric("🔥 Total Afetado", f"{area_total_afetada:.2f} km²")
 
                         st.markdown("---")
-                        st.caption("💡 Abra o guia de interpretação acima para detalhes de cada classe.")
+                        st.markdown(
+                            "**Interpretação:**\n\n"
+                            "- **Baixa:** vegetação parcialmente afetada, recuperação rápida\n"
+                            "- **Moderada:** danos significativos ao dossel\n"
+                            "- **Alta:** destruição quase total da cobertura vegetal"
+                        )
 
         # ----------------------------------------------------------
-        # ABA 4 — CUSTO DE COMBATE
-        # ----------------------------------------------------------
-        with aba_custos:
-            st.subheader("💰 Estimativa de Custo de Combate ao Incêndio")
-            st.markdown(
-                "Estimativa baseada nos **custos médios operacionais do IBAMA** "
-                "(Relatório de Operações de Combate a Incêndios Florestais). "
-                "Os valores refletem operações aéreas e terrestres em biomas brasileiros."
-            )
-
-            # ── Tabela de referência de custos (fonte: IBAMA / literatura técnica) ────────
-            # Valores em R$/hectare. Fontes:
-            #   • IBAMA (2022): Relatório de Operações PrevFogo — custo médio nacional R$ 40–80/ha
-            #   • Soares & Batista (2007): custos diferenciados por bioma
-            #   • Ajuste por inflação IPCA até 2024 (~35% sobre base 2020)
-            CUSTOS_POR_BIOMA = {
-                "Amazônia":          {"aereo": 142, "terrestre": 48,  "total": 190},
-                "Cerrado":           {"aereo": 98,  "terrestre": 35,  "total": 133},
-                "Pantanal":          {"aereo": 165, "terrestre": 52,  "total": 217},
-                "Mata Atlântica":    {"aereo": 120, "terrestre": 42,  "total": 162},
-                "Caatinga":          {"aereo": 75,  "terrestre": 30,  "total": 105},
-                "Pampa":             {"aereo": 68,  "terrestre": 28,  "total":  96},
-            }
-            CUSTO_PADRAO = {"aereo": 110, "terrestre": 38, "total": 148}
-
-            # ── Detectar bioma da seleção atual ────────────────────────────────────────────
-            bioma_detectado = None
-            for nome_bioma in CUSTOS_POR_BIOMA:
-                if nome_bioma.lower() in val_sel.lower():
-                    bioma_detectado = nome_bioma
-                    break
-            custos = CUSTOS_POR_BIOMA.get(bioma_detectado, CUSTO_PADRAO)
-
-            # ── Área queimada disponível ────────────────────────────────────────────────────
-            area_ha = 0.0
-            if "MODIS" in fonte_escolhida and total_valor > 0:
-                area_ha = total_valor * 100   # total_valor já está em km²  → × 100 = ha
-            elif "INPE" in fonte_escolhida and total_valor > 0:
-                # INPE retorna focos, não área — estimativa: ~15 ha médios por foco (literatura)
-                area_ha = total_valor * 15
-
-            # ── Controles do usuário ────────────────────────────────────────────────────────
-            st.markdown("---")
-            col_c1, col_c2 = st.columns([1.2, 1])
-
-            with col_c1:
-                st.markdown("#### ⚙️ Parâmetros da estimativa")
-
-                # Slider para ajuste do custo
-                custo_ajustado = st.slider(
-                    "💲 Custo total estimado por hectare (R$/ha)",
-                    min_value=30, max_value=500,
-                    value=custos["total"],
-                    step=5,
-                    help=(
-                        f"Valor padrão para **{bioma_detectado or 'seleção atual'}**: "
-                        f"R$ {custos['total']}/ha  "
-                        f"(aéreo R$ {custos['aereo']}/ha + terrestre R$ {custos['terrestre']}/ha). "
-                        "Ajuste conforme o tipo de operação real."
-                    )
-                )
-
-                # Área editável
-                area_editavel = st.number_input(
-                    "🔥 Área afetada (hectares)",
-                    min_value=0.0,
-                    value=float(max(area_ha, 0.0)),
-                    step=100.0,
-                    format="%.0f",
-                    help=(
-                        "Preenchido automaticamente com os dados da análise. "
-                        "Você pode ajustar manualmente."
-                    )
-                )
-
-                # Fator de mobilização (distância/logística)
-                fator_logistica = st.select_slider(
-                    "🚁 Fator de dificuldade logística",
-                    options=[1.0, 1.2, 1.5, 1.8, 2.0, 2.5, 3.0],
-                    value=1.5,
-                    help=(
-                        "1.0 = região de fácil acesso (rodovia próxima). "
-                        "1.5 = acesso moderado (voos curtos, estradas vicinais). "
-                        "3.0 = zona remota (floresta fechada, sem pistas, voos longos)."
-                    )
-                )
-
-            with col_c2:
-                st.markdown("#### 📋 Referência de custos por bioma (IBAMA)")
-                df_ref = pd.DataFrame([
-                    {"Bioma": k, "Aéreo (R$/ha)": v["aereo"],
-                     "Terrestre (R$/ha)": v["terrestre"], "Total (R$/ha)": v["total"]}
-                    for k, v in CUSTOS_POR_BIOMA.items()
-                ])
-                # Highlight da linha do bioma detectado
-                def _highlight_bioma(row):
-                    cor = "background-color: rgba(255,100,50,0.18);" if row["Bioma"] == bioma_detectado else ""
-                    return [cor] * len(row)
-                st.dataframe(
-                    df_ref.style.apply(_highlight_bioma, axis=1),
-                    hide_index=True,
-                    use_container_width=True,
-                    height=250,
-                )
-                st.caption("🔴 Linha destacada = bioma identificado na seleção atual")
-
-            st.markdown("---")
-
-            # ── Cálculo ────────────────────────────────────────────────────────────────────
-            custo_base      = area_editavel * custo_ajustado
-            custo_total     = custo_base * fator_logistica
-            custo_aereo_est = area_editavel * custos["aereo"]  * fator_logistica
-            custo_terr_est  = area_editavel * custos["terrestre"] * fator_logistica
-
-            # ── KPI Cards ─────────────────────────────────────────────────────────────────
-            st.markdown("#### 📊 Resultado da Estimativa")
-            k1, k2, k3, k4 = st.columns(4)
-
-            def _kpi(col, emoji, titulo, valor, sub=""):
-                with col:
-                    st.metric(
-                        label=f"{emoji} {titulo}",
-                        value=valor,
-                        delta=sub if sub else None,
-                        delta_color="off"
-                    )
-
-            _kpi(k1, "🔥", "Área afetada",
-                 f"{area_editavel:,.0f} ha",
-                 f"≈ {area_editavel/100:,.0f} km²")
-            _kpi(k2, "💲", "Custo base",
-                 f"R$ {custo_base:,.0f}",
-                 f"R$ {custo_ajustado}/ha × área")
-            _kpi(k3, "🚁", "Fator logística",
-                 f"×{fator_logistica}",
-                 "dificuldade de acesso")
-            _kpi(k4, "💰", "Custo total estimado",
-                 f"R$ {custo_total:,.0f}",
-                 f"≈ R$ {custo_total/1e6:.2f} milhões" if custo_total >= 1e6 else "")
-
-            # ── Gráfico de decomposição ────────────────────────────────────────────────────
-            st.markdown("---")
-            col_g1, col_g2 = st.columns([1.3, 1])
-
-            with col_g1:
-                df_pizza = pd.DataFrame({
-                    "Componente": ["Combate aéreo", "Combate terrestre", "Overhead logístico"],
-                    "Valor (R$)": [
-                        custo_aereo_est,
-                        custo_terr_est,
-                        custo_total - custo_aereo_est - custo_terr_est
-                    ]
-                }).query("`Valor (R$)` > 0")
-
-                fig_pizza = px.pie(
-                    df_pizza,
-                    names="Componente", values="Valor (R$)",
-                    title="Decomposição do Custo de Combate",
-                    color_discrete_sequence=["#e74c3c", "#e67e22", "#f39c12"],
-                    hole=0.42
-                )
-                fig_pizza.update_traces(
-                    textinfo="percent+label",
-                    hovertemplate="<b>%{label}</b><br>R$ %{value:,.0f}<extra></extra>"
-                )
-                fig_pizza.update_layout(
-                    template="plotly_dark",
-                    height=340,
-                    margin=dict(t=50, b=10),
-                    showlegend=False
-                )
-                st.plotly_chart(fig_pizza, use_container_width=True)
-
-            with col_g2:
-                st.markdown("#### 📌 Contexto & benchmarks")
-                st.markdown(f"""
-| Indicador | Valor |
-|-----------|-------|
-| 🌍 Área afetada | **{area_editavel:,.0f} ha** |
-| 💲 Custo/ha | **R$ {custo_ajustado}/ha** |
-| 🚁 Fator logística | **{fator_logistica}×** |
-| 🧾 **Custo total** | **R$ {custo_total:,.0f}** |
-| 🏛️ Equivalente em escolas | **≈ {int(custo_total / 1_200_000):,} salas** |
-| 🏥 Equiv. em UBS construídas | **≈ {int(custo_total / 800_000):,} unidades** |
-                """)
-                st.caption(
-                    "Benchmarks: custo médio de construção de sala de aula escolar "
-                    "R$ 1,2M (FNDE 2023); UBS padrão R$ 800K (MS 2023)."
-                )
-
-            # ── Aviso metodológico ─────────────────────────────────────────────────────────
-            with st.expander("⚠️ Metodologia e limitações desta estimativa", expanded=False):
-                st.markdown("""
-**Fontes dos custos de referência:**
-- IBAMA / PrevFogo — *Relatório Anual de Operações de Combate a Incêndios Florestais (2022)*
-- Soares, R.V. & Batista, A.C. — *Incêndios Florestais: controle, efeitos e uso do fogo* (2007)
-- Atualização monetária via IPCA acumulado até 2024
-
-**O que está incluído no custo:**
-- Horas de voo de helicópteros e aviões de combate (Air Tractor, Ipanema)
-- Diárias e deslocamento de brigadistas
-- Insumos diretos (retardante, bombas d'água)
-- Overhead operacional (logística, comunicação, coordenação)
-
-**O que NÃO está incluído:**
-- Dano ambiental (carbono emitido, biodiversidade perdida)
-- Custo de recuperação/reflorestamento pós-incêndio
-- Perdas agrícolas e pecuárias
-- Dano à saúde pública (fumaça, doenças respiratórias)
-- Custo para o produtor rural
-
-**Para uso acadêmico/MBA:** valores são estimativas de ordem de grandeza. Para análise de custo-benefício precisa, consulte os relatórios PrevFogo do IBAMA e os dados do SINAFLOR.
-                """)
-
-        # ----------------------------------------------------------
-        # ABA 5 — ESG & CAR
+        # ABA 4 — ESG & CAR POR PROPRIEDADE
         # ----------------------------------------------------------
         with aba_esg:
-            st.subheader("🌿 Dashboard ESG — Risco de Queimada & Rastreabilidade CAR")
+            st.subheader("🌿 Análise ESG por Propriedade Rural — Cadastro Ambiental Rural (SICAR)")
             st.markdown(
-                "Ferramenta de apoio à decisão para **instituições financeiras, seguradoras e "
-                "investidores ESG** do agronegócio. Cruza dados de satélite com o "
-                "**Cadastro Ambiental Rural (SICAR)** para gerar um score de risco por região."
+                "Cruza os **polígonos reais de imóveis rurais** baixados do SICAR "
+                "com os focos de incêndio detectados por satélite. "
+                "Identifica quais propriedades foram atingidas, com quantos focos, "
+                "e em quantos dos últimos 5 anos houve ocorrência — "
+                "base para due diligence ESG, análise de crédito rural e seguro agrícola."
             )
 
-            # ── Detectar bioma da seleção ──────────────────────────────────────────────
-            _BIOMAS_CONHECIDOS = [
-                "Amazônia", "Cerrado", "Pantanal",
-                "Mata Atlântica", "Caatinga", "Pampa"
-            ]
-            bioma_esg = next(
-                (b for b in _BIOMAS_CONHECIDOS if b.lower() in val_sel.lower()),
-                "Cerrado"   # fallback mais comum no agro
-            )
-
-            # ── Busca SICAR ────────────────────────────────────────────────────────────
-            with st.spinner("🔗 Consultando SICAR..."):
-                dados_sicar = consultar_sicar(estado_dd)
-
-            # ── Anomalia (pode já ter sido calculada na aba de gráficos) ──────────────
-            df_anom_esg = pd.DataFrame()
-            if "MODIS" in fonte_escolhida and not df_modis_temporal.empty and ano_modis > 2001:
-                try:
-                    df_anom_esg = calcular_anomalia_modis(geom_json_str, ano_modis)
-                except Exception:
-                    pass
-
-            # ── Calcular score ESG ─────────────────────────────────────────────────────
-            esg = calcular_score_esg(
-                total_valor, area_km2_local,
-                fonte_escolhida, bioma_esg, df_anom_esg
-            )
-
-            st.markdown("---")
-
-            # ── Linha 1: KPIs do SICAR + Score ────────────────────────────────────────
-            c1, c2, c3, c4 = st.columns([1, 1, 1, 1.4])
-            with c1:
-                st.metric(
-                    "🏘️ Imóveis no CAR", f"{dados_sicar['imoveis']:,}",
-                    help=f"Estado {estado_dd} · {dados_sicar['fonte']}"
-                )
-            with c2:
-                st.metric(
-                    "🌾 Área cadastrada", f"{dados_sicar['area_mha']:.1f} Mha",
-                    help="Área total registrada no CAR para o estado selecionado"
-                )
-            with c3:
-                area_afetada_ha = total_valor * 100 if "MODIS" in fonte_escolhida else total_valor * 15
-                pct_afetada = (area_afetada_ha / (dados_sicar["area_mha"] * 1e6) * 100) if dados_sicar["area_mha"] > 0 else 0
-                st.metric(
-                    "🔥 Área afetada/CAR",
-                    f"{pct_afetada:.2f}%",
-                    help="% da área CAR cadastrada potencialmente afetada por fogo no período"
-                )
-            with c4:
-                st.markdown(
-                    f"""
-                    <div style="border:1px solid {esg['cor']}55; border-radius:10px;
-                                padding:12px 16px; background:{esg['cor']}14; text-align:center;">
-                        <div style="font-size:12px; color:#aaa; margin-bottom:2px;">
-                            ESG Fire Risk Score
-                        </div>
-                        <div style="font-size:36px; font-weight:800; color:{esg['cor']}; line-height:1;">
-                            {esg['score_final']}
-                        </div>
-                        <div style="font-size:13px; font-weight:600; color:{esg['cor']}; margin-top:4px;">
-                            ● Risco {esg['tier']}
-                        </div>
-                        <div style="font-size:11px; color:#888; margin-top:4px;">
-                            escala 0 (sem risco) → 100 (crítico)
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-
-            st.markdown("---")
-
-            # ── Linha 2: Gauge + Radar + Tabela de pilares ────────────────────────────
-            col_gauge, col_radar = st.columns([1, 1.1])
-
-            with col_gauge:
-                fig_gauge = go.Figure(go.Indicator(
-                    mode="gauge+number+delta",
-                    value=esg["score_final"],
-                    number={"suffix": " / 100", "font": {"size": 28}},
-                    delta={"reference": 50, "increasing": {"color": "#e74c3c"},
-                           "decreasing": {"color": "#27ae60"}},
-                    title={"text": f"ESG Fire Risk — {val_sel}", "font": {"size": 13}},
-                    gauge={
-                        "axis": {"range": [0, 100], "tickwidth": 1,
-                                 "tickcolor": "#555", "tickvals": [0,25,50,75,100]},
-                        "bar": {"color": esg["cor"], "thickness": 0.28},
-                        "bgcolor": "rgba(0,0,0,0)",
-                        "borderwidth": 0,
-                        "steps": [
-                            {"range": [0, 25],  "color": "#27ae6022"},
-                            {"range": [25, 50], "color": "#f39c1222"},
-                            {"range": [50, 75], "color": "#e67e2222"},
-                            {"range": [75, 100],"color": "#e74c3c22"},
-                        ],
-                        "threshold": {
-                            "line": {"color": esg["cor"], "width": 3},
-                            "thickness": 0.85,
-                            "value": esg["score_final"]
-                        }
-                    }
-                ))
-                fig_gauge.update_layout(
-                    template="plotly_dark", height=300,
-                    margin=dict(t=50, b=10, l=20, r=20)
-                )
-                st.plotly_chart(fig_gauge, use_container_width=True)
-
-            with col_radar:
-                fig_radar = go.Figure(go.Scatterpolar(
-                    r=[esg["score_exp"], esg["score_rec"], esg["score_sens"],
-                       esg["score_exp"]],
-                    theta=["Exposição ao Fogo", "Recorrência Histórica",
-                           "Sensibilidade do Bioma", "Exposição ao Fogo"],
-                    fill="toself",
-                    fillcolor=esg["cor"] + "33",
-                    line=dict(color=esg["cor"], width=2),
-                    name="Score ESG"
-                ))
-                fig_radar.update_layout(
-                    template="plotly_dark",
-                    polar=dict(
-                        radialaxis=dict(visible=True, range=[0, 100],
-                                        tickfont=dict(size=9)),
-                        angularaxis=dict(tickfont=dict(size=11))
-                    ),
-                    height=300,
-                    margin=dict(t=40, b=20, l=40, r=40),
-                    title=dict(text="Decomposição do Risco", font=dict(size=13))
-                )
-                st.plotly_chart(fig_radar, use_container_width=True)
-
-            # ── Tabela dos 3 pilares ───────────────────────────────────────────────────
-            df_pilares = pd.DataFrame([
-                {
-                    "Pilar": "🔥 Exposição ao Fogo",
-                    "Peso": "50%",
-                    "Score (0–100)": esg["score_exp"],
-                    "Descrição": (
-                        f"{'Área queimada' if 'MODIS' in fonte_escolhida else 'Focos INPE'} "
-                        f"vs benchmark do {bioma_esg}"
-                    )
-                },
-                {
-                    "Pilar": "📅 Recorrência Histórica",
-                    "Peso": "30%",
-                    "Score (0–100)": esg["score_rec"],
-                    "Descrição": (
-                        f"{int((df_anom_esg['Anomalia (%)'] > 30).sum())} meses acima "
-                        f"de +30% da média histórica"
-                        if not df_anom_esg.empty else "Dado indisponível (MODIS necessário)"
-                    )
-                },
-                {
-                    "Pilar": "🌿 Sensibilidade do Bioma",
-                    "Peso": "20%",
-                    "Score (0–100)": esg["score_sens"],
-                    "Descrição": f"{bioma_esg} — fragilidade ecológica (IUCN/WWF)"
-                },
-                {
-                    "Pilar": "⚖️ Score Final Ponderado",
-                    "Peso": "100%",
-                    "Score (0–100)": esg["score_final"],
-                    "Descrição": f"Risco {esg['tier']} — benchmarks INPE/MapBiomas/IUCN"
-                },
-            ])
-
-            def _color_score(val):
-                if not isinstance(val, (int, float)):
-                    return ""
-                if val < 25:   return "background-color:#27ae6025;"
-                if val < 50:   return "background-color:#f39c1225;"
-                if val < 75:   return "background-color:#e67e2225;"
-                return "background-color:#e74c3c25;"
-
-            st.dataframe(
-                df_pilares.style.applymap(
-                    _color_score, subset=["Score (0–100)"]
-                ),
-                hide_index=True, use_container_width=True
-            )
-
-            st.markdown("---")
-
-            # ── Ranking de municípios por risco (se disponível) ───────────────────────
-            if not df_top_mun_modis.empty and tipo_analise != "Por Município":
-                st.markdown("#### 🏙️ Municípios com maior exposição a fogo")
-                st.caption(
-                    "Base para decisões de crédito rural, seguro agrícola e due diligence ESG. "
-                    "Municípios com alta concentração de queimadas representam maior risco de "
-                    "inadimplência climática e passivo ambiental."
-                )
-
-                df_mun_esg = df_top_mun_modis.copy()
-                df_mun_esg.columns = ["Município", "Área Queimada (km²)"]
-                df_mun_esg["Risco Relativo"] = (
-                    df_mun_esg["Área Queimada (km²)"] /
-                    df_mun_esg["Área Queimada (km²)"].max() * 100
-                ).round(1)
-                df_mun_esg["Classificação ESG"] = df_mun_esg["Risco Relativo"].apply(
-                    lambda v: "🔴 Crítico" if v > 75
-                    else ("🟠 Alto" if v > 50
-                    else ("🟡 Moderado" if v > 25
-                    else "🟢 Baixo"))
-                )
-                df_mun_esg["Ação Recomendada"] = df_mun_esg["Classificação ESG"].map({
-                    "🔴 Crítico":  "Suspender crédito / acionar CAR",
-                    "🟠 Alto":     "Revisão de apólice / due diligence",
-                    "🟡 Moderado": "Monitoramento trimestral",
-                    "🟢 Baixo":    "Manter — baixo risco sistêmico",
-                })
-
-                fig_mun = px.bar(
-                    df_mun_esg, x="Área Queimada (km²)", y="Município",
-                    orientation="h", color="Risco Relativo",
-                    color_continuous_scale=["#27ae60", "#f39c12", "#e74c3c"],
-                    title="Ranking de Exposição ao Fogo por Município",
-                    text="Área Queimada (km²)"
-                )
-                fig_mun.update_layout(
-                    template="plotly_dark", height=320,
-                    margin=dict(t=40, b=10, l=10, r=10),
-                    coloraxis_showscale=False
-                )
-                fig_mun.update_traces(texttemplate="%{text:.0f} km²", textposition="outside")
-                st.plotly_chart(fig_mun, use_container_width=True)
-
-                st.dataframe(
-                    df_mun_esg[["Município","Área Queimada (km²)","Classificação ESG","Ação Recomendada"]],
-                    hide_index=True, use_container_width=True
-                )
-
-                # Export ESG
-                csv_esg = df_mun_esg.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "⬇️ Exportar relatório ESG (.csv)",
-                    csv_esg,
-                    file_name=f"esg_risco_fogo_{val_sel.replace(' ','_')}_{ano_modis}.csv",
-                    mime="text/csv"
-                )
-
-            elif tipo_analise == "Por Município":
+            # ── Verifica escala de análise ──────────────────────────────────────────────
+            if tipo_analise != "Por Município":
                 st.info(
-                    "ℹ️ Para análise por município, o score acima já representa "
-                    "o risco específico da propriedade selecionada. "
-                    "Para comparar municípios, selecione análise **Por Estado** ou **Por Bioma**."
+                    "ℹ️ A análise por propriedade CAR requer seleção **Por Município**. "
+                    "O download individual de polígonos por estado ou bioma ultrapassaria "
+                    "centenas de mil imóveis — inviável em tempo real.\n\n"
+                    "**Como usar:** selecione *Por Município* na barra lateral, "
+                    "escolha o município de interesse e clique em Gerar Dashboard novamente."
+                )
+                if not df_top_mun_modis.empty:
+                    st.markdown("**Municípios com maior área queimada na análise atual — sugestões:**")
+                    st.dataframe(df_top_mun_modis.rename(
+                        columns={"Município": "Município", "Valor": "Área Queimada (km²)"}
+                    ), hide_index=True, use_container_width=True)
+                st.stop()
+
+            # ── Obtém código IBGE do município ─────────────────────────────────────────
+            code_ibge = None
+            for col in ["code_muni", "CD_MUN", "CD_GEOCMU", "geocodigo"]:
+                if col in limite.columns:
+                    code_ibge = int(str(limite[col].iloc[0])[:7])
+                    break
+
+            if code_ibge is None:
+                st.error("⚠️ Não foi possível identificar o código IBGE do município na camada geobr.")
+                st.stop()
+
+            # ── Download dos polígonos CAR ─────────────────────────────────────────────
+            with st.spinner(f"🔗 Baixando imóveis rurais do SICAR para código IBGE {code_ibge}..."):
+                gdf_car = baixar_car_municipio(code_ibge)
+
+            if gdf_car.empty:
+                st.error(
+                    f"⚠️ O SICAR não retornou dados para o município (código {code_ibge}). "
+                    "Possíveis causas: município sem imóveis cadastrados, "
+                    "API do SICAR indisponível no momento, ou código IBGE não reconhecido. "
+                    "Tente novamente em alguns minutos ou verifique em "
+                    "[car.gov.br](https://car.gov.br/publico/imoveis/index)."
+                )
+                st.stop()
+
+            n_imoveis = len(gdf_car)
+            area_total_car_ha = gdf_car["num_area"].sum()
+
+            # ── Cruzamento espacial: focos INPE × imóveis CAR ─────────────────────────
+            gdf_focos_mun = gpd.GeoDataFrame()
+            if "INPE" in fonte_escolhida and not df_rec.empty:
+                gdf_focos_mun = gpd.GeoDataFrame(
+                    df_rec,
+                    geometry=gpd.points_from_xy(df_rec["longitude"], df_rec["latitude"]),
+                    crs="EPSG:4326"
+                )
+                # Focos dentro de cada imóvel CAR
+                join = gpd.sjoin(gdf_focos_mun, gdf_car, predicate="within", how="inner")
+                focos_por_imovel = (
+                    join.groupby("cod_imovel")
+                    .size()
+                    .reset_index(name="n_focos")
+                )
+                gdf_car = gdf_car.merge(focos_por_imovel, on="cod_imovel", how="left")
+                gdf_car["n_focos"] = gdf_car["n_focos"].fillna(0).astype(int)
+                n_com_fogo = (gdf_car["n_focos"] > 0).sum()
+            elif "MODIS" in fonte_escolhida and area_queimada_img is not None:
+                # Para MODIS: usa GEE reduceRegions para verificar interseção com área queimada
+                features_ee = [
+                    ee.Feature(
+                        ee.Geometry(row.geometry.__geo_interface__),
+                        {"cod_imovel": str(row.cod_imovel)}
+                    )
+                    for _, row in gdf_car.iterrows()
+                ]
+                fc_car = ee.FeatureCollection(features_ee)
+                try:
+                    with st.spinner("☁️ Cruzando imóveis CAR com área queimada MODIS no GEE..."):
+                        stats_car = _gee_retry(lambda: (
+                            ee.Image.pixelArea().divide(1e4)   # → hectares
+                            .updateMask(area_queimada_img.gt(0))
+                            .reduceRegions(
+                                collection=fc_car,
+                                reducer=ee.Reducer.sum().setOutputs(["area_ha_queimada"]),
+                                scale=500, tileScale=4
+                            ).getInfo()
+                        ))
+                    recs_modis = [
+                        {
+                            "cod_imovel": f["properties"]["cod_imovel"],
+                            "n_focos":    round(f["properties"].get("area_ha_queimada", 0), 2)
+                        }
+                        for f in stats_car["features"]
+                        if f["properties"].get("area_ha_queimada", 0) > 0
+                    ]
+                    df_modis_car = pd.DataFrame(recs_modis)
+                    if not df_modis_car.empty:
+                        gdf_car = gdf_car.merge(df_modis_car, on="cod_imovel", how="left")
+                        gdf_car["n_focos"] = gdf_car["n_focos"].fillna(0)
+                    else:
+                        gdf_car["n_focos"] = 0
+                except Exception as e_modis:
+                    st.warning(f"⚠️ Cruzamento MODIS×CAR falhou: {e_modis}")
+                    gdf_car["n_focos"] = 0
+                n_com_fogo = (gdf_car["n_focos"] > 0).sum()
+            else:
+                gdf_car["n_focos"] = 0
+                n_com_fogo = 0
+
+            # ── Recorrência histórica MODIS (últimos 5 anos) ──────────────────────────
+            gdf_car["anos_com_fogo"] = 0
+            anos_historico = list(range(
+                datetime.now().year - 5, datetime.now().year
+            ))
+            imoveis_afetados = gdf_car[gdf_car["n_focos"] > 0].head(50)  # limita a 50 para GEE
+
+            if not imoveis_afetados.empty:
+                with st.spinner(
+                    f"📅 Calculando recorrência histórica ({anos_historico[0]}–"
+                    f"{anos_historico[-1]}) para {len(imoveis_afetados)} imóveis afetados..."
+                ):
+                    try:
+                        feats_afetados = {
+                            "type": "FeatureCollection",
+                            "features": [
+                                {
+                                    "type": "Feature",
+                                    "geometry": row.geometry.__geo_interface__,
+                                    "properties": {"cod_imovel": str(row.cod_imovel)}
+                                }
+                                for _, row in imoveis_afetados.iterrows()
+                            ]
+                        }
+                        rec_dict = calcular_recorrencia_modis_car(
+                            json.dumps(feats_afetados), anos_historico
+                        )
+                        gdf_car["anos_com_fogo"] = gdf_car["cod_imovel"].map(
+                            lambda c: rec_dict.get(str(c), 0)
+                        )
+                    except Exception as e_rec:
+                        st.caption(f"⚠️ Recorrência não calculada: {e_rec}")
+
+            # ── Classificação ESG por imóvel ───────────────────────────────────────────
+            def _classificar(row):
+                focos = row["n_focos"]
+                anos  = row["anos_com_fogo"]
+                if focos == 0:
+                    return "🟢 Sem ocorrência"
+                if focos <= 3 and anos <= 1:
+                    return "🟡 Baixo risco"
+                if focos <= 10 or anos <= 2:
+                    return "🟠 Risco moderado"
+                if anos >= 4:
+                    return "🔴 Reincidente crítico"
+                return "🔴 Alto risco"
+
+            def _acao(cls):
+                return {
+                    "🟢 Sem ocorrência":    "Manter financiamento — conformidade OK",
+                    "🟡 Baixo risco":       "Monitoramento semestral",
+                    "🟠 Risco moderado":    "Revisão de apólice / exigir CAR atualizado",
+                    "🔴 Alto risco":        "Due diligence obrigatória / suspender crédito",
+                    "🔴 Reincidente crítico":"Suspender crédito · notificar IBAMA · acionamento CAR",
+                }.get(cls, "—")
+
+            gdf_car["classificacao_esg"] = gdf_car.apply(_classificar, axis=1)
+            gdf_car["acao_recomendada"]  = gdf_car["classificacao_esg"].apply(_acao)
+
+            # ── KPIs ──────────────────────────────────────────────────────────────────
+            st.markdown("---")
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("🏘️ Imóveis no CAR", f"{n_imoveis:,}")
+            k2.metric("🌾 Área cadastrada", f"{area_total_car_ha/1000:.1f} mil ha")
+            k3.metric("🔥 Com fogo detectado",
+                      f"{n_com_fogo:,}",
+                      f"{n_com_fogo/n_imoveis*100:.1f}% do total" if n_imoveis else "")
+            k4.metric("🔁 Reincidentes (≥3 anos)",
+                      f"{(gdf_car['anos_com_fogo'] >= 3).sum():,}")
+            k5.metric("🔴 Risco crítico",
+                      f"{gdf_car['classificacao_esg'].str.contains('crítico').sum():,}",
+                      delta_color="inverse")
+
+            st.markdown("---")
+
+            # ── Mapa Folium: polígonos CAR coloridos por classificação ESG ────────────
+            col_map, col_tab = st.columns([1.4, 1])
+
+            with col_map:
+                st.markdown("#### 🗺️ Mapa de Risco ESG por Imóvel Rural")
+
+                centro_esg = limite.geometry.union_all().centroid
+                m_esg = folium.Map(
+                    location=[centro_esg.y, centro_esg.x],
+                    zoom_start=11,
+                    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                    attr="Esri"
+                )
+
+                # Limite do município
+                folium.GeoJson(
+                    limite.__geo_interface__,
+                    style_function=lambda x: {
+                        "fillColor": "transparent",
+                        "color": "#00d4ff",
+                        "weight": 2.5,
+                        "dashArray": "6 4"
+                    },
+                    name="Limite Municipal"
+                ).add_to(m_esg)
+
+                # Paleta de cores por classificação ESG
+                _cor_esg = {
+                    "🟢 Sem ocorrência":     "#27ae60",
+                    "🟡 Baixo risco":        "#f1c40f",
+                    "🟠 Risco moderado":     "#e67e22",
+                    "🔴 Alto risco":         "#e74c3c",
+                    "🔴 Reincidente crítico":"#7b0d0d",
+                }
+
+                def _style_car(feature):
+                    cls = feature["properties"].get("classificacao_esg", "🟢 Sem ocorrência")
+                    cor = _cor_esg.get(cls, "#aaaaaa")
+                    return {
+                        "fillColor":   cor,
+                        "color":       "#ffffff",
+                        "weight":      0.4,
+                        "fillOpacity": 0.72,
+                    }
+
+                # Converte apenas as colunas serializáveis para GeoJson
+                gdf_car_mapa = gdf_car[[
+                    "cod_imovel", "num_area", "n_focos",
+                    "anos_com_fogo", "classificacao_esg", "geometry"
+                ]].copy()
+
+                folium.GeoJson(
+                    gdf_car_mapa.__geo_interface__,
+                    style_function=_style_car,
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=["cod_imovel", "num_area", "n_focos",
+                                "anos_com_fogo", "classificacao_esg"],
+                        aliases=["CAR:", "Área (ha):", "Focos de fogo:",
+                                 "Anos com fogo:", "Classificação ESG:"],
+                        localize=True,
+                        sticky=True
+                    ),
+                    name="Imóveis CAR"
+                ).add_to(m_esg)
+
+                # Focos INPE como marcadores (apenas se INPE e não vazio)
+                if "INPE" in fonte_escolhida and not gdf_focos_mun.empty:
+                    fg_focos = folium.FeatureGroup(name="Focos INPE")
+                    for _, row in gdf_focos_mun.iterrows():
+                        folium.CircleMarker(
+                            location=[row.geometry.y, row.geometry.x],
+                            radius=3,
+                            color="#ff4500",
+                            fill=True,
+                            fill_color="#ff4500",
+                            fill_opacity=0.8,
+                            weight=0
+                        ).add_to(fg_focos)
+                    fg_focos.add_to(m_esg)
+
+                # Legenda
+                legenda_esg = """
+                <div style="position:fixed; bottom:24px; right:10px; z-index:9999;
+                            background:rgba(15,15,15,0.88); padding:12px 16px;
+                            border-radius:10px; font-size:12px; color:#eee;
+                            line-height:1.9; border:1px solid rgba(255,255,255,0.12);">
+                    <b style="font-size:13px;">Risco ESG — CAR</b><br>
+                    <span style="color:#27ae60;">■</span> Sem ocorrência<br>
+                    <span style="color:#f1c40f;">■</span> Baixo risco<br>
+                    <span style="color:#e67e22;">■</span> Risco moderado<br>
+                    <span style="color:#e74c3c;">■</span> Alto risco<br>
+                    <span style="color:#7b0d0d;">■</span> Reincidente crítico<br>
+                    <span style="color:#ff4500;">●</span> Foco INPE
+                </div>"""
+                m_esg.get_root().html.add_child(folium.Element(legenda_esg))
+                folium.LayerControl().add_to(m_esg)
+
+                _esg_key = f"esg_{val_sel}_{n_imoveis}"
+                st_folium(m_esg, width=None, height=560,
+                          returned_objects=[], key=_esg_key)
+
+            # ── Tabela de imóveis com ocorrência de fogo ──────────────────────────────
+            with col_tab:
+                st.markdown("#### 📋 Propriedades com Fogo Detectado")
+
+                df_tabela = (
+                    gdf_car[gdf_car["n_focos"] > 0]
+                    .sort_values(["anos_com_fogo", "n_focos"], ascending=False)
+                    [[
+                        "cod_imovel", "num_area", "des_condic",
+                        "n_focos", "anos_com_fogo",
+                        "classificacao_esg", "acao_recomendada"
+                    ]]
+                    .rename(columns={
+                        "cod_imovel":        "Cód. CAR",
+                        "num_area":          "Área (ha)",
+                        "des_condic":        "Status CAR",
+                        "n_focos":           "Focos / Área (ha)",
+                        "anos_com_fogo":     f"Anos c/ fogo ({anos_historico[0]}–{anos_historico[-1]})",
+                        "classificacao_esg": "Classificação ESG",
+                        "acao_recomendada":  "Ação Recomendada"
+                    })
+                    .reset_index(drop=True)
+                )
+
+                if df_tabela.empty:
+                    st.success("✅ Nenhum imóvel com fogo detectado no período analisado.")
+                else:
+                    def _cor_linha(row):
+                        mapa = {
+                            "🟢 Sem ocorrência":     "background-color:#27ae6015;",
+                            "🟡 Baixo risco":        "background-color:#f1c40f20;",
+                            "🟠 Risco moderado":     "background-color:#e67e2225;",
+                            "🔴 Alto risco":         "background-color:#e74c3c25;",
+                            "🔴 Reincidente crítico":"background-color:#7b0d0d35;",
+                        }
+                        cls = row.get("Classificação ESG", "")
+                        cor = mapa.get(cls, "")
+                        return [cor] * len(row)
+
+                    st.dataframe(
+                        df_tabela.style.apply(_cor_linha, axis=1),
+                        hide_index=True,
+                        use_container_width=True,
+                        height=520
+                    )
+
+            # ── Gráfico de distribuição ESG ───────────────────────────────────────────
+            st.markdown("---")
+            col_pizza, col_bar = st.columns(2)
+
+            with col_pizza:
+                contagem_esg = (
+                    gdf_car["classificacao_esg"]
+                    .value_counts()
+                    .reset_index()
+                    .rename(columns={"classificacao_esg": "Classificação", "count": "Imóveis"})
+                )
+                cores_pizza = {
+                    "🟢 Sem ocorrência":     "#27ae60",
+                    "🟡 Baixo risco":        "#f1c40f",
+                    "🟠 Risco moderado":     "#e67e22",
+                    "🔴 Alto risco":         "#e74c3c",
+                    "🔴 Reincidente crítico":"#7b0d0d",
+                }
+                fig_pizza_esg = px.pie(
+                    contagem_esg,
+                    names="Classificação", values="Imóveis",
+                    color="Classificação", color_discrete_map=cores_pizza,
+                    title="Distribuição de Imóveis por Classe ESG",
+                    hole=0.42
+                )
+                fig_pizza_esg.update_layout(
+                    template="plotly_dark", height=320,
+                    margin=dict(t=40, b=10), showlegend=True,
+                    legend=dict(font=dict(size=10))
+                )
+                st.plotly_chart(fig_pizza_esg, use_container_width=True)
+
+            with col_bar:
+                df_rec_hist = (
+                    gdf_car[gdf_car["anos_com_fogo"] > 0]
+                    ["anos_com_fogo"]
+                    .value_counts()
+                    .sort_index()
+                    .reset_index()
+                    .rename(columns={"anos_com_fogo": "Anos com Fogo", "count": "Nº de Imóveis"})
+                )
+                if not df_rec_hist.empty:
+                    fig_hist = px.bar(
+                        df_rec_hist,
+                        x="Anos com Fogo", y="Nº de Imóveis",
+                        title=f"Recorrência de Fogo por Imóvel ({anos_historico[0]}–{anos_historico[-1]})",
+                        color="Anos com Fogo",
+                        color_continuous_scale=["#f1c40f", "#e67e22", "#e74c3c", "#7b0d0d"],
+                        text="Nº de Imóveis"
+                    )
+                    fig_hist.update_layout(
+                        template="plotly_dark", height=320,
+                        margin=dict(t=40, b=10),
+                        coloraxis_showscale=False,
+                        xaxis=dict(tickmode="linear", dtick=1)
+                    )
+                    fig_hist.update_traces(textposition="outside")
+                    st.plotly_chart(fig_hist, use_container_width=True)
+                else:
+                    st.info("Sem dados de recorrência histórica para exibir.")
+
+            # ── Export ────────────────────────────────────────────────────────────────
+            st.markdown("---")
+            if not df_tabela.empty:
+                csv_esg = df_tabela.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "⬇️ Exportar relatório ESG por propriedade (.csv)",
+                    data=csv_esg,
+                    file_name=f"esg_car_{val_sel.replace(' ','_')}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    use_container_width=False
                 )
 
             # ── Metodologia ───────────────────────────────────────────────────────────
-            with st.expander("📐 Metodologia do ESG Fire Risk Score", expanded=False):
+            with st.expander("📐 Metodologia e fontes de dados", expanded=False):
                 st.markdown(f"""
-**Fórmula:**
-```
-Score Final = 0,50 × Exposição + 0,30 × Recorrência + 0,20 × Sensibilidade
-```
+**Polígonos CAR:** SICAR — Sistema Nacional de Cadastro Ambiental Rural (MAPA/SFB)
+URL: `car.gov.br/publico/municipios/shapefile?municipio[id]={code_ibge}&tema=IMOVEL`
+Total de imóveis baixados: **{n_imoveis:,}** · Área total: **{area_total_car_ha/1000:.1f} mil ha**
 
-| Pilar | Fonte | Cálculo |
-|-------|-------|---------|
-| Exposição ao Fogo | MODIS MCD64A1 / INPE BDQueimadas | % área queimada ÷ benchmark do bioma × 25 |
-| Recorrência | MODIS histórico 2001–presente | Meses com anomalia > +30% × 12,5 |
-| Sensibilidade | IUCN Red List of Ecosystems / WWF | Score fixo por bioma (Mata Atlântica=90, Pampa=38) |
+**Cruzamento de focos:**
+{"- INPE BDQueimadas: focos detectados no período selecionado, cruzados via `gpd.sjoin` (ponto dentro do polígono CAR)" if "INPE" in fonte_escolhida else "- MODIS MCD64A1: área queimada detectada pelo satélite Terra, cruzada via GEE `reduceRegions` por imóvel CAR"}
 
-**Benchmarks de referência (área queimada/ano normal):**
-Amazônia 0,3% · Cerrado 2,5% · Pantanal 1,5% · Mata Atlântica 0,1% · Caatinga 1,0% · Pampa 0,2%
+**Recorrência histórica:** MODIS MCD64A1 — {anos_historico[0]}–{anos_historico[-1]}
+GEE `reduceRegions` com `Reducer.max()` para detectar BurnDate > 0 por imóvel, por ano.
+Análise limitada aos **50 imóveis mais afetados** para viabilizar o tempo de processamento GEE.
 
-**Fonte CAR:** {dados_sicar['fonte']}
+**Classificação ESG:**
+| Classe | Critério |
+|--------|----------|
+| 🟢 Sem ocorrência | 0 focos no período |
+| 🟡 Baixo risco | ≤3 focos · ≤1 ano histórico |
+| 🟠 Risco moderado | ≤10 focos ou ≤2 anos históricos |
+| 🔴 Alto risco | >10 focos sem reincidência estrutural |
+| 🔴 Reincidente crítico | ≥4 anos com fogo nos últimos 5 anos |
 
-**Escala de risco:**
-- 🟢 **Verde (0–25):** Risco baixo — operações normais de crédito e seguro
-- 🟡 **Amarelo (25–50):** Risco moderado — monitoramento recomendado
-- 🟠 **Laranja (50–75):** Risco alto — revisão de apólices e garantias
-- 🔴 **Vermelho (75–100):** Risco crítico — due diligence obrigatória, verificar conformidade CAR
-
-**Fontes:** INPE BDQueimadas · MODIS MCD64A1 · SICAR/MAPA · MapBiomas Fire Collection · IUCN · WWF Living Planet
+**Base legal:** Lei 12.651/2012 (Código Florestal) — CAR obrigatório para acesso a crédito rural (art. 78-A).
+Imóveis com queimadas não autorizadas estão sujeitos a embargo IBAMA e perda de financiamento.
+Referências: SICAR/MAPA · INPE BDQueimadas · NASA MODIS MCD64A1 · GRI 304-4 · TCFD Physical Risks.
                 """)
 
         # ----------------------------------------------------------
-        # ABA 6 — EXPORTAR DADOS
+        # ABA 5 — EXPORTAR DADOS
         # ----------------------------------------------------------
         with aba_export:
             st.subheader("⬇️ Exportar Dados da Análise")
