@@ -8,7 +8,7 @@ from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 import plotly.express as px
 import plotly.graph_objects as go
-import requests, warnings, time, unicodedata, re, json, io, calendar, zipfile, tempfile, os
+import requests, warnings, time, unicodedata, re, json, io, calendar
 import ee
 from io import BytesIO
 import traceback
@@ -213,132 +213,6 @@ def buscar_cidades(uf):
     except:
         pass
     return ["Erro ao carregar cidades"]
-
-# =====================================================================
-# ESG / CAR — FUNÇÕES DE ANÁLISE POR PROPRIEDADE RURAL
-# =====================================================================
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def baixar_car_municipio(code_ibge: int) -> gpd.GeoDataFrame:
-    """
-    Baixa os polígonos de imóveis rurais cadastrados no CAR (SICAR)
-    para o município indicado pelo código IBGE de 7 dígitos.
-
-    Fonte: Sistema Nacional de Cadastro Ambiental Rural
-    URL:   https://car.gov.br/publico/municipios/shapefile?municipio[id]={code}&tema=IMOVEL
-    Retorna GeoDataFrame com colunas: cod_imovel, num_area, des_condic, dat_entrad, geometry
-    """
-    url = (
-        f"https://car.gov.br/publico/municipios/shapefile"
-        f"?municipio[id]={code_ibge}&tema=IMOVEL"
-    )
-    try:
-        r = requests.get(url, timeout=90, verify=False)
-        if r.status_code != 200 or len(r.content) < 500:
-            return gpd.GeoDataFrame()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            zip_path = os.path.join(tmp, "car.zip")
-            with open(zip_path, "wb") as f:
-                f.write(r.content)
-
-            with zipfile.ZipFile(zip_path, "r") as z:
-                z.extractall(tmp)
-
-            # Encontra o .shp dentro de possíveis subpastas
-            shp_files = []
-            for root, _, files in os.walk(tmp):
-                for fname in files:
-                    if fname.endswith(".shp"):
-                        shp_files.append(os.path.join(root, fname))
-
-            if not shp_files:
-                return gpd.GeoDataFrame()
-
-            gdf = gpd.read_file(shp_files[0])
-            gdf = gdf.to_crs("EPSG:4326")
-
-            # Normaliza colunas — o SICAR pode entregar nomes em maiúsculas
-            gdf.columns = [c.lower() for c in gdf.columns]
-
-            # Garante que as colunas essenciais existam
-            for col, default in [
-                ("cod_imovel", "N/D"),
-                ("num_area",   0.0),
-                ("des_condic", "N/D"),
-                ("dat_entrad", None),
-            ]:
-                if col not in gdf.columns:
-                    gdf[col] = default
-
-            gdf["num_area"] = pd.to_numeric(gdf["num_area"], errors="coerce").fillna(0)
-            gdf = gdf[gdf.geometry.notnull()]
-            gdf = gdf[gdf.geometry.is_valid]
-            return gdf[["cod_imovel", "num_area", "des_condic", "dat_entrad", "geometry"]]
-
-    except Exception:
-        return gpd.GeoDataFrame()
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def calcular_recorrencia_modis_car(features_geojson: str, anos: list) -> dict:
-    """
-    Para cada imóvel CAR (GeoJSON de FeatureCollection), conta em quantos
-    dos 'anos' fornecidos houve área queimada detectada pelo MODIS MCD64A1.
-
-    Retorna dict {cod_imovel: anos_com_fogo (int)}
-
-    Estratégia: uma chamada reduceRegions por ano → N chamadas GEE no total,
-    mas cada uma é leve pois analisa só a coleção de imóveis afetados.
-    """
-    try:
-        fc = ee.FeatureCollection(json.loads(features_geojson))
-    except Exception:
-        return {}
-
-    recorrencia = {}
-
-    for ano in anos:
-        try:
-            burned = (
-                ee.ImageCollection("MODIS/061/MCD64A1")
-                .filterDate(f"{ano}-01-01", f"{ano}-12-31")
-                .select("BurnDate")
-                .max()
-            )
-            stats = _gee_retry(lambda: burned.reduceRegions(
-                collection=fc,
-                reducer=ee.Reducer.max().setOutputs(["burn_max"]),
-                scale=500,
-                tileScale=4,
-            ).getInfo())
-
-            for feat in stats.get("features", []):
-                props = feat.get("properties", {})
-                cod   = props.get("cod_imovel", feat.get("id", "?"))
-                if props.get("burn_max", 0) and props["burn_max"] > 0:
-                    recorrencia[cod] = recorrencia.get(cod, 0) + 1
-        except Exception:
-            continue   # ano sem dado → ignora, não aborta
-
-    return recorrencia
-
-
-def _gee_retry(fn, max_tentativas=4, espera_inicial=6):
-    """Retry com backoff exponencial para erros 429 do GEE."""
-    for tentativa in range(max_tentativas):
-        try:
-            return fn()
-        except Exception as e:
-            eh_ultimo = tentativa == max_tentativas - 1
-            msg = str(e).lower()
-            eh_429 = any(t in msg for t in [
-                "too many concurrent", "429", "quota", "rate limit", "resource exhausted"
-            ])
-            if eh_ultimo or not eh_429:
-                raise
-            time.sleep(espera_inicial * (2 ** tentativa))
-
 
 @st.cache_data(show_spinner=False)
 def carregar_fronteira(tipo, estado, bioma, municipio):
@@ -648,6 +522,263 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hint=
     # RETORNA O DNBR ORIGINAL!
     # Isso fará as cores do mapa combinarem perfeitamente com as do gráfico
     return poly, dnbr
+
+# =============================================================
+# FEATURE 1 — RANKING DE ANOS POR MÊS (para alerta de anomalia)
+# =============================================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def buscar_ranking_anos_mes(geom_json_str, mes, ano_ref):
+    """
+    Retorna DataFrame com área queimada MODIS por ano para um mês específico.
+    Usa um único .getInfo() server-side para minimizar latência.
+    """
+    geom_dict = json.loads(geom_json_str)
+    if 'features' in geom_dict:
+        ee_geom = ee.Geometry(geom_dict['features'][0]['geometry']).simplify(maxError=5000)
+    else:
+        ee_geom = ee.Geometry(geom_dict).simplify(maxError=5000)
+
+    anos_list = ee.List(list(range(2001, ano_ref + 1)))
+    mes_n    = ee.Number(mes)
+
+    def area_para_ano(ano):
+        ano_n = ee.Number(ano)
+        ini   = ee.Date.fromYMD(ano_n, mes_n, 1)
+        img   = (
+            ee.ImageCollection('MODIS/061/MCD64A1')
+            .filterDate(ini, ini.advance(1, 'month'))
+            .filterBounds(ee_geom)
+            .select('BurnDate').max().clip(ee_geom)
+        )
+        val = (
+            ee.Image.pixelArea().divide(1e6)
+            .updateMask(img.gt(0))
+            .reduceRegion(
+                reducer=ee.Reducer.sum(),
+                geometry=ee_geom, scale=1000,
+                maxPixels=1e13, tileScale=8, bestEffort=True
+            ).get('area')
+        )
+        return ee.Feature(None, {'ano': ano_n, 'area': ee.Algorithms.If(val, val, 0)})
+
+    try:
+        fc   = ee.FeatureCollection(anos_list.map(area_para_ano))
+        info = fc.getInfo()
+        registros = [
+            {
+                'ano':      int(f['properties']['ano']),
+                'area_km2': round(float(f['properties'].get('area') or 0), 2)
+            }
+            for f in info['features']
+        ]
+    except Exception:
+        # fallback: lista vazia — não bloqueia o resto do app
+        registros = []
+
+    return (
+        pd.DataFrame(registros)
+        .sort_values('area_km2', ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+# =============================================================
+# FEATURE 2 — PRODES WFS + CORREDOR PRODES × MODIS
+# =============================================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def buscar_prodes_wfs(geom_json_str, ano):
+    """
+    Busca polígonos PRODES de desmatamento via TerraBrasilis WFS.
+    Tenta Amazônia e Cerrado; usa GetCapabilities para descobrir
+    dinamicamente o nome da camada.
+    """
+    from shapely.geometry import shape as shp_shape
+
+    geom_dict = json.loads(geom_json_str)
+    if 'features' in geom_dict:
+        geom_dict = geom_dict['features'][0]['geometry']
+    g_shape = shp_shape(geom_dict)
+    minx, miny, maxx, maxy = g_shape.bounds
+
+    session = requests.Session()
+    retries = Retry(total=2, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    hdrs = {"User-Agent": "Mozilla/5.0"}
+
+    endpoints = [
+        ("Amazônia",  "https://terrabrasilis.dpi.inpe.br/geoserver/prodes-amazon-nb/ows"),
+        ("Cerrado",   "https://terrabrasilis.dpi.inpe.br/geoserver/prodes-cerrado-nb/ows"),
+    ]
+
+    for bioma_nome, base_url in endpoints:
+        # 1. Descobre layers via GetCapabilities
+        layer_name = None
+        try:
+            cap = session.get(
+                base_url,
+                params={"service": "WFS", "version": "1.0.0", "request": "GetCapabilities"},
+                headers=hdrs, timeout=20, verify=False
+            )
+            if cap.status_code == 200:
+                nomes = re.findall(r'<Name>([^<]+)</Name>', cap.text)
+                for n in nomes:
+                    if 'deforest' in n.lower() or 'desmat' in n.lower():
+                        layer_name = n
+                        break
+        except Exception:
+            pass
+
+        # Fallback: nome mais provável
+        if not layer_name:
+            prefix = "prodes-amazon-nb" if "amazon" in base_url else "prodes-cerrado-nb"
+            layer_name = f"{prefix}:yearly_deforestation_biome"
+
+        # 2. Busca feições
+        try:
+            params = {
+                "service": "WFS", "version": "1.0.0", "request": "GetFeature",
+                "typeName": layer_name, "outputFormat": "application/json",
+                "BBOX": f"{miny},{minx},{maxy},{maxx},EPSG:4326",
+                "maxFeatures": 3000
+            }
+            # Filtra por ano se a camada suportar CQL
+            cql = f"year={ano}"
+            resp = session.get(
+                base_url, params={**params, "CQL_FILTER": cql},
+                headers=hdrs, timeout=45, verify=False
+            )
+            if resp.status_code != 200:
+                # tenta sem CQL (filtra localmente depois)
+                resp = session.get(base_url, params=params, headers=hdrs, timeout=45, verify=False)
+
+            if resp.status_code == 200:
+                data = resp.json()
+                feats = data.get('features', [])
+                if feats:
+                    gdf = gpd.GeoDataFrame.from_features(feats, crs='EPSG:4326')
+                    # Filtra por ano localmente (cobertura de ambos os casos)
+                    for col_ano in ['year', 'ano', 'Year']:
+                        if col_ano in gdf.columns:
+                            gdf = gdf[gdf[col_ano].astype(str) == str(ano)]
+                            break
+                    if not gdf.empty:
+                        gdf['bioma_prodes'] = bioma_nome
+                        return gdf, bioma_nome, None
+        except Exception as e:
+            continue
+
+    return gpd.GeoDataFrame(), None, (
+        "Dados PRODES não disponíveis via TerraBrasilis para este bioma/período. "
+        "Verifique a conectividade ou tente outro ano."
+    )
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def analisar_corredor_prodes_modis(geom_json_str, ano, mes_referencia):
+    """
+    Hipótese clássica da literatura: queimada antecede desmatamento em ~30-60 dias.
+
+    Para cada polígono PRODES do ano:
+      - Verifica se houve área queimada MODIS (MCD64A1) nos 60 dias ANTES
+        do mês de referência (pico de queimadas).
+      - Calcula: % da área desmatada que foi precedida por fogo.
+
+    Retorna dict com GeoDataFrame, estatísticas e imagens GEE para o mapa.
+    """
+    result = {
+        'gdf_prodes':  gpd.GeoDataFrame(),
+        'stats':       {},
+        'erro':        None,
+        'ee_fogo_img': None,
+    }
+
+    # 1. Polígonos PRODES
+    gdf_prodes, bioma_nome, erro = buscar_prodes_wfs(geom_json_str, ano)
+    if erro or gdf_prodes.empty:
+        result['erro'] = erro or "Nenhum polígono PRODES encontrado para este ano/região."
+        return result
+
+    # 2. Janela temporal do fogo (60 dias antes do mês de referência)
+    data_fim_fogo = datetime(ano, mes_referencia, 1)
+    data_ini_fogo = data_fim_fogo - timedelta(days=60)
+
+    # 3. GEE — imagem de fogo no período pré-desmatamento
+    geom_dict = json.loads(geom_json_str)
+    if 'features' in geom_dict:
+        ee_geom = ee.Geometry(geom_dict['features'][0]['geometry']).simplify(maxError=5000)
+    else:
+        ee_geom = ee.Geometry(geom_dict).simplify(maxError=5000)
+
+    img_fogo = (
+        ee.ImageCollection('MODIS/061/MCD64A1')
+        .filterDate(
+            ee.Date(data_ini_fogo.strftime('%Y-%m-%d')),
+            ee.Date(data_fim_fogo.strftime('%Y-%m-%d'))
+        )
+        .filterBounds(ee_geom)
+        .select('BurnDate').max().clip(ee_geom)
+    )
+    img_fogo_bin = img_fogo.gt(0)   # 1 = houve fogo, 0 = não
+
+    # 4. Converte PRODES → FeatureCollection EE (máx. 500 polígonos)
+    gdf_clip = gdf_prodes.head(500)
+    try:
+        feats_ee = [
+            ee.Feature(ee.Geometry(row.geometry.__geo_interface__))
+            for _, row in gdf_clip.iterrows()
+            if row.geometry is not None and row.geometry.is_valid
+        ]
+        if not feats_ee:
+            result['erro'] = "Nenhum polígono PRODES válido após filtragem."
+            return result
+
+        fc_prodes_ee = ee.FeatureCollection(feats_ee)
+        geom_prodes_ee = fc_prodes_ee.geometry()
+
+        # Área total dos polígonos PRODES na região
+        area_prodes = (
+            ee.Image.pixelArea().divide(1e6)
+            .reduceRegion(
+                reducer=ee.Reducer.sum(),
+                geometry=geom_prodes_ee,
+                scale=500, maxPixels=1e13, bestEffort=True
+            ).get('area')
+        )
+
+        # Área de sobreposição: desmatamento + fogo precedente
+        area_sobr = (
+            ee.Image.pixelArea().divide(1e6)
+            .updateMask(img_fogo_bin)
+            .reduceRegion(
+                reducer=ee.Reducer.sum(),
+                geometry=geom_prodes_ee,
+                scale=500, maxPixels=1e13, bestEffort=True
+            ).get('area')
+        )
+
+        area_prodes_val = round(float(area_prodes.getInfo() or 0), 2)
+        area_sobr_val   = round(float(area_sobr.getInfo()   or 0), 2)
+        pct             = round(area_sobr_val / area_prodes_val * 100, 1) if area_prodes_val > 0 else 0
+
+        result['stats'] = {
+            'n_poligonos':             len(gdf_clip),
+            'area_prodes_km2':         area_prodes_val,
+            'area_fogo_precedente_km2': area_sobr_val,
+            'pct_precedido_fogo':      pct,
+            'bioma':                   bioma_nome,
+            'janela_fogo':             (
+                f"{data_ini_fogo.strftime('%d/%m/%Y')} → "
+                f"{data_fim_fogo.strftime('%d/%m/%Y')}"
+            ),
+        }
+        result['gdf_prodes']  = gdf_clip
+        result['ee_fogo_img'] = img_fogo
+
+    except Exception as e:
+        result['erro'] = f"Erro no cálculo GEE: {traceback.format_exc(limit=2)}"
+
+    return result
+
 
 # =============================================================
 # --- INTERFACE (BARRA LATERAL) ---
@@ -1115,11 +1246,11 @@ if st.session_state.gerar_dashboard:
         # =============================================================
         # --- ABAS PRINCIPAIS ---
         # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_esg, aba_export = st.tabs([
+        aba_mapa, aba_graficos, aba_nbr, aba_corredor, aba_export = st.tabs([
             "🗺️ Mapa de Focos",
             "📈 Gráficos & Anomalia",
             "🔬 Severidade (NBR Sentinel-2)",
-            "🌿 ESG & CAR — Por Propriedade",
+            "🌲 Corredor PRODES×Fogo",
             "⬇️ Exportar Dados"
         ])
 
@@ -1379,7 +1510,86 @@ if st.session_state.gerar_dashboard:
                     if not df_anomalia.empty:
                         col_ano = f'Área {ano_modis} (km²)'
 
-                        # --- Resumo geral em linguagem simples ---
+                        # ─────────────────────────────────────────────────────
+                        # ⚠️  ALERTA AUTOMÁTICO DE ANOMALIA CRÍTICA
+                        # Dispara quando o mês selecionado está ≥ 100 % acima
+                        # da média histórica — transforma dado em narrativa.
+                        # ─────────────────────────────────────────────────────
+                        MESES_PT = {
+                            1:'Janeiro', 2:'Fevereiro', 3:'Março',    4:'Abril',
+                            5:'Maio',    6:'Junho',     7:'Julho',    8:'Agosto',
+                            9:'Setembro',10:'Outubro',  11:'Novembro',12:'Dezembro'
+                        }
+                        row_mes_sel = df_anomalia[df_anomalia['Mês'] == mes_modis]
+                        if not row_mes_sel.empty:
+                            anom_mes = float(row_mes_sel.iloc[0]['Anomalia (%)'])
+                            media_mes = float(row_mes_sel.iloc[0]['Média Histórica (km²)'])
+
+                            if anom_mes >= 100:
+                                nome_mes_pt = MESES_PT[mes_modis]
+                                with st.spinner(
+                                    "🔍 Contextualizando anomalia na série histórica..."
+                                ):
+                                    df_rank = buscar_ranking_anos_mes(
+                                        geom_json_str, mes_modis, ano_modis
+                                    )
+
+                                # Determina posição do ano na série
+                                rank_row = df_rank[df_rank['ano'] == ano_modis]
+                                posicao  = int(rank_row.index[0]) + 1 if not rank_row.empty else None
+
+                                # Constrói contexto histórico narrativo
+                                if posicao == 1:
+                                    contexto_hist = (
+                                        f"o <b>pior registro histórico</b> para {nome_mes_pt} "
+                                        f"em toda a série MODIS (2001–{ano_modis})"
+                                    )
+                                else:
+                                    anos_anteriores = df_rank[df_rank['ano'] < ano_modis]
+                                    area_atual = float(rank_row['area_km2'].iloc[0]) if not rank_row.empty else 0
+                                    mais_intensos = anos_anteriores[
+                                        anos_anteriores['area_km2'] >= area_atual
+                                    ]
+                                    if not mais_intensos.empty:
+                                        ultimo_pior = int(mais_intensos['ano'].max())
+                                        contexto_hist = (
+                                            f"o <b>pior registro</b> para {nome_mes_pt} "
+                                            f"desde <b>{ultimo_pior}</b>"
+                                        )
+                                    else:
+                                        contexto_hist = (
+                                            f"o <b>{posicao}º mais intenso</b> "
+                                            f"em toda a série histórica para {nome_mes_pt}"
+                                        )
+
+                                st.markdown(f"""
+                                <div style="
+                                    background: linear-gradient(135deg,#6b0000 0%,#c0392b 100%);
+                                    border-radius:12px; padding:18px 22px; margin-bottom:20px;
+                                    box-shadow:0 4px 24px rgba(192,57,43,0.55);
+                                    border-left:6px solid #ff6b6b;">
+                                    <div style="font-size:20px; font-weight:800; color:#fff;
+                                                margin-bottom:8px; letter-spacing:.5px;">
+                                        ⚠️ ALERTA DE ANOMALIA CRÍTICA
+                                    </div>
+                                    <div style="font-size:15px; color:#ffeeba; line-height:1.7;">
+                                        <b>{nome_mes_pt}/{ano_modis}</b> está
+                                        <b style="color:#ff8a80; font-size:19px;">
+                                            +{anom_mes:.0f}%
+                                        </b>
+                                        acima da média histórica para
+                                        <b>{val_sel}</b> —
+                                        {contexto_hist}.
+                                    </div>
+                                    <div style="font-size:12px; color:rgba(255,255,255,0.65);
+                                                margin-top:10px;">
+                                        📊 Fonte: MODIS/MCD64A1 &nbsp;·&nbsp;
+                                        Série 2001–{ano_modis} &nbsp;·&nbsp;
+                                        Média histórica {nome_mes_pt}: {media_mes:,.1f} km²
+                                    </div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                        # ─────────────────────────────────────────────────────
                         meses_acima = df_anomalia[df_anomalia['Anomalia (%)'] > 20]
                         meses_abaixo = df_anomalia[df_anomalia['Anomalia (%)'] < -20]
                         mes_pior = df_anomalia.loc[df_anomalia['Anomalia (%)'].idxmax()]
@@ -1809,445 +2019,242 @@ if st.session_state.gerar_dashboard:
                         )
 
         # ----------------------------------------------------------
-        # ABA 4 — ESG & CAR POR PROPRIEDADE
+        # ABA 4 — CORREDOR PRODES × FOGO
         # ----------------------------------------------------------
-        with aba_esg:
-            st.subheader("🌿 Análise ESG por Propriedade Rural — Cadastro Ambiental Rural (SICAR)")
-            st.markdown(
-                "Cruza os **polígonos reais de imóveis rurais** baixados do SICAR "
-                "com os focos de incêndio detectados por satélite. "
-                "Identifica quais propriedades foram atingidas, com quantos focos, "
-                "e em quantos dos últimos 5 anos houve ocorrência — "
-                "base para due diligence ESG, análise de crédito rural e seguro agrícola."
-            )
-
-            # ── Verifica escala de análise ──────────────────────────────────────────────
-            if tipo_analise != "Por Município":
+        with aba_corredor:
+            if "INPE" in fonte_escolhida:
                 st.info(
-                    "ℹ️ A análise por propriedade CAR requer seleção **Por Município**. "
-                    "O download individual de polígonos por estado ou bioma ultrapassaria "
-                    "centenas de mil imóveis — inviável em tempo real.\n\n"
-                    "**Como usar:** selecione *Por Município* na barra lateral, "
-                    "escolha o município de interesse e clique em Gerar Dashboard novamente."
+                    "💡 A análise do Corredor PRODES×Fogo usa dados de área queimada "
+                    "(MODIS) e alertas de desmatamento (PRODES/INPE). "
+                    "Para ativá-la, selecione **🗺️ Área Queimada (NASA MODIS)** "
+                    "na barra lateral."
                 )
-                if not df_top_mun_modis.empty:
-                    st.markdown("**Municípios com maior área queimada na análise atual — sugestões:**")
-                    st.dataframe(df_top_mun_modis.rename(
-                        columns={"Município": "Município", "Valor": "Área Queimada (km²)"}
-                    ), hide_index=True, use_container_width=True)
-                st.stop()
-
-            # ── Obtém código IBGE do município ─────────────────────────────────────────
-            code_ibge = None
-            for col in ["code_muni", "CD_MUN", "CD_GEOCMU", "geocodigo"]:
-                if col in limite.columns:
-                    code_ibge = int(str(limite[col].iloc[0])[:7])
-                    break
-
-            if code_ibge is None:
-                st.error("⚠️ Não foi possível identificar o código IBGE do município na camada geobr.")
-                st.stop()
-
-            # ── Download dos polígonos CAR ─────────────────────────────────────────────
-            with st.spinner(f"🔗 Baixando imóveis rurais do SICAR para código IBGE {code_ibge}..."):
-                gdf_car = baixar_car_municipio(code_ibge)
-
-            if gdf_car.empty:
-                st.error(
-                    f"⚠️ O SICAR não retornou dados para o município (código {code_ibge}). "
-                    "Possíveis causas: município sem imóveis cadastrados, "
-                    "API do SICAR indisponível no momento, ou código IBGE não reconhecido. "
-                    "Tente novamente em alguns minutos ou verifique em "
-                    "[car.gov.br](https://car.gov.br/publico/imoveis/index)."
-                )
-                st.stop()
-
-            n_imoveis = len(gdf_car)
-            area_total_car_ha = gdf_car["num_area"].sum()
-
-            # ── Cruzamento espacial: focos INPE × imóveis CAR ─────────────────────────
-            gdf_focos_mun = gpd.GeoDataFrame()
-            if "INPE" in fonte_escolhida and not df_rec.empty:
-                gdf_focos_mun = gpd.GeoDataFrame(
-                    df_rec,
-                    geometry=gpd.points_from_xy(df_rec["longitude"], df_rec["latitude"]),
-                    crs="EPSG:4326"
-                )
-                # Focos dentro de cada imóvel CAR
-                join = gpd.sjoin(gdf_focos_mun, gdf_car, predicate="within", how="inner")
-                focos_por_imovel = (
-                    join.groupby("cod_imovel")
-                    .size()
-                    .reset_index(name="n_focos")
-                )
-                gdf_car = gdf_car.merge(focos_por_imovel, on="cod_imovel", how="left")
-                gdf_car["n_focos"] = gdf_car["n_focos"].fillna(0).astype(int)
-                n_com_fogo = (gdf_car["n_focos"] > 0).sum()
-            elif "MODIS" in fonte_escolhida and area_queimada_img is not None:
-                # Para MODIS: usa GEE reduceRegions para verificar interseção com área queimada
-                features_ee = [
-                    ee.Feature(
-                        ee.Geometry(row.geometry.__geo_interface__),
-                        {"cod_imovel": str(row.cod_imovel)}
-                    )
-                    for _, row in gdf_car.iterrows()
-                ]
-                fc_car = ee.FeatureCollection(features_ee)
-                try:
-                    with st.spinner("☁️ Cruzando imóveis CAR com área queimada MODIS no GEE..."):
-                        stats_car = _gee_retry(lambda: (
-                            ee.Image.pixelArea().divide(1e4)   # → hectares
-                            .updateMask(area_queimada_img.gt(0))
-                            .reduceRegions(
-                                collection=fc_car,
-                                reducer=ee.Reducer.sum().setOutputs(["area_ha_queimada"]),
-                                scale=500, tileScale=4
-                            ).getInfo()
-                        ))
-                    recs_modis = [
-                        {
-                            "cod_imovel": f["properties"]["cod_imovel"],
-                            "n_focos":    round(f["properties"].get("area_ha_queimada", 0), 2)
-                        }
-                        for f in stats_car["features"]
-                        if f["properties"].get("area_ha_queimada", 0) > 0
-                    ]
-                    df_modis_car = pd.DataFrame(recs_modis)
-                    if not df_modis_car.empty:
-                        gdf_car = gdf_car.merge(df_modis_car, on="cod_imovel", how="left")
-                        gdf_car["n_focos"] = gdf_car["n_focos"].fillna(0)
-                    else:
-                        gdf_car["n_focos"] = 0
-                except Exception as e_modis:
-                    st.warning(f"⚠️ Cruzamento MODIS×CAR falhou: {e_modis}")
-                    gdf_car["n_focos"] = 0
-                n_com_fogo = (gdf_car["n_focos"] > 0).sum()
             else:
-                gdf_car["n_focos"] = 0
-                n_com_fogo = 0
+                st.subheader("🌲 Corredor de Desmatamento × Queimada (PRODES + MODIS)")
 
-            # ── Recorrência histórica MODIS (últimos 5 anos) ──────────────────────────
-            gdf_car["anos_com_fogo"] = 0
-            anos_historico = list(range(
-                datetime.now().year - 5, datetime.now().year
-            ))
-            imoveis_afetados = gdf_car[gdf_car["n_focos"] > 0].head(50)  # limita a 50 para GEE
+                st.markdown("""
+                <div style="background:rgba(255,255,255,0.04); border-left:5px solid #e67e22;
+                            border-radius:8px; padding:14px 18px; margin-bottom:18px;">
+                    <b style="font-size:15px;">Hipótese da literatura:</b>
+                    <span style="font-size:14px; color:#bbb;">
+                        Queimadas precedem o desmatamento em <b>~30–60 dias</b>.
+                        O fogo é utilizado para remover a vegetação e facilitar a conversão do solo —
+                        padrão documentado em estudos publicados na <i>Nature</i>,
+                        <i>Global Change Biology</i> e relatórios do IPAM.
+                        Esta aba sobrepõe os alertas do <b>PRODES/INPE</b> com os focos
+                        <b>MODIS MCD64A1</b> para testar essa hipótese na região selecionada.
+                    </span>
+                </div>
+                """, unsafe_allow_html=True)
 
-            if not imoveis_afetados.empty:
-                with st.spinner(
-                    f"📅 Calculando recorrência histórica ({anos_historico[0]}–"
-                    f"{anos_historico[-1]}) para {len(imoveis_afetados)} imóveis afetados..."
-                ):
-                    try:
-                        feats_afetados = {
-                            "type": "FeatureCollection",
-                            "features": [
+                col_cfg1, col_cfg2 = st.columns(2)
+                with col_cfg1:
+                    mes_ref_corredor = st.selectbox(
+                        "📅 Mês de referência (pico de queimadas):",
+                        list(range(1, 13)),
+                        index=mes_modis - 1,
+                        format_func=lambda m: {
+                            1:'Jan',2:'Fev',3:'Mar',4:'Abr',5:'Mai',6:'Jun',
+                            7:'Jul',8:'Ago',9:'Set',10:'Out',11:'Nov',12:'Dez'
+                        }[m],
+                        key="mes_ref_corredor"
+                    )
+                with col_cfg2:
+                    st.markdown(
+                        "<div style='margin-top:28px; font-size:13px; color:#aaa;'>"
+                        "O fogo analisado cobre os <b>60 dias anteriores</b> ao mês selecionado.</div>",
+                        unsafe_allow_html=True
+                    )
+
+                if st.button("🔍 Analisar Corredor PRODES×Fogo", type="primary",
+                             use_container_width=True):
+                    with st.spinner(
+                        "Buscando polígonos PRODES e calculando sobreposição com MODIS… "
+                        "(pode levar ~30–60 s)"
+                    ):
+                        resultado = analisar_corredor_prodes_modis(
+                            geom_json_str, ano_modis, mes_ref_corredor
+                        )
+
+                    if resultado['erro']:
+                        st.warning(f"⚠️ {resultado['erro']}")
+                        st.markdown(
+                            "**Dica:** O PRODES disponibiliza dados principalmente para "
+                            "Amazônia e Cerrado. Verifique se a região selecionada "
+                            "está dentro desses biomas."
+                        )
+                    else:
+                        s = resultado['stats']
+                        gdf_p = resultado['gdf_prodes']
+
+                        # ── Métricas principais ──
+                        st.markdown("### 📊 Resultado da Análise")
+                        mc1, mc2, mc3, mc4 = st.columns(4)
+                        mc1.metric("🌲 Polígonos PRODES", f"{s['n_poligonos']:,}")
+                        mc2.metric("📐 Área Desmatada", f"{s['area_prodes_km2']:,.1f} km²")
+                        mc3.metric("🔥 Precedida por Fogo", f"{s['area_fogo_precedente_km2']:,.1f} km²")
+                        mc4.metric(
+                            "✅ % Confirmado",
+                            f"{s['pct_precedido_fogo']:.1f}%",
+                            delta=f"Hipótese {'✓ validada' if s['pct_precedido_fogo'] > 30 else '– inconclusiva'}"
+                        )
+
+                        # ── Interpretação narrativa ──
+                        pct = s['pct_precedido_fogo']
+                        if pct >= 50:
+                            cor_interp, icon_interp = "#c0392b", "🔴"
+                            txt_interp = (
+                                f"<b>{pct:.0f}%</b> da área desmatada no {s['bioma']} em "
+                                f"<b>{ano_modis}</b> foi precedida por queimada nos 60 dias anteriores "
+                                f"({s['janela_fogo']}). Isso corrobora fortemente a hipótese de que "
+                                f"o fogo é usado como ferramenta de desmatamento."
+                            )
+                        elif pct >= 25:
+                            cor_interp, icon_interp = "#e67e22", "🟡"
+                            txt_interp = (
+                                f"<b>{pct:.0f}%</b> da área desmatada foi precedida por fogo. "
+                                f"Correlação moderada, consistente com a literatura para o bioma "
+                                f"{s['bioma']} em períodos fora do pico histórico."
+                            )
+                        else:
+                            cor_interp, icon_interp = "#27ae60", "🟢"
+                            txt_interp = (
+                                f"Apenas <b>{pct:.0f}%</b> da área desmatada foi precedida por fogo. "
+                                f"A hipótese não se confirma neste período — pode indicar "
+                                f"desmatamento por mecanização sem uso do fogo."
+                            )
+
+                        st.markdown(f"""
+                        <div style="background:rgba(255,255,255,0.04);
+                                    border-left:5px solid {cor_interp};
+                                    border-radius:8px; padding:14px 18px; margin:16px 0;">
+                            <span style="font-size:16px;">{icon_interp}</span>
+                            <span style="font-size:14px; color:#ddd; margin-left:8px;">
+                                {txt_interp}
+                            </span>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        # ── Mapa de sobreposição ──
+                        st.markdown("### 🗺️ Mapa de Sobreposição PRODES × Fogo Precedente")
+                        col_mapa_est = st.columns(1)[0]
+
+                        centro_p = limite.geometry.union_all().centroid
+                        m_corr = folium.Map(
+                            location=[centro_p.y, centro_p.x],
+                            zoom_start=6,
+                            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                            attr="Esri"
+                        )
+
+                        # Borda da região
+                        folium.GeoJson(
+                            limite.__geo_interface__,
+                            style_function=lambda x: {
+                                'fillOpacity': 0.03, 'color': '#00d4ff',
+                                'weight': 2, 'dashArray': '6 3'
+                            }
+                        ).add_to(m_corr)
+
+                        # PRODES polygons (laranja)
+                        if not gdf_p.empty:
+                            folium.GeoJson(
+                                gdf_p.__geo_interface__,
+                                name="🌲 PRODES — Desmatamento",
+                                style_function=lambda x: {
+                                    'fillColor': '#e67e22',
+                                    'fillOpacity': 0.55,
+                                    'color': '#d35400',
+                                    'weight': 1
+                                },
+                                tooltip=folium.GeoJsonTooltip(
+                                    fields=[c for c in ['year', 'ano', 'classname', 'area_ha']
+                                            if c in gdf_p.columns][:2],
+                                    aliases=['Ano PRODES:', 'Classe:'][:len(
+                                        [c for c in ['year', 'ano', 'classname', 'area_ha']
+                                         if c in gdf_p.columns][:2]
+                                    )]
+                                ) if len([c for c in ['year', 'ano'] if c in gdf_p.columns]) > 0
+                                  else None
+                            ).add_to(m_corr)
+
+                        # Fogo precedente via GEE (vermelho)
+                        if resultado['ee_fogo_img'] is not None:
+                            m_corr.add_ee_layer(
+                                resultado['ee_fogo_img'].updateMask(
+                                    resultado['ee_fogo_img'].gt(0)
+                                ),
                                 {
-                                    "type": "Feature",
-                                    "geometry": row.geometry.__geo_interface__,
-                                    "properties": {"cod_imovel": str(row.cod_imovel)}
-                                }
-                                for _, row in imoveis_afetados.iterrows()
-                            ]
-                        }
-                        rec_dict = calcular_recorrencia_modis_car(
-                            json.dumps(feats_afetados), anos_historico
+                                    'min': 1, 'max': 366,
+                                    'palette': ['#ffe082', '#ff8a65', '#e53935']
+                                },
+                                '🔥 Fogo precedente (MODIS)',
+                                opacity=0.8
+                            )
+
+                        # Legenda manual
+                        leg_corr = """
+                        <div style="position:fixed;bottom:28px;left:12px;z-index:9999;
+                                    background:rgba(15,15,15,0.85);padding:10px 14px;
+                                    border-radius:10px;font-size:12px;color:#ecf0f1;
+                                    line-height:2;border:1px solid rgba(255,255,255,0.1);">
+                          <b>Legenda</b><br>
+                          <span style="color:#e67e22;">■</span> PRODES — Desmatamento<br>
+                          <span style="color:#e53935;">■</span> Fogo Precedente (60 dias)
+                        </div>"""
+                        m_corr.get_root().html.add_child(folium.Element(leg_corr))
+                        folium.LayerControl(collapsed=False).add_to(m_corr)
+
+                        st_folium(
+                            m_corr, width=None, height=600,
+                            returned_objects=[],
+                            key=f"mapa_corredor_{val_sel}_{ano_modis}_{mes_ref_corredor}"
                         )
-                        gdf_car["anos_com_fogo"] = gdf_car["cod_imovel"].map(
-                            lambda c: rec_dict.get(str(c), 0)
-                        )
-                    except Exception as e_rec:
-                        st.caption(f"⚠️ Recorrência não calculada: {e_rec}")
 
-            # ── Classificação ESG por imóvel ───────────────────────────────────────────
-            def _classificar(row):
-                focos = row["n_focos"]
-                anos  = row["anos_com_fogo"]
-                if focos == 0:
-                    return "🟢 Sem ocorrência"
-                if focos <= 3 and anos <= 1:
-                    return "🟡 Baixo risco"
-                if focos <= 10 or anos <= 2:
-                    return "🟠 Risco moderado"
-                if anos >= 4:
-                    return "🔴 Reincidente crítico"
-                return "🔴 Alto risco"
+                        # ── Tabela PRODES ──
+                        if not gdf_p.empty:
+                            st.markdown("### 📋 Polígonos PRODES (amostra)")
+                            cols_show = [c for c in gdf_p.columns
+                                         if c not in ['geometry', 'bioma_prodes']][:6]
+                            st.dataframe(
+                                gdf_p[cols_show].head(20),
+                                hide_index=True,
+                                use_container_width=True
+                            )
+                            csv_prodes = gdf_p[cols_show].to_csv(index=False).encode('utf-8-sig')
+                            st.download_button(
+                                "📄 Baixar CSV — Polígonos PRODES",
+                                data=csv_prodes,
+                                file_name=f"prodes_{val_sel}_{ano_modis}.csv",
+                                mime="text/csv",
+                                use_container_width=True
+                            )
 
-            def _acao(cls):
-                return {
-                    "🟢 Sem ocorrência":    "Manter financiamento — conformidade OK",
-                    "🟡 Baixo risco":       "Monitoramento semestral",
-                    "🟠 Risco moderado":    "Revisão de apólice / exigir CAR atualizado",
-                    "🔴 Alto risco":        "Due diligence obrigatória / suspender crédito",
-                    "🔴 Reincidente crítico":"Suspender crédito · notificar IBAMA · acionamento CAR",
-                }.get(cls, "—")
+                        # ── Nota metodológica ──
+                        with st.expander("📖 Metodologia e referências"):
+                            st.markdown(f"""
+                            **Fonte dos polígonos de desmatamento:** PRODES Digital (INPE) via
+                            [TerraBrasilis WFS](https://terrabrasilis.dpi.inpe.br/geoserver) —
+                            resolução espacial: 30 m (Landsat).
 
-            gdf_car["classificacao_esg"] = gdf_car.apply(_classificar, axis=1)
-            gdf_car["acao_recomendada"]  = gdf_car["classificacao_esg"].apply(_acao)
+                            **Fonte dos focos de fogo:** MODIS/MCD64A1 (NASA) via Google Earth
+                            Engine — resolução: 500 m, atualização mensal.
 
-            # ── KPIs ──────────────────────────────────────────────────────────────────
-            st.markdown("---")
-            k1, k2, k3, k4, k5 = st.columns(5)
-            k1.metric("🏘️ Imóveis no CAR", f"{n_imoveis:,}")
-            k2.metric("🌾 Área cadastrada", f"{area_total_car_ha/1000:.1f} mil ha")
-            k3.metric("🔥 Com fogo detectado",
-                      f"{n_com_fogo:,}",
-                      f"{n_com_fogo/n_imoveis*100:.1f}% do total" if n_imoveis else "")
-            k4.metric("🔁 Reincidentes (≥3 anos)",
-                      f"{(gdf_car['anos_com_fogo'] >= 3).sum():,}")
-            k5.metric("🔴 Risco crítico",
-                      f"{gdf_car['classificacao_esg'].str.contains('crítico').sum():,}",
-                      delta_color="inverse")
+                            **Janela temporal analisada:** {s['janela_fogo']}
 
-            st.markdown("---")
+                            **Metodologia:** Para cada pixel da máscara PRODES de {ano_modis},
+                            verificou-se se o mesmo pixel apresentou área queimada no MODIS
+                            dentro da janela de 60 dias anteriores ao mês de referência.
+                            A sobreposição é calculada via `reduceRegion` no GEE com
+                            escala de 500 m.
 
-            # ── Mapa Folium: polígonos CAR coloridos por classificação ESG ────────────
-            col_map, col_tab = st.columns([1.4, 1])
-
-            with col_map:
-                st.markdown("#### 🗺️ Mapa de Risco ESG por Imóvel Rural")
-
-                centro_esg = limite.geometry.union_all().centroid
-                m_esg = folium.Map(
-                    location=[centro_esg.y, centro_esg.x],
-                    zoom_start=11,
-                    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
-                    attr="Esri"
-                )
-
-                # Limite do município
-                folium.GeoJson(
-                    limite.__geo_interface__,
-                    style_function=lambda x: {
-                        "fillColor": "transparent",
-                        "color": "#00d4ff",
-                        "weight": 2.5,
-                        "dashArray": "6 4"
-                    },
-                    name="Limite Municipal"
-                ).add_to(m_esg)
-
-                # Paleta de cores por classificação ESG
-                _cor_esg = {
-                    "🟢 Sem ocorrência":     "#27ae60",
-                    "🟡 Baixo risco":        "#f1c40f",
-                    "🟠 Risco moderado":     "#e67e22",
-                    "🔴 Alto risco":         "#e74c3c",
-                    "🔴 Reincidente crítico":"#7b0d0d",
-                }
-
-                def _style_car(feature):
-                    cls = feature["properties"].get("classificacao_esg", "🟢 Sem ocorrência")
-                    cor = _cor_esg.get(cls, "#aaaaaa")
-                    return {
-                        "fillColor":   cor,
-                        "color":       "#ffffff",
-                        "weight":      0.4,
-                        "fillOpacity": 0.72,
-                    }
-
-                # Converte apenas as colunas serializáveis para GeoJson
-                gdf_car_mapa = gdf_car[[
-                    "cod_imovel", "num_area", "n_focos",
-                    "anos_com_fogo", "classificacao_esg", "geometry"
-                ]].copy()
-
-                folium.GeoJson(
-                    gdf_car_mapa.__geo_interface__,
-                    style_function=_style_car,
-                    tooltip=folium.GeoJsonTooltip(
-                        fields=["cod_imovel", "num_area", "n_focos",
-                                "anos_com_fogo", "classificacao_esg"],
-                        aliases=["CAR:", "Área (ha):", "Focos de fogo:",
-                                 "Anos com fogo:", "Classificação ESG:"],
-                        localize=True,
-                        sticky=True
-                    ),
-                    name="Imóveis CAR"
-                ).add_to(m_esg)
-
-                # Focos INPE como marcadores (apenas se INPE e não vazio)
-                if "INPE" in fonte_escolhida and not gdf_focos_mun.empty:
-                    fg_focos = folium.FeatureGroup(name="Focos INPE")
-                    for _, row in gdf_focos_mun.iterrows():
-                        folium.CircleMarker(
-                            location=[row.geometry.y, row.geometry.x],
-                            radius=3,
-                            color="#ff4500",
-                            fill=True,
-                            fill_color="#ff4500",
-                            fill_opacity=0.8,
-                            weight=0
-                        ).add_to(fg_focos)
-                    fg_focos.add_to(m_esg)
-
-                # Legenda
-                legenda_esg = """
-                <div style="position:fixed; bottom:24px; right:10px; z-index:9999;
-                            background:rgba(15,15,15,0.88); padding:12px 16px;
-                            border-radius:10px; font-size:12px; color:#eee;
-                            line-height:1.9; border:1px solid rgba(255,255,255,0.12);">
-                    <b style="font-size:13px;">Risco ESG — CAR</b><br>
-                    <span style="color:#27ae60;">■</span> Sem ocorrência<br>
-                    <span style="color:#f1c40f;">■</span> Baixo risco<br>
-                    <span style="color:#e67e22;">■</span> Risco moderado<br>
-                    <span style="color:#e74c3c;">■</span> Alto risco<br>
-                    <span style="color:#7b0d0d;">■</span> Reincidente crítico<br>
-                    <span style="color:#ff4500;">●</span> Foco INPE
-                </div>"""
-                m_esg.get_root().html.add_child(folium.Element(legenda_esg))
-                folium.LayerControl().add_to(m_esg)
-
-                _esg_key = f"esg_{val_sel}_{n_imoveis}"
-                st_folium(m_esg, width=None, height=560,
-                          returned_objects=[], key=_esg_key)
-
-            # ── Tabela de imóveis com ocorrência de fogo ──────────────────────────────
-            with col_tab:
-                st.markdown("#### 📋 Propriedades com Fogo Detectado")
-
-                df_tabela = (
-                    gdf_car[gdf_car["n_focos"] > 0]
-                    .sort_values(["anos_com_fogo", "n_focos"], ascending=False)
-                    [[
-                        "cod_imovel", "num_area", "des_condic",
-                        "n_focos", "anos_com_fogo",
-                        "classificacao_esg", "acao_recomendada"
-                    ]]
-                    .rename(columns={
-                        "cod_imovel":        "Cód. CAR",
-                        "num_area":          "Área (ha)",
-                        "des_condic":        "Status CAR",
-                        "n_focos":           "Focos / Área (ha)",
-                        "anos_com_fogo":     f"Anos c/ fogo ({anos_historico[0]}–{anos_historico[-1]})",
-                        "classificacao_esg": "Classificação ESG",
-                        "acao_recomendada":  "Ação Recomendada"
-                    })
-                    .reset_index(drop=True)
-                )
-
-                if df_tabela.empty:
-                    st.success("✅ Nenhum imóvel com fogo detectado no período analisado.")
-                else:
-                    def _cor_linha(row):
-                        mapa = {
-                            "🟢 Sem ocorrência":     "background-color:#27ae6015;",
-                            "🟡 Baixo risco":        "background-color:#f1c40f20;",
-                            "🟠 Risco moderado":     "background-color:#e67e2225;",
-                            "🔴 Alto risco":         "background-color:#e74c3c25;",
-                            "🔴 Reincidente crítico":"background-color:#7b0d0d35;",
-                        }
-                        cls = row.get("Classificação ESG", "")
-                        cor = mapa.get(cls, "")
-                        return [cor] * len(row)
-
-                    st.dataframe(
-                        df_tabela.style.apply(_cor_linha, axis=1),
-                        hide_index=True,
-                        use_container_width=True,
-                        height=520
-                    )
-
-            # ── Gráfico de distribuição ESG ───────────────────────────────────────────
-            st.markdown("---")
-            col_pizza, col_bar = st.columns(2)
-
-            with col_pizza:
-                contagem_esg = (
-                    gdf_car["classificacao_esg"]
-                    .value_counts()
-                    .reset_index()
-                    .rename(columns={"classificacao_esg": "Classificação", "count": "Imóveis"})
-                )
-                cores_pizza = {
-                    "🟢 Sem ocorrência":     "#27ae60",
-                    "🟡 Baixo risco":        "#f1c40f",
-                    "🟠 Risco moderado":     "#e67e22",
-                    "🔴 Alto risco":         "#e74c3c",
-                    "🔴 Reincidente crítico":"#7b0d0d",
-                }
-                fig_pizza_esg = px.pie(
-                    contagem_esg,
-                    names="Classificação", values="Imóveis",
-                    color="Classificação", color_discrete_map=cores_pizza,
-                    title="Distribuição de Imóveis por Classe ESG",
-                    hole=0.42
-                )
-                fig_pizza_esg.update_layout(
-                    template="plotly_dark", height=320,
-                    margin=dict(t=40, b=10), showlegend=True,
-                    legend=dict(font=dict(size=10))
-                )
-                st.plotly_chart(fig_pizza_esg, use_container_width=True)
-
-            with col_bar:
-                df_rec_hist = (
-                    gdf_car[gdf_car["anos_com_fogo"] > 0]
-                    ["anos_com_fogo"]
-                    .value_counts()
-                    .sort_index()
-                    .reset_index()
-                    .rename(columns={"anos_com_fogo": "Anos com Fogo", "count": "Nº de Imóveis"})
-                )
-                if not df_rec_hist.empty:
-                    fig_hist = px.bar(
-                        df_rec_hist,
-                        x="Anos com Fogo", y="Nº de Imóveis",
-                        title=f"Recorrência de Fogo por Imóvel ({anos_historico[0]}–{anos_historico[-1]})",
-                        color="Anos com Fogo",
-                        color_continuous_scale=["#f1c40f", "#e67e22", "#e74c3c", "#7b0d0d"],
-                        text="Nº de Imóveis"
-                    )
-                    fig_hist.update_layout(
-                        template="plotly_dark", height=320,
-                        margin=dict(t=40, b=10),
-                        coloraxis_showscale=False,
-                        xaxis=dict(tickmode="linear", dtick=1)
-                    )
-                    fig_hist.update_traces(textposition="outside")
-                    st.plotly_chart(fig_hist, use_container_width=True)
-                else:
-                    st.info("Sem dados de recorrência histórica para exibir.")
-
-            # ── Export ────────────────────────────────────────────────────────────────
-            st.markdown("---")
-            if not df_tabela.empty:
-                csv_esg = df_tabela.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "⬇️ Exportar relatório ESG por propriedade (.csv)",
-                    data=csv_esg,
-                    file_name=f"esg_car_{val_sel.replace(' ','_')}_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    use_container_width=False
-                )
-
-            # ── Metodologia ───────────────────────────────────────────────────────────
-            with st.expander("📐 Metodologia e fontes de dados", expanded=False):
-                st.markdown(f"""
-**Polígonos CAR:** SICAR — Sistema Nacional de Cadastro Ambiental Rural (MAPA/SFB)
-URL: `car.gov.br/publico/municipios/shapefile?municipio[id]={code_ibge}&tema=IMOVEL`
-Total de imóveis baixados: **{n_imoveis:,}** · Área total: **{area_total_car_ha/1000:.1f} mil ha**
-
-**Cruzamento de focos:**
-{"- INPE BDQueimadas: focos detectados no período selecionado, cruzados via `gpd.sjoin` (ponto dentro do polígono CAR)" if "INPE" in fonte_escolhida else "- MODIS MCD64A1: área queimada detectada pelo satélite Terra, cruzada via GEE `reduceRegions` por imóvel CAR"}
-
-**Recorrência histórica:** MODIS MCD64A1 — {anos_historico[0]}–{anos_historico[-1]}
-GEE `reduceRegions` com `Reducer.max()` para detectar BurnDate > 0 por imóvel, por ano.
-Análise limitada aos **50 imóveis mais afetados** para viabilizar o tempo de processamento GEE.
-
-**Classificação ESG:**
-| Classe | Critério |
-|--------|----------|
-| 🟢 Sem ocorrência | 0 focos no período |
-| 🟡 Baixo risco | ≤3 focos · ≤1 ano histórico |
-| 🟠 Risco moderado | ≤10 focos ou ≤2 anos históricos |
-| 🔴 Alto risco | >10 focos sem reincidência estrutural |
-| 🔴 Reincidente crítico | ≥4 anos com fogo nos últimos 5 anos |
-
-**Base legal:** Lei 12.651/2012 (Código Florestal) — CAR obrigatório para acesso a crédito rural (art. 78-A).
-Imóveis com queimadas não autorizadas estão sujeitos a embargo IBAMA e perda de financiamento.
-Referências: SICAR/MAPA · INPE BDQueimadas · NASA MODIS MCD64A1 · GRI 304-4 · TCFD Physical Risks.
-                """)
+                            **Referências:**
+                            - Nepstad et al. (2008) *Science* — "Interactions among Amazon Land Use,
+                              Forests and Climate"
+                            - Aragão et al. (2018) *Nature Communications* — "21st Century
+                              drought-related fires counteract the decline of Amazon deforestation"
+                            - IPAM (2020) — "Fogo na Amazônia: raízes, impactos e soluções"
+                            """)
 
         # ----------------------------------------------------------
         # ABA 5 — EXPORTAR DADOS
