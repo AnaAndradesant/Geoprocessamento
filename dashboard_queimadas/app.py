@@ -572,14 +572,10 @@ def buscar_ranking_anos_mes(geom_json_str, mes, ano_ref):
             for f in info['features']
         ]
     except Exception:
-        # fallback: lista vazia — não bloqueia o resto do app
         registros = []
 
-    return (
-        pd.DataFrame(registros)
-        .sort_values('area_km2', ascending=False)
-        .reset_index(drop=True)
-    )
+    df = pd.DataFrame(registros) if registros else pd.DataFrame(columns=['ano', 'area_km2'])
+    return df.sort_values('area_km2', ascending=False).reset_index(drop=True)
 
 
 # =============================================================
@@ -1534,12 +1530,17 @@ if st.session_state.gerar_dashboard:
                                         geom_json_str, mes_modis, ano_modis
                                     )
 
-                                # Determina posição do ano na série
-                                rank_row = df_rank[df_rank['ano'] == ano_modis]
-                                posicao  = int(rank_row.index[0]) + 1 if not rank_row.empty else None
+                                if not df_rank.empty:
+                                    rank_row = df_rank[df_rank['ano'] == ano_modis]
+                                    posicao  = int(rank_row.index[0]) + 1 if not rank_row.empty else None
+                                else:
+                                    rank_row = pd.DataFrame(columns=['ano', 'area_km2'])
+                                    posicao  = None
 
                                 # Constrói contexto histórico narrativo
-                                if posicao == 1:
+                                if posicao is None or df_rank.empty:
+                                    contexto_hist = "um dos registros mais elevados da série histórica"
+                                elif posicao == 1:
                                     contexto_hist = (
                                         f"o <b>pior registro histórico</b> para {nome_mes_pt} "
                                         f"em toda a série MODIS (2001–{ano_modis})"
