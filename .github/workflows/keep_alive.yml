@@ -2,9 +2,10 @@ name: Despertador do Streamlit
 
 on:
   schedule:
-    # Roda a cada 15 minutos para não dar tempo de "esfriar" a memória
-    - cron: "*/6 * * * *"
-  workflow_dispatch: # Botão manual mantido
+    # Rodar a cada 6 minutos é muito pesado e pode gerar bloqueio. 
+    # Vamos mudar para 1 vez por dia (suficiente para não dormir).
+    - cron: "0 12 * * *"
+  workflow_dispatch: # Permite que você teste clicando no botão
 
 jobs:
   ping:
@@ -12,4 +13,4 @@ jobs:
     steps:
       - name: Wake Streamlit app
         run: |
-           curl -L -w "\nStatus: %{http_code}\n" https://monitor-focos-queimadas.streamlit.app/
+          curl -L --max-redirs 10 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" -w "\nStatus: %{http_code}\n" https://monitor-focos-queimadas.streamlit.app/
