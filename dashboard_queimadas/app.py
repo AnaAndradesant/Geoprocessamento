@@ -1538,30 +1538,63 @@ if st.session_state.gerar_dashboard:
                     </div>
                     """, unsafe_allow_html=True)
 
+                # --- CHAVE DE CACHE PARA O BOTÃO ---
+                _nbr_cache_key = f"nbr_resultado_{val_sel}_{ano_modis}_{mes_modis}"
+                if _nbr_cache_key not in st.session_state:
+                    st.session_state[_nbr_cache_key] = None
+
+                # --- BOTÃO SOB DEMANDA ---
+                if st.session_state[_nbr_cache_key] is None:
+                    st.info(
+                        "⚡ A análise de severidade usa imagens Sentinel-2 e pode levar "
+                        "**1–3 minutos** dependendo do tamanho da área. "
+                        "Clique quando estiver pronto."
+                    )
+                    if st.button(
+                        "🛰️ Calcular Severidade NBR (Sentinel-2)",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"btn_nbr_{val_sel}_{ano_modis}_{mes_modis}"
+                    ):
+                        with st.spinner("🛰️ Buscando imagens Sentinel-2 e calculando dNBR… aguarde."):
+                            try:
+                                # CHAMADA UNIFICADA: stats + imagem em um único bloco GEE
+                                stats_sev = calcular_stats_nbr(
+                                    geom_json_str, ano_modis, mes_modis,
+                                    area_queimada_img,
+                                    area_km2_hint=area_km2_local
+                                )
+                                _, dnbr_img = _construir_dnbr(
+                                    geom_json_str, ano_modis, mes_modis,
+                                    area_queimada_img,
+                                    area_km2_hint=area_km2_local
+                                )
+                                st.session_state[_nbr_cache_key] = {
+                                    "stats_sev": stats_sev,
+                                    "dnbr_img": dnbr_img,
+                                    "ok": True
+                                }
+                                st.rerun()
+                            except ValueError as ve:
+                                st.warning(f"⚠️ {ve}")
+                            except Exception as e:
+                                st.error(
+                                    f"⚠️ Erro ao processar Sentinel-2: {e}\n\n"
+                                    "Tente uma região menor ou um mês diferente."
+                                )
+
+                # --- RECUPERA RESULTADO DO CACHE DE SESSÃO ---
+                nbr_ok = False
+                stats_sev = {}
+                dnbr_img = None
+                if st.session_state[_nbr_cache_key] and st.session_state[_nbr_cache_key].get("ok"):
+                    stats_sev = st.session_state[_nbr_cache_key]["stats_sev"]
+                    dnbr_img  = st.session_state[_nbr_cache_key]["dnbr_img"]
+                    nbr_ok = True
+
                 col_nbr1, col_nbr2 = st.columns([1.4, 1])
 
                 with col_nbr1:
-                    with st.spinner("🛰️ Processando imagens Sentinel-2..."):
-                        nbr_ok = False
-                        stats_sev = {}
-                        dnbr_img = None
-                        try:
-                            # 1) Stats cacheados
-                            stats_sev = calcular_stats_nbr(
-                                geom_json_str, ano_modis, mes_modis, area_queimada_img,
-                                area_km2_hint=area_km2_local
-                            )
-                            
-                            # 2) Imagem GEE reconstruída
-                            _, dnbr_img = _construir_dnbr(
-                                geom_json_str, ano_modis, mes_modis, area_queimada_img,
-                                area_km2_hint=area_km2_local
-                            )
-                            nbr_ok = True
-                        except ValueError as ve:
-                            st.warning(f"⚠️ {ve}")
-                        except Exception as e:
-                            st.error(f"⚠️ Erro inesperado ao processar Sentinel-2: {e}\n\nTente uma região menor ou um mês diferente.")
 
                     if nbr_ok and dnbr_img is not None:
                         try:
@@ -1613,6 +1646,15 @@ if st.session_state.gerar_dashboard:
                             
                             _nbr_key = f"nbr_{val_sel}_{ano_modis}_{mes_modis}"
                             st_folium(m_nbr, width=None, height=620, returned_objects=[], key=_nbr_key)
+
+                            st.markdown("")
+                            if st.button(
+                                "🔄 Recalcular Severidade",
+                                key=f"btn_nbr_reset_{val_sel}_{ano_modis}_{mes_modis}",
+                                use_container_width=True
+                            ):
+                                st.session_state[_nbr_cache_key] = None
+                                st.rerun()
                             
                         except Exception as erro_mapa:
                             st.error(f"⚠️ Os dados foram calculados, mas ocorreu um erro ao desenhar o mapa Folium: {erro_mapa}")
