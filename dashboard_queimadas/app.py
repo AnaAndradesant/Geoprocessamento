@@ -989,10 +989,11 @@ if st.session_state.gerar_dashboard:
         # =============================================================
         # --- ABAS PRINCIPAIS ---
         # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_export = st.tabs([
+        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_export = st.tabs([
             "🗺️ Mapa de Focos",
             "📈 Gráficos & Anomalia",
             "🔬 Severidade (NBR Sentinel-2)",
+            "💰 Impacto Econômico",
             "⬇️ Exportar Dados"
         ])
 
@@ -1682,7 +1683,279 @@ if st.session_state.gerar_dashboard:
                         )
 
         # ----------------------------------------------------------
-        # ABA 4 — EXPORTAR DADOS
+        # ABA 4 — IMPACTO ECONÔMICO
+        # ----------------------------------------------------------
+        with aba_impacto:
+            st.subheader("💰 Estimativa de Impacto Econômico")
+
+            # --- TABELA DE REFERÊNCIAS ---
+            VALORES_ECOSSIS = {
+                "Amazônia":      {"conservador": 2000,  "moderado": 4000,  "otimista": 6000},
+                "Cerrado":       {"conservador": 800,   "moderado": 1650,  "otimista": 2500},
+                "Mata Atlântica":{"conservador": 3000,  "moderado": 5500,  "otimista": 8000},
+                "Pantanal":      {"conservador": 1500,  "moderado": 2750,  "otimista": 4000},
+                "Caatinga":      {"conservador": 400,   "moderado": 800,   "otimista": 1200},
+                "Pampa":         {"conservador": 600,   "moderado": 1050,  "otimista": 1500},
+            }
+
+            EMISSOES_CO2_HA = {
+                "Amazônia": 150,  # tCO2e/ha
+                "Cerrado": 60,
+                "Mata Atlântica": 120,
+                "Pantanal": 80,
+                "Caatinga": 30,
+                "Pampa": 25,
+            }
+
+            PRECO_CARBONO_USD = 15  # US$/tCO2e — mercado voluntário médio 2023 (Ecosystem Marketplace)
+
+            st.markdown("""
+            > **Metodologia:** Os valores de serviços ecossistêmicos por hectare são baseados em
+            > literatura científica e relatórios institucionais brasileiros e internacionais.
+            > Os cenários (Conservador / Moderado / Otimista) refletem os intervalos publicados
+            > nas fontes abaixo. O cálculo é uma **estimativa indicativa** para fins de análise
+            > de impacto e tomada de decisão — não substitui laudos periciais.
+            """)
+
+            with st.expander("📚 Ver Fontes e Referências Metodológicas"):
+                st.markdown("""
+                | Fonte | Descrição |
+                |---|---|
+                | **Costanza et al. (2014)** — *Global Policy* | Valoração de serviços ecossistêmicos globais por bioma (Nature, forests, wetlands) |
+                | **IPAM — Instituto de Pesquisa Ambiental da Amazônia** | Estimativas de custo de restauração e valor de carbono na Amazônia brasileira |
+                | **The Nature Conservancy Brasil (TNC)** | Relatórios de custo-benefício de conservação por bioma no Brasil |
+                | **SEEG / Observatório do Clima** | Fatores de emissão de CO₂ por tipo de vegetação e bioma (tCO₂e/ha) |
+                | **Ecosystem Marketplace (2023)** | Preço médio de créditos de carbono no mercado voluntário (US$/tCO₂e) |
+                | **CEPEA/USP — Centro de Estudos Avançados em Economia Aplicada** | Custo de oportunidade agrícola e perdas em cadeias produtivas associadas a biomas |
+                | **FUNCATE / INPE** | Dados de área queimada e séries históricas (base MODIS MCD64A1) |
+
+                Os intervalos de valor por hectare utilizados (em US$/ha):
+                - **Amazônia:** US\\$ 2.000–6.000/ha
+                - **Cerrado:** US\\$ 800–2.500/ha
+                - **Mata Atlântica:** US\\$ 3.000–8.000/ha
+                - **Pantanal:** US\\$ 1.500–4.000/ha
+                - **Caatinga:** US\\$ 400–1.200/ha
+                - **Pampa:** US\\$ 600–1.500/ha
+                """)
+
+            st.markdown("---")
+
+            # --- DETECTAR BIOMA / ÁREA ---
+            # Tenta identificar o bioma com base na seleção do usuário
+            bioma_detectado = None
+            if tipo_analise == "Por Bioma":
+                bioma_detectado = bioma_dd
+            else:
+                # Mapeamento aproximado: estado → bioma predominante
+                ESTADO_BIOMA = {
+                    "AM": "Amazônia", "PA": "Amazônia", "AC": "Amazônia",
+                    "RO": "Amazônia", "RR": "Amazônia", "AP": "Amazônia",
+                    "MT": "Cerrado",  "GO": "Cerrado",  "TO": "Cerrado",
+                    "MA": "Cerrado",  "PI": "Caatinga", "BA": "Caatinga",
+                    "CE": "Caatinga", "RN": "Caatinga", "PB": "Caatinga",
+                    "PE": "Caatinga", "AL": "Caatinga", "SE": "Caatinga",
+                    "MS": "Pantanal", "PR": "Mata Atlântica",
+                    "SC": "Mata Atlântica", "RS": "Pampa",
+                    "SP": "Mata Atlântica", "RJ": "Mata Atlântica",
+                    "ES": "Mata Atlântica", "MG": "Mata Atlântica",
+                    "DF": "Cerrado",
+                }
+                bioma_detectado = ESTADO_BIOMA.get(estado_dd, "Cerrado")
+
+            col_conf1, col_conf2, col_conf3 = st.columns(3)
+
+            with col_conf1:
+                bioma_calc = st.selectbox(
+                    "🌿 Bioma para o cálculo:",
+                    list(VALORES_ECOSSIS.keys()),
+                    index=list(VALORES_ECOSSIS.keys()).index(bioma_detectado)
+                          if bioma_detectado in VALORES_ECOSSIS else 0,
+                    key="bioma_impacto"
+                )
+
+            with col_conf2:
+                cenario = st.selectbox(
+                    "📊 Cenário de valoração:",
+                    ["conservador", "moderado", "otimista"],
+                    index=1,
+                    format_func=lambda x: x.capitalize(),
+                    key="cenario_impacto"
+                )
+
+            with col_conf3:
+                cambio_usd = st.number_input(
+                    "💱 Câmbio USD → BRL:",
+                    min_value=1.0, max_value=20.0,
+                    value=5.70, step=0.10,
+                    key="cambio_impacto"
+                )
+
+            # --- CÁLCULOS ---
+            valor_usd_ha = VALORES_ECOSSIS[bioma_calc][cenario]
+            fator_co2_ha = EMISSOES_CO2_HA.get(bioma_calc, 60)
+
+            # Área queimada: prefere MODIS (km²), fallback para focos INPE (estimativa)
+            area_km2_calc = 0.0
+            fonte_area = ""
+
+            if "MODIS" in fonte_escolhida and total_valor > 0:
+                area_km2_calc = float(total_valor)
+                fonte_area = f"MODIS MCD64A1 — {area_km2_calc:,.2f} km² detectados"
+            elif "INPE" in fonte_escolhida and not df_rec.empty:
+                # Estimativa: cada foco INPE ≈ 0,5 km² (referência INPE/PRODES)
+                area_km2_calc = len(df_rec) * 0.5
+                fonte_area = (
+                    f"Estimativa a partir de {len(df_rec):,} focos INPE "
+                    f"(~0,5 km²/foco — referência INPE/PRODES)"
+                )
+
+            area_ha = area_km2_calc * 100  # 1 km² = 100 ha
+
+            valor_total_usd = area_ha * valor_usd_ha
+            valor_total_brl = valor_total_usd * cambio_usd
+            co2_emitido_t   = area_ha * fator_co2_ha
+            credito_carbono_usd = co2_emitido_t * PRECO_CARBONO_USD
+            credito_carbono_brl = credito_carbono_usd * cambio_usd
+
+            # --- KPIs ---
+            st.markdown("### 📊 Resultados da Estimativa")
+            k1, k2, k3, k4 = st.columns(4)
+
+            with k1:
+                st.metric(
+                    "🌍 Área Afetada",
+                    f"{area_km2_calc:,.1f} km²",
+                    f"{area_ha:,.0f} hectares"
+                )
+            with k2:
+                st.metric(
+                    "💵 Perda em Serviços Ecossistêmicos",
+                    f"R$ {valor_total_brl/1e6:,.1f} Mi",
+                    f"US$ {valor_total_usd/1e6:,.1f} Mi"
+                )
+            with k3:
+                st.metric(
+                    "☁️ CO₂ Estimado Emitido",
+                    f"{co2_emitido_t/1e6:,.2f} Mt CO₂e",
+                    f"{co2_emitido_t:,.0f} toneladas"
+                )
+            with k4:
+                st.metric(
+                    "🌱 Valor Crédito de Carbono",
+                    f"R$ {credito_carbono_brl/1e6:,.1f} Mi",
+                    f"@ US$ {PRECO_CARBONO_USD}/tCO₂e"
+                )
+
+            st.caption(f"📡 Base de área: {fonte_area}")
+
+            st.markdown("---")
+
+            # --- GRÁFICO COMPARATIVO DOS 3 CENÁRIOS ---
+            st.markdown("### 🔁 Comparação entre Cenários")
+
+            dados_cenarios = []
+            for cen in ["conservador", "moderado", "otimista"]:
+                v_usd = area_ha * VALORES_ECOSSIS[bioma_calc][cen]
+                v_brl = v_usd * cambio_usd
+                dados_cenarios.append({
+                    "Cenário": cen.capitalize(),
+                    "US$/ha referência": VALORES_ECOSSIS[bioma_calc][cen],
+                    "Perda (R$ Mi)": round(v_brl / 1e6, 2),
+                    "Perda (US$ Mi)": round(v_usd / 1e6, 2),
+                })
+
+            df_cenarios = pd.DataFrame(dados_cenarios)
+
+            fig_cen = px.bar(
+                df_cenarios,
+                x="Cenário",
+                y="Perda (R$ Mi)",
+                color="Cenário",
+                text="Perda (R$ Mi)",
+                color_discrete_map={
+                    "Conservador": "#f39c12",
+                    "Moderado": "#e74c3c",
+                    "Otimista": "#c0392b"
+                },
+                title=f"Perda em Serviços Ecossistêmicos — {bioma_calc} (R$ Milhões)"
+            )
+            fig_cen.update_traces(texttemplate='R$ %{text:.1f} Mi', textposition='outside')
+            fig_cen.update_layout(
+                template='plotly_dark',
+                showlegend=False,
+                height=350,
+                yaxis_title="R$ Milhões",
+                margin=dict(t=50, b=20)
+            )
+            st.plotly_chart(fig_cen, use_container_width=True)
+
+            st.dataframe(
+                df_cenarios[["Cenário", "US$/ha referência",
+                              "Perda (US$ Mi)", "Perda (R$ Mi)"]],
+                hide_index=True,
+                use_container_width=True
+            )
+
+            # --- GRÁFICO BREAKDOWN: SERVIÇOS vs CARBONO ---
+            st.markdown("---")
+            st.markdown("### 🌿 Composição do Impacto (Cenário Selecionado)")
+
+            df_breakdown = pd.DataFrame({
+                "Componente": [
+                    "Serviços Ecossistêmicos\n(regulação hídrica, solo, biodiversidade)",
+                    "Valor de Carbono\n(mercado voluntário)"
+                ],
+                "Valor (R$ Mi)": [
+                    round(valor_total_brl / 1e6, 2),
+                    round(credito_carbono_brl / 1e6, 2)
+                ]
+            })
+
+            fig_pie = px.pie(
+                df_breakdown,
+                values="Valor (R$ Mi)",
+                names="Componente",
+                color_discrete_sequence=["#e74c3c", "#f39c12"],
+                title="Distribuição do Impacto Econômico Total"
+            )
+            fig_pie.update_traces(textinfo='percent+label')
+            fig_pie.update_layout(
+                template='plotly_dark',
+                height=380,
+                showlegend=False,
+                margin=dict(t=50, b=20)
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+            # --- CARD DE CONTEXTO ---
+            total_impacto_brl = valor_total_brl + credito_carbono_brl
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #c0392b22, #e74c3c11);
+                        border-left: 6px solid #e74c3c; border-radius: 8px;
+                        padding: 18px; margin-top: 10px;">
+                <h4 style="color: #e74c3c; margin: 0 0 8px 0;">
+                    🔥 Impacto Econômico Total Estimado (Cenário {cenario.capitalize()})
+                </h4>
+                <p style="font-size: 28px; font-weight: bold; margin: 0; color: inherit;">
+                    R$ {total_impacto_brl/1e6:,.1f} Milhões
+                </p>
+                <p style="margin: 6px 0 0 0; color: #888; font-size: 13px;">
+                    Combinando perda de serviços ecossistêmicos + valor de créditos de carbono
+                    perdidos · Bioma: {bioma_calc} · Câmbio: R$ {cambio_usd:.2f}/USD
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown("")
+            st.info(
+                "⚠️ **Aviso:** Esta estimativa tem caráter indicativo e acadêmico. "
+                "Os valores de serviços ecossistêmicos variam conforme metodologia, "
+                "grau de degradação e contexto local. Para aplicações regulatórias ou "
+                "legais, recomenda-se laudo técnico especializado."
+            )
+
+        # ----------------------------------------------------------
+        # ABA 5 — EXPORTAR DADOS
         # ----------------------------------------------------------
         with aba_export:
             st.subheader("⬇️ Exportar Dados da Análise")
