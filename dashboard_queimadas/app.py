@@ -1964,13 +1964,14 @@ ser gerados por essa floresta perdida.
 
                 with st.expander("📚 Fontes e referências"):
                     st.markdown("""
-| Fonte | O que fornece |
-|---|---|
-| Costanza et al. (2014) — *Global Policy* | Valor de serviços ecossistêmicos por bioma |
-| IPAM | Custo de restauração e carbono na Amazônia |
-| TNC Brasil | Custo-benefício de conservação por bioma |
-| SEEG / Obs. do Clima | Fator de emissão de CO₂ por bioma (tCO₂e/ha) |
-| Ecosystem Marketplace (2023) | Preço médio de carbono no mercado voluntário |
+| Fonte | O que fornece | Site |
+|---|---|---|
+| Costanza et al. (2014) — *Global Policy* | Valor de serviços ecossistêmicos por bioma | [acessar](https://www.sciencedirect.com/science/article/pii/S0959378014000685) |
+| IPAM — Inst. de Pesquisa Ambiental da Amazônia | Custo de restauração e carbono na Amazônia | [ipam.org.br](https://ipam.org.br) |
+| TNC Brasil — The Nature Conservancy | Custo-benefício de conservação por bioma | [tnc.org/brasil](https://www.tnc.org/brasil) |
+| SEEG / Observatório do Clima | Fator de emissão de CO₂ por bioma (tCO₂e/ha) | [seeg.eco.br](https://seeg.eco.br) |
+| Ecosystem Marketplace (2023) | Preço médio de carbono no mercado voluntário | [ecosystemmarketplace.com](https://www.ecosystemmarketplace.com) |
+| CEPEA/USP | Custo de oportunidade agrícola e perdas em cadeias produtivas | [cepea.esalq.usp.br](https://www.cepea.esalq.usp.br) |
                     """)
 
           except Exception as _err_impacto:
