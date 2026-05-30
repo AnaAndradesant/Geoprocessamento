@@ -203,6 +203,27 @@ def gerar_excel(df):
 # --- FUNÇÕES COM CACHE ---
 # =============================================================
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def buscar_cotacao_dolar():
+    """Busca a cotação PTAX do dólar no Banco Central. Cache de 1h."""
+    from datetime import datetime, timedelta
+    try:
+        # Tenta os últimos 5 dias úteis para garantir que ache uma cotação
+        for delta in range(5):
+            data = (datetime.now() - timedelta(days=delta)).strftime("%m-%d-%Y")
+            url = (
+                f"https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/"
+                f"CotacaoDolarDia(dataCotacao=@d)?@d='{data}'&$top=1&$format=json&$select=cotacaoVenda"
+            )
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                valores = resp.json().get("value", [])
+                if valores:
+                    return round(float(valores[0]["cotacaoVenda"]), 2)
+    except Exception:
+        pass
+    return 5.04  # fallback caso a API esteja indisponível
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def buscar_cidades(uf):
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
@@ -631,12 +652,10 @@ html_contato_novo = f"""
 """
 st.sidebar.markdown(html_contato_novo, unsafe_allow_html=True)
 
-
-# Adicione isso na seção da barra lateral (sidebar)
-if st.sidebar.button("♻️ Limpar Cache do Sistema"):
+if st.sidebar.button("♻️ Limpar Cache", use_container_width=True, type="secondary"):
     st.cache_data.clear()
     st.cache_resource.clear()
-    st.sidebar.success("Cache limpo com sucesso!")
+    st.sidebar.success("Cache limpo!")
 
 
 # =============================================================
@@ -1758,7 +1777,7 @@ if st.session_state.gerar_dashboard:
                 "Pantanal": 80, "Caatinga": 30, "Pampa": 25,
             }
             PRECO_CARBONO_USD = 15
-            CAMBIO_FIXO = 5.70
+            CAMBIO_FIXO = buscar_cotacao_dolar()
 
             # --- DETECTAR BIOMA ---
             ESTADO_BIOMA = {
@@ -1955,7 +1974,8 @@ ser gerados por essa floresta perdida.
                         )
                     with pc3:
                         st.number_input(
-                            "Câmbio R$/US$:", min_value=1.0, max_value=20.0,
+                            f"Câmbio R$/US$ (PTAX hoje: R$ {CAMBIO_FIXO:.2f}):",
+                            min_value=1.0, max_value=20.0,
                             value=float(cambio_usd), step=0.10, key="cambio_impacto"
                         )
                     st.caption(
