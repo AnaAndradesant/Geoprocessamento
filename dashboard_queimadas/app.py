@@ -448,46 +448,42 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
             'media_hist': media_hist
         })
 
-    # ── PROCESSAMENTO MÊS A MÊS com retry/backoff ────────────────────────────
-    # Para a Amazônia (~5,5M km²), mesmo lotes de 4 meses geram
-    # 4 × 23 anos = ~92 reduceRegion simultâneos → erro 429.
-    # Processando 1 mês por vez (1 × 23 = ~23 operações), ficamos bem abaixo
-    # do limite do EE para qualquer região do Brasil.
-    MAX_RETRIES = 5
+    # ── PROCESSAMENTO PARALELO (4 meses simultâneos) ───────────
+    # Reduz de ~60s sequencial para ~15s com 4 workers paralelos
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    MAX_RETRIES = 4
     registros = []
 
-    for mes in range(1, 13):
-        feat_resultado = None
+    def processar_mes(mes):
         for tentativa in range(1, MAX_RETRIES + 1):
             try:
                 feat_resultado = ee.Feature(calc_mes_feature(mes)).getInfo()
-                break
+                p = feat_resultado['properties']
+                val_ref  = round(float(p.get('area_ref')  or 0), 2)
+                media    = round(float(p.get('media_hist') or 0), 2)
+                anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
+                return {
+                    'Mês': mes,
+                    'Mês Nome': meses_map[mes],
+                    f'Área {ano_ref} (km²)': val_ref,
+                    'Média Histórica (km²)': media,
+                    'Anomalia (%)': anomalia
+                }
             except Exception as e:
                 msg = str(e)
-                if 'Too many concurrent aggregations' in msg or '429' in msg:
-                    if tentativa < MAX_RETRIES:
-                        time.sleep(2 ** tentativa)  # 2s, 4s, 8s, 16s, 32s
-                        continue
-                # Outro erro ou esgotou tentativas: injeta zero e continua
-                feat_resultado = {
-                    'type': 'Feature',
-                    'properties': {'mes': mes, 'area_ref': 0, 'media_hist': 0}
+                if ('Too many concurrent' in msg or '429' in msg) and tentativa < MAX_RETRIES:
+                    time.sleep(2 ** tentativa)
+                    continue
+                return {
+                    'Mês': mes, 'Mês Nome': meses_map[mes],
+                    f'Área {ano_ref} (km²)': 0,
+                    'Média Histórica (km²)': 0, 'Anomalia (%)': 0
                 }
-                break
 
-        p = feat_resultado['properties']
-        val_ref  = round(float(p.get('area_ref')  or 0), 2)
-        media    = round(float(p.get('media_hist') or 0), 2)
-        anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
-        registros.append({
-            'Mês': mes,
-            'Mês Nome': meses_map[mes],
-            f'Área {ano_ref} (km²)': val_ref,
-            'Média Histórica (km²)': media,
-            'Anomalia (%)': anomalia
-        })
-
-        time.sleep(0.5)  # pausa entre meses para não sobrecarregar a fila do EE
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(processar_mes, mes): mes for mes in range(1, 13)}
+        for future in as_completed(futures):
+            registros.append(future.result())
 
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
@@ -913,6 +909,22 @@ if st.session_state.gerar_dashboard:
     # --- RENDERIZAÇÃO ---
     # =============================================================
 
+    # Inicialização de variáveis NBR — evita NameError na aba de exportação
+    # caso a aba de severidade nunca tenha sido aberta na sessão atual
+    stats_sev = {}
+    dnbr_img = None
+
+    # =============================================================
+    # --- ABAS PRINCIPAIS ---
+    # =============================================================
+    aba_mapa, aba_impacto, aba_graficos, aba_nbr, aba_export = st.tabs([
+        "🗺️ Mapa de Focos",
+        "💰 Impacto Econômico",
+        "📈 Gráficos & Anomalia",
+        "🔬 Severidade (NBR Sentinel-2)",
+        "⬇️ Exportar Dados"
+    ])
+
     if dados_indisponiveis:
         mes_nome = {
             1:'Jan',2:'Fev',3:'Mar',4:'Abr',5:'Mai',6:'Jun',
@@ -1000,21 +1012,6 @@ if st.session_state.gerar_dashboard:
 
         st.markdown("---")
 
-        # Inicialização de variáveis NBR — evita NameError na aba de exportação
-        # caso a aba de severidade nunca tenha sido aberta na sessão atual
-        stats_sev = {}
-        dnbr_img = None
-
-        # =============================================================
-        # --- ABAS PRINCIPAIS ---
-        # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_export = st.tabs([
-            "🗺️ Mapa de Focos",
-            "📈 Gráficos & Anomalia",
-            "🔬 Severidade (NBR Sentinel-2)",
-            "💰 Impacto Econômico",
-            "⬇️ Exportar Dados"
-        ])
 
         # ----------------------------------------------------------
         # ABA 1 — MAPA
@@ -1752,247 +1749,6 @@ if st.session_state.gerar_dashboard:
                             "- **Alta:** destruição quase total da cobertura vegetal"
                         )
 
-        # ----------------------------------------------------------
-        # ----------------------------------------------------------
-        # ABA 4 — IMPACTO ECONÔMICO
-        # ----------------------------------------------------------
-        with aba_impacto:
-          try:
-            # --- TABELAS DE REFERÊNCIA ---
-            VALORES_ECOSSIS = {
-                "Amazônia":      {"conservador": 2000,  "moderado": 4000,  "otimista": 6000},
-                "Cerrado":       {"conservador": 800,   "moderado": 1650,  "otimista": 2500},
-                "Mata Atlântica":{"conservador": 3000,  "moderado": 5500,  "otimista": 8000},
-                "Pantanal":      {"conservador": 1500,  "moderado": 2750,  "otimista": 4000},
-                "Caatinga":      {"conservador": 400,   "moderado": 800,   "otimista": 1200},
-                "Pampa":         {"conservador": 600,   "moderado": 1050,  "otimista": 1500},
-            }
-            EMISSOES_CO2_HA = {
-                "Amazônia": 150, "Cerrado": 60, "Mata Atlântica": 120,
-                "Pantanal": 80, "Caatinga": 30, "Pampa": 25,
-            }
-            PRECO_CARBONO_USD = 15
-            CAMBIO_FIXO = buscar_cotacao_dolar()
-
-            # --- DETECTAR BIOMA ---
-            ESTADO_BIOMA = {
-                "AM": "Amazônia", "PA": "Amazônia", "AC": "Amazônia",
-                "RO": "Amazônia", "RR": "Amazônia", "AP": "Amazônia",
-                "MT": "Cerrado",  "GO": "Cerrado",  "TO": "Cerrado",
-                "MA": "Cerrado",  "PI": "Caatinga", "BA": "Caatinga",
-                "CE": "Caatinga", "RN": "Caatinga", "PB": "Caatinga",
-                "PE": "Caatinga", "AL": "Caatinga", "SE": "Caatinga",
-                "MS": "Pantanal", "PR": "Mata Atlântica",
-                "SC": "Mata Atlântica", "RS": "Pampa",
-                "SP": "Mata Atlântica", "RJ": "Mata Atlântica",
-                "ES": "Mata Atlântica", "MG": "Mata Atlântica",
-                "DF": "Cerrado",
-            }
-            bioma_detectado = (
-                bioma_dd if tipo_analise == "Por Bioma"
-                else ESTADO_BIOMA.get(estado_dd, "Cerrado")
-            )
-
-            # --- ÁREA QUEIMADA ---
-            area_km2_calc = 0.0
-            if "MODIS" in fonte_escolhida and total_valor > 0:
-                area_km2_calc = float(total_valor)
-                fonte_area = f"Satélite MODIS — {area_km2_calc:,.1f} km² queimados detectados"
-            elif "INPE" in fonte_escolhida and not df_rec.empty:
-                area_km2_calc = len(df_rec) * 0.5
-                fonte_area = f"{len(df_rec):,} focos INPE (estimativa: ~0,5 km²/foco)"
-            else:
-                fonte_area = "Sem dados de área disponíveis"
-
-            area_ha = area_km2_calc * 100
-
-            st.markdown("## 💰 Impacto Econômico das Queimadas")
-            st.markdown(
-                f"Estimativa do prejuízo causado pelas queimadas em **{val_sel}**, "
-                f"com base na área afetada e no valor dos serviços que o ecossistema presta à sociedade."
-            )
-
-            if area_km2_calc == 0:
-                st.warning(
-                    "⚠️ Nenhuma área queimada detectada para o período selecionado. "
-                    "Selecione outro mês ou ano."
-                )
-            else:
-                # Leitura dos parâmetros do session_state (definidos no expander abaixo)
-                bioma_calc = st.session_state.get("bioma_impacto",
-                    bioma_detectado if bioma_detectado in VALORES_ECOSSIS
-                    else list(VALORES_ECOSSIS.keys())[0])
-                cenario    = st.session_state.get("cenario_impacto", "moderado")
-                cambio_usd = st.session_state.get("cambio_impacto", CAMBIO_FIXO)
-
-                # --- CÁLCULOS ---
-                valor_usd_ha        = VALORES_ECOSSIS[bioma_calc][cenario]
-                valor_brl_ha        = valor_usd_ha * cambio_usd
-                fator_co2_ha        = EMISSOES_CO2_HA.get(bioma_calc, 60)
-                perda_ecossis_brl   = area_ha * valor_brl_ha
-                co2_emitido_t       = area_ha * fator_co2_ha
-                credito_carbono_brl = co2_emitido_t * PRECO_CARBONO_USD * cambio_usd
-                total_impacto_brl   = perda_ecossis_brl + credito_carbono_brl
-
-                # --- CARD PRINCIPAL ---
-                st.markdown(f"""
-                <div style="background: linear-gradient(135deg, #c0392b22, #e74c3c11);
-                            border-left: 6px solid #e74c3c; border-radius: 10px;
-                            padding: 22px 26px; margin: 16px 0;">
-                    <p style="margin: 0 0 4px 0; color: #aaa; font-size: 13px;
-                              text-transform: uppercase; letter-spacing: 1px;">
-                        Prejuízo econômico estimado — {bioma_calc} · Cenário {cenario.capitalize()}
-                    </p>
-                    <p style="font-size: 42px; font-weight: 800; margin: 0; color: #e74c3c;">
-                        R$ {total_impacto_brl/1e9:,.2f} bilhões
-                    </p>
-                    <p style="margin: 6px 0 0 0; color: #bbb; font-size: 13px;">
-                        📡 Base: {fonte_area}
-                    </p>
-                </div>
-                """, unsafe_allow_html=True)
-
-                # --- 3 CARDS SECUNDÁRIOS ---
-                m1, m2, m3 = st.columns(3)
-                with m1:
-                    st.metric("🌍 Área Queimada",
-                              f"{area_km2_calc:,.1f} km²",
-                              f"{area_ha:,.0f} hectares")
-                with m2:
-                    st.metric("🌳 Perda de Serviços Ambientais",
-                              f"R$ {perda_ecossis_brl/1e9:,.2f} bi",
-                              f"R$ {valor_brl_ha:,.0f}/ha · {bioma_calc}")
-                with m3:
-                    st.metric("☁️ Carbono Emitido",
-                              f"{co2_emitido_t/1e6:,.2f} Mt CO₂e",
-                              f"≈ R$ {credito_carbono_brl/1e9:,.2f} bi em créditos perdidos")
-
-                st.markdown("---")
-
-                # --- GRÁFICO: COMPARAÇÃO DOS 3 CENÁRIOS ---
-                st.markdown("### Como o valor muda conforme o cenário?")
-                st.caption(
-                    "Cada cenário reflete um intervalo da literatura científica — "
-                    "do mais conservador (menor impacto estimado) ao otimista (maior)."
-                )
-                dados_cen = []
-                for cen_k in ["conservador", "moderado", "otimista"]:
-                    v_brl_ha_cen = VALORES_ECOSSIS[bioma_calc][cen_k] * cambio_usd
-                    perda_cen    = area_ha * v_brl_ha_cen
-                    co2_cen      = area_ha * fator_co2_ha * PRECO_CARBONO_USD * cambio_usd
-                    total_cen    = perda_cen + co2_cen
-                    dados_cen.append({
-                        "Cenário": {"conservador": "Conservador", "moderado": "Moderado",
-                                  "otimista": "Otimista"}[cen_k],
-                        "Serviços Ambientais (R$ bi)": round(perda_cen / 1e9, 2),
-                        "Créditos de Carbono (R$ bi)":  round(co2_cen / 1e9, 2),
-                        "Total (R$ bi)":                   round(total_cen / 1e9, 2),
-                    })
-                df_cen = pd.DataFrame(dados_cen)
-                fig_cen = go.Figure()
-                fig_cen.add_bar(
-                    name="Serviços Ambientais",
-                    x=df_cen["Cenário"],
-                    y=df_cen["Serviços Ambientais (R$ bi)"],
-                    marker_color="#e74c3c",
-                    text=df_cen["Serviços Ambientais (R$ bi)"].apply(lambda v: f"R$ {v:.2f} bi"),
-                    textposition="inside",
-                )
-                fig_cen.add_bar(
-                    name="Créditos de Carbono",
-                    x=df_cen["Cenário"],
-                    y=df_cen["Créditos de Carbono (R$ bi)"],
-                    marker_color="#f39c12",
-                    text=df_cen["Créditos de Carbono (R$ bi)"].apply(lambda v: f"R$ {v:.2f} bi"),
-                    textposition="inside",
-                )
-                fig_cen.update_layout(
-                    barmode="stack", template="plotly_dark", height=360,
-                    yaxis_title="R$ Bilhões",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                    margin=dict(t=40, b=20),
-                )
-                st.plotly_chart(fig_cen, use_container_width=True)
-                st.dataframe(
-                    df_cen.rename(columns={"Total (R$ bi)": "💰 Total (R$ bi)"}),
-                    hide_index=True, use_container_width=True
-                )
-
-                st.markdown("---")
-
-                # --- CONTEXTO EXPLICATIVO ---
-                st.markdown("### O que significa esse prejuízo?")
-                col_ctx1, col_ctx2 = st.columns(2)
-                with col_ctx1:
-                    st.markdown(f"""
-**Serviços ambientais** são os benefícios que a floresta entrega à sociedade sem custo:
-regulação das chuvas, filtragem da água, controle da temperatura e manutenção
-do solo e da biodiversidade. Quando uma área queima, esses benefícios deixam
-de existir por anos.
-
-Para o **{bioma_calc}**, cada hectare vale em média **R$ {valor_brl_ha:,.0f}**
-no cenário {cenario} — valor que a sociedade perde enquanto a vegetação não se recupera.
-                    """)
-                with col_ctx2:
-                    st.markdown(f"""
-**Carbono emitido:** as queimadas lançaram aproximadamente
-**{co2_emitido_t/1e6:,.2f} milhões de toneladas de CO₂** na atmosfera.
-
-No mercado voluntário de carbono, cada tonelada vale em torno de
-**R$ {PRECO_CARBONO_USD * cambio_usd:,.0f}** — o equivalente a
-**R$ {credito_carbono_brl/1e9:,.2f} bilhões** em créditos que não poderão mais
-ser gerados por essa floresta perdida.
-                    """)
-
-                st.info(
-                    "Estimativa indicativa com base em literatura científica. "
-                    "Não substitui laudo técnico para fins legais ou regulatórios."
-                )
-
-                with st.expander("⚙️ Ajustar parâmetros do cálculo"):
-                    pc1, pc2, pc3 = st.columns(3)
-                    with pc1:
-                        st.selectbox(
-                            "Bioma:", list(VALORES_ECOSSIS.keys()),
-                            index=list(VALORES_ECOSSIS.keys()).index(bioma_calc),
-                            key="bioma_impacto"
-                        )
-                    with pc2:
-                        st.selectbox(
-                            "Cenário:",
-                            ["conservador", "moderado", "otimista"],
-                            index=["conservador","moderado","otimista"].index(cenario),
-                            format_func=lambda x: {"conservador": "Conservador (mínimo)",
-                                                   "moderado": "Moderado (referência)",
-                                                   "otimista": "Otimista (máximo)"}[x],
-                            key="cenario_impacto"
-                        )
-                    with pc3:
-                        st.number_input(
-                            f"Câmbio R$/US$ (PTAX hoje: R$ {CAMBIO_FIXO:.2f}):",
-                            min_value=1.0, max_value=20.0,
-                            value=float(cambio_usd), step=0.10, key="cambio_impacto"
-                        )
-                    st.caption(
-                        "Altere os parâmetros e clique em **Gerar Dashboard** novamente para recalcular."
-                    )
-
-                with st.expander("📚 Fontes e referências"):
-                    st.markdown("""
-| Fonte | O que fornece | Site |
-|---|---|---|
-| Costanza et al. (2014) — *Global Policy* | Valor de serviços ecossistêmicos por bioma | [acessar](https://www.sciencedirect.com/science/article/pii/S0959378014000685) |
-| IPAM — Inst. de Pesquisa Ambiental da Amazônia | Custo de restauração e carbono na Amazônia | [ipam.org.br](https://ipam.org.br) |
-| TNC Brasil — The Nature Conservancy | Custo-benefício de conservação por bioma | [tnc.org.br](https://www.tnc.org.br) |
-| SEEG / Observatório do Clima | Fator de emissão de CO₂ por bioma (tCO₂e/ha) | [seeg.eco.br](https://seeg.eco.br) |
-| Ecosystem Marketplace (2023) | Preço médio de carbono no mercado voluntário | [ecosystemmarketplace.com](https://www.ecosystemmarketplace.com) |
-| CEPEA/USP | Custo de oportunidade agrícola e perdas em cadeias produtivas | [cepea.esalq.usp.br](https://www.cepea.esalq.usp.br) |
-                    """)
-
-          except Exception as _err_impacto:
-            st.error(f"⚠️ Erro na aba de Impacto Econômico: {_err_impacto}")
-            import traceback
-            st.code(traceback.format_exc(), language="python")
 
         # ----------------------------------------------------------
         # ABA 5 — EXPORTAR DADOS
@@ -2139,6 +1895,248 @@ ser gerados por essa floresta perdida.
                         mime="text/csv",
                         use_container_width=True
                     )
+
+    # ----------------------------------------------------------
+    # ----------------------------------------------------------
+    # ABA 4 — IMPACTO ECONÔMICO
+    # ----------------------------------------------------------
+    with aba_impacto:
+      try:
+        # --- TABELAS DE REFERÊNCIA ---
+        VALORES_ECOSSIS = {
+            "Amazônia":      {"conservador": 2000,  "moderado": 4000,  "otimista": 6000},
+            "Cerrado":       {"conservador": 800,   "moderado": 1650,  "otimista": 2500},
+            "Mata Atlântica":{"conservador": 3000,  "moderado": 5500,  "otimista": 8000},
+            "Pantanal":      {"conservador": 1500,  "moderado": 2750,  "otimista": 4000},
+            "Caatinga":      {"conservador": 400,   "moderado": 800,   "otimista": 1200},
+            "Pampa":         {"conservador": 600,   "moderado": 1050,  "otimista": 1500},
+        }
+        EMISSOES_CO2_HA = {
+            "Amazônia": 150, "Cerrado": 60, "Mata Atlântica": 120,
+            "Pantanal": 80, "Caatinga": 30, "Pampa": 25,
+        }
+        PRECO_CARBONO_USD = 15
+        CAMBIO_FIXO = buscar_cotacao_dolar()
+
+        # --- DETECTAR BIOMA ---
+        ESTADO_BIOMA = {
+            "AM": "Amazônia", "PA": "Amazônia", "AC": "Amazônia",
+            "RO": "Amazônia", "RR": "Amazônia", "AP": "Amazônia",
+            "MT": "Cerrado",  "GO": "Cerrado",  "TO": "Cerrado",
+            "MA": "Cerrado",  "PI": "Caatinga", "BA": "Caatinga",
+            "CE": "Caatinga", "RN": "Caatinga", "PB": "Caatinga",
+            "PE": "Caatinga", "AL": "Caatinga", "SE": "Caatinga",
+            "MS": "Pantanal", "PR": "Mata Atlântica",
+            "SC": "Mata Atlântica", "RS": "Pampa",
+            "SP": "Mata Atlântica", "RJ": "Mata Atlântica",
+            "ES": "Mata Atlântica", "MG": "Mata Atlântica",
+            "DF": "Cerrado",
+        }
+        bioma_detectado = (
+            bioma_dd if tipo_analise == "Por Bioma"
+            else ESTADO_BIOMA.get(estado_dd, "Cerrado")
+        )
+
+        # --- ÁREA QUEIMADA ---
+        area_km2_calc = 0.0
+        if "MODIS" in fonte_escolhida and total_valor > 0:
+            area_km2_calc = float(total_valor)
+            fonte_area = f"Satélite MODIS — {area_km2_calc:,.1f} km² queimados detectados"
+        elif "INPE" in fonte_escolhida and not df_rec.empty:
+            area_km2_calc = len(df_rec) * 0.5
+            fonte_area = f"{len(df_rec):,} focos INPE (estimativa: ~0,5 km²/foco)"
+        else:
+            fonte_area = "Sem dados de área disponíveis"
+
+        area_ha = area_km2_calc * 100
+
+        st.markdown("## 💰 Impacto Econômico das Queimadas")
+        st.markdown(
+            f"Estimativa do prejuízo causado pelas queimadas em **{val_sel}**, "
+            f"com base na área afetada e no valor dos serviços que o ecossistema presta à sociedade."
+        )
+
+        if area_km2_calc == 0:
+            st.warning(
+                "⚠️ Nenhuma área queimada detectada para o período selecionado. "
+                "Selecione outro mês ou ano."
+            )
+        else:
+            # Leitura dos parâmetros do session_state (definidos no expander abaixo)
+            bioma_calc = st.session_state.get("bioma_impacto",
+                bioma_detectado if bioma_detectado in VALORES_ECOSSIS
+                else list(VALORES_ECOSSIS.keys())[0])
+            cenario    = st.session_state.get("cenario_impacto", "moderado")
+            cambio_usd = st.session_state.get("cambio_impacto", CAMBIO_FIXO)
+
+            # --- CÁLCULOS ---
+            valor_usd_ha        = VALORES_ECOSSIS[bioma_calc][cenario]
+            valor_brl_ha        = valor_usd_ha * cambio_usd
+            fator_co2_ha        = EMISSOES_CO2_HA.get(bioma_calc, 60)
+            perda_ecossis_brl   = area_ha * valor_brl_ha
+            co2_emitido_t       = area_ha * fator_co2_ha
+            credito_carbono_brl = co2_emitido_t * PRECO_CARBONO_USD * cambio_usd
+            total_impacto_brl   = perda_ecossis_brl + credito_carbono_brl
+
+            # --- CARD PRINCIPAL ---
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #c0392b22, #e74c3c11);
+                        border-left: 6px solid #e74c3c; border-radius: 10px;
+                        padding: 22px 26px; margin: 16px 0;">
+                <p style="margin: 0 0 4px 0; color: #aaa; font-size: 13px;
+                          text-transform: uppercase; letter-spacing: 1px;">
+                    Prejuízo econômico estimado — {bioma_calc} · Cenário {cenario.capitalize()}
+                </p>
+                <p style="font-size: 42px; font-weight: 800; margin: 0; color: #e74c3c;">
+                    R$ {total_impacto_brl/1e9:,.2f} bilhões
+                </p>
+                <p style="margin: 6px 0 0 0; color: #bbb; font-size: 13px;">
+                    📡 Base: {fonte_area}
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # --- 3 CARDS SECUNDÁRIOS ---
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                st.metric("🌍 Área Queimada",
+                          f"{area_km2_calc:,.1f} km²",
+                          f"{area_ha:,.0f} hectares")
+            with m2:
+                st.metric("🌳 Perda de Serviços Ambientais",
+                          f"R$ {perda_ecossis_brl/1e9:,.2f} bi",
+                          f"R$ {valor_brl_ha:,.0f}/ha · {bioma_calc}")
+            with m3:
+                st.metric("☁️ Carbono Emitido",
+                          f"{co2_emitido_t/1e6:,.2f} Mt CO₂e",
+                          f"≈ R$ {credito_carbono_brl/1e9:,.2f} bi em créditos perdidos")
+
+            st.markdown("---")
+
+            # --- GRÁFICO: COMPARAÇÃO DOS 3 CENÁRIOS ---
+            st.markdown("### Como o valor muda conforme o cenário?")
+            st.caption(
+                "Cada cenário reflete um intervalo da literatura científica — "
+                "do mais conservador (menor impacto estimado) ao otimista (maior)."
+            )
+            dados_cen = []
+            for cen_k in ["conservador", "moderado", "otimista"]:
+                v_brl_ha_cen = VALORES_ECOSSIS[bioma_calc][cen_k] * cambio_usd
+                perda_cen    = area_ha * v_brl_ha_cen
+                co2_cen      = area_ha * fator_co2_ha * PRECO_CARBONO_USD * cambio_usd
+                total_cen    = perda_cen + co2_cen
+                dados_cen.append({
+                    "Cenário": {"conservador": "Conservador", "moderado": "Moderado",
+                              "otimista": "Otimista"}[cen_k],
+                    "Serviços Ambientais (R$ bi)": round(perda_cen / 1e9, 2),
+                    "Créditos de Carbono (R$ bi)":  round(co2_cen / 1e9, 2),
+                    "Total (R$ bi)":                   round(total_cen / 1e9, 2),
+                })
+            df_cen = pd.DataFrame(dados_cen)
+            fig_cen = go.Figure()
+            fig_cen.add_bar(
+                name="Serviços Ambientais",
+                x=df_cen["Cenário"],
+                y=df_cen["Serviços Ambientais (R$ bi)"],
+                marker_color="#e74c3c",
+                text=df_cen["Serviços Ambientais (R$ bi)"].apply(lambda v: f"R$ {v:.2f} bi"),
+                textposition="inside",
+            )
+            fig_cen.add_bar(
+                name="Créditos de Carbono",
+                x=df_cen["Cenário"],
+                y=df_cen["Créditos de Carbono (R$ bi)"],
+                marker_color="#f39c12",
+                text=df_cen["Créditos de Carbono (R$ bi)"].apply(lambda v: f"R$ {v:.2f} bi"),
+                textposition="inside",
+            )
+            fig_cen.update_layout(
+                barmode="stack", template="plotly_dark", height=360,
+                yaxis_title="R$ Bilhões",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                margin=dict(t=40, b=20),
+            )
+            st.plotly_chart(fig_cen, use_container_width=True)
+            st.dataframe(
+                df_cen.rename(columns={"Total (R$ bi)": "💰 Total (R$ bi)"}),
+                hide_index=True, use_container_width=True
+            )
+
+            st.markdown("---")
+
+            # --- CONTEXTO EXPLICATIVO ---
+            st.markdown("### O que significa esse prejuízo?")
+            col_ctx1, col_ctx2 = st.columns(2)
+            with col_ctx1:
+                st.markdown(f"""
+**Serviços ambientais** são os benefícios que a floresta entrega à sociedade sem custo:
+regulação das chuvas, filtragem da água, controle da temperatura e manutenção
+do solo e da biodiversidade. Quando uma área queima, esses benefícios deixam
+de existir por anos.
+
+Para o **{bioma_calc}**, cada hectare vale em média **R$ {valor_brl_ha:,.0f}**
+no cenário {cenario} — valor que a sociedade perde enquanto a vegetação não se recupera.
+                """)
+            with col_ctx2:
+                st.markdown(f"""
+**Carbono emitido:** as queimadas lançaram aproximadamente
+**{co2_emitido_t/1e6:,.2f} milhões de toneladas de CO₂** na atmosfera.
+
+No mercado voluntário de carbono, cada tonelada vale em torno de
+**R$ {PRECO_CARBONO_USD * cambio_usd:,.0f}** — o equivalente a
+**R$ {credito_carbono_brl/1e9:,.2f} bilhões** em créditos que não poderão mais
+ser gerados por essa floresta perdida.
+                """)
+
+            st.info(
+                "Estimativa indicativa com base em literatura científica. "
+                "Não substitui laudo técnico para fins legais ou regulatórios."
+            )
+
+            with st.expander("⚙️ Ajustar parâmetros do cálculo"):
+                pc1, pc2, pc3 = st.columns(3)
+                with pc1:
+                    st.selectbox(
+                        "Bioma:", list(VALORES_ECOSSIS.keys()),
+                        index=list(VALORES_ECOSSIS.keys()).index(bioma_calc),
+                        key="bioma_impacto"
+                    )
+                with pc2:
+                    st.selectbox(
+                        "Cenário:",
+                        ["conservador", "moderado", "otimista"],
+                        index=["conservador","moderado","otimista"].index(cenario),
+                        format_func=lambda x: {"conservador": "Conservador (mínimo)",
+                                               "moderado": "Moderado (referência)",
+                                               "otimista": "Otimista (máximo)"}[x],
+                        key="cenario_impacto"
+                    )
+                with pc3:
+                    st.number_input(
+                        f"Câmbio R$/US$ (PTAX hoje: R$ {CAMBIO_FIXO:.2f}):",
+                        min_value=1.0, max_value=20.0,
+                        value=float(cambio_usd), step=0.10, key="cambio_impacto"
+                    )
+                st.caption(
+                    "Altere os parâmetros e clique em **Gerar Dashboard** novamente para recalcular."
+                )
+
+            with st.expander("📚 Fontes e referências"):
+                st.markdown("""
+| Fonte | O que fornece | Site |
+|---|---|---|
+| Costanza et al. (2014) — *Global Policy* | Valor de serviços ecossistêmicos por bioma | [acessar](https://www.sciencedirect.com/science/article/pii/S0959378014000685) |
+| IPAM — Inst. de Pesquisa Ambiental da Amazônia | Custo de restauração e carbono na Amazônia | [ipam.org.br](https://ipam.org.br) |
+| TNC Brasil — The Nature Conservancy | Custo-benefício de conservação por bioma | [tnc.org.br](https://www.tnc.org.br) |
+| SEEG / Observatório do Clima | Fator de emissão de CO₂ por bioma (tCO₂e/ha) | [seeg.eco.br](https://seeg.eco.br) |
+| Ecosystem Marketplace (2023) | Preço médio de carbono no mercado voluntário | [ecosystemmarketplace.com](https://www.ecosystemmarketplace.com) |
+| CEPEA/USP | Custo de oportunidade agrícola e perdas em cadeias produtivas | [cepea.esalq.usp.br](https://www.cepea.esalq.usp.br) |
+                """)
+
+      except Exception as _err_impacto:
+        st.error(f"⚠️ Erro na aba de Impacto Econômico: {_err_impacto}")
+        import traceback
+        st.code(traceback.format_exc(), language="python")
 
 else:
     st.info(
