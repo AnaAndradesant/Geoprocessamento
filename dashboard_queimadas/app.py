@@ -382,6 +382,32 @@ def calcular_area_queimada_modis(geom_json, ano, mes=None):
     return burned, area_km2 or 0
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def buscar_total_modis(geom_json_str, ano, mes):
+    """Busca area queimada total MODIS. Cache de 1h por geometria+periodo."""
+    ee_geom = ee.Geometry(json.loads(geom_json_str))
+    ee_geom_simple = ee_geom.simplify(maxError=10000)
+    data_ini = ee.Date.fromYMD(ano, mes, 1)
+    colecao = (
+        ee.ImageCollection('MODIS/061/MCD64A1')
+        .filterDate(data_ini, data_ini.advance(1, 'month'))
+        .filterBounds(ee_geom_simple)
+    )
+    if colecao.size().getInfo() == 0:
+        return None, 0.0  # dados indisponiveis
+    img = colecao.select('BurnDate').max().clip(ee_geom_simple)
+    stats = (
+        ee.Image.pixelArea().divide(1e6)
+        .updateMask(img.gt(0))
+        .rename('area_km2')
+        .reduceRegion(reducer=ee.Reducer.sum(), geometry=ee_geom_simple,
+                      scale=1000, maxPixels=1e13, bestEffort=True)
+        .getInfo()
+    )
+    area = round(stats.get('area_km2') or 0, 2)
+    return img, area
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_anomalia_modis(geom_json_str, ano_ref):
     ee_geom = ee.Geometry(json.loads(geom_json_str))
@@ -749,34 +775,20 @@ if st.session_state.gerar_dashboard:
         else:
             st.write("☁️ Analisando satélite MODIS no GEE...")
             try:
-                data_ini_ee = ee.Date.fromYMD(ano_modis, mes_modis, 1)
-                colecao = (
-                    ee.ImageCollection('MODIS/061/MCD64A1')
-                    .filterDate(data_ini_ee, data_ini_ee.advance(1, 'month'))
-                    .filterBounds(ee_geom_complex)
+                # Usa funcao cacheada -- segunda consulta ao mesmo periodo e instantanea
+                area_queimada_img, total_valor = buscar_total_modis(
+                    geom_json_str, ano_modis, mes_modis
                 )
-
-                if colecao.size().getInfo() == 0:
+                if area_queimada_img is None:
                     dados_indisponiveis = True
                     total_valor = 0
                 else:
-                    area_queimada_img = (
-                        colecao.select('BurnDate').max().clip(ee_geom_complex)
-                    )
+                    ee_geom_simple = ee_geom_complex.simplify(maxError=10000)
+                    area_queimada_img = ee.Image(area_queimada_img)
                     img_area_km2 = (
                         ee.Image.pixelArea().divide(1000000)
                         .updateMask(area_queimada_img.gt(0))
                         .rename('area_km2')
-                    )
-
-                    stats_total = img_area_km2.reduceRegion(
-                        reducer=ee.Reducer.sum(),
-                        geometry=ee_geom_complex,
-                        scale=500, maxPixels=1e13, bestEffort=True
-                    ).getInfo()
-                    total_valor = round(
-                        stats_total.get('area_km2', 0)
-                        if stats_total.get('area_km2') else 0, 2
                     )
 
                     if area_protegida != "Nenhuma" and total_valor > 0:
