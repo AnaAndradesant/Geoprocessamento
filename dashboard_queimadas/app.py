@@ -827,78 +827,7 @@ if st.session_state.gerar_dashboard:
                             else:
                                 total_valor = 0
 
-                    if tipo_analise != "Por Município" and total_valor > 0:
-                        st.write("🏙️ Calculando ranking de municípios (MODIS)...")
-                        muns_ee = (
-                            ee.FeatureCollection("FAO/GAUL/2015/level2")
-                            .filterBounds(ee_geom_complex)
-                        )
-                        stats_mun = img_area_km2.reduceRegions(
-                            collection=muns_ee, reducer=ee.Reducer.sum(), scale=1000
-                        ).getInfo()
-                        recs_mun = [
-                            {
-                                'Município': f['properties']['ADM2_NAME'],
-                                'Valor': round(f['properties'].get('sum', 0), 2)
-                            }
-                            for f in stats_mun['features']
-                            if f['properties'].get('sum', 0) > 0
-                        ]
-                        if recs_mun:
-                            df_top_mun_modis = (
-                                pd.DataFrame(recs_mun)
-                                .sort_values(by='Valor', ascending=False)
-                                .head(5)
-                            )
-
-                    if total_valor > 0:
-                        st.write("📊 Calculando série temporal anual (MODIS)...")
-                        geom_temporal = (
-                            ee_geom_afetadas
-                            if (area_protegida != "Nenhuma" and not areas_afetadas.empty)
-                            else ee_geom_complex
-                        )
-
-                        def calc_mes(m):
-                            m_num = ee.Number(m)
-                            ini = ee.Date.fromYMD(ano_modis, m_num, 1)
-                            fim = ini.advance(1, 'month')
-                            img_mes = (
-                                ee.ImageCollection('MODIS/061/MCD64A1')
-                                .filterDate(ini, fim)
-                                .select('BurnDate').max().clip(geom_temporal)
-                            )
-                            area_calc = (
-                                ee.Image.pixelArea().divide(1000000)
-                                .updateMask(img_mes.gt(0))
-                            )
-                            val = area_calc.reduceRegion(
-                                reducer=ee.Reducer.sum(),
-                                geometry=geom_temporal,
-                                scale=1000,
-                                maxPixels=1e13,
-                                tileScale=4,
-                                bestEffort=True
-                            ).get('area')
-                            return ee.Feature(None, {'mes': m_num, 'area': val})
-
-                        meses_list = ee.List.sequence(1, 12)
-                        fc_meses = ee.FeatureCollection(meses_list.map(calc_mes)).getInfo()
-                        dados_temp = [
-                            {
-                                'Mês': f['properties']['mes'],
-                                'Área (km²)': round(f['properties'].get('area') or 0, 2)
-                            }
-                            for f in fc_meses['features']
-                        ]
-                        df_modis_temporal = pd.DataFrame(dados_temp)
-                        meses_map_label = {
-                            1: 'Jan', 2: 'Fev', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun',
-                            7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Out', 11: 'Nov', 12: 'Dez'
-                        }
-                        df_modis_temporal['Mês Nome'] = df_modis_temporal['Mês'].map(
-                            meses_map_label
-                        )
+                    # ranking de municipios e serie temporal: calculados dentro das abas
 
             except Exception as e:
                 st.warning(f"⚠️ Erro ao processar MODIS: {e}")
@@ -1220,6 +1149,63 @@ if st.session_state.gerar_dashboard:
                     st.plotly_chart(fig_bar, use_container_width=True)
 
             else:
+                # --- Calcula serie temporal e ranking de municipios aqui (sob demanda) ---
+                if df_modis_temporal.empty and total_valor > 0:
+                    with st.spinner("📊 Calculando evolução mensal..."):
+                        try:
+                            geom_temporal = (
+                                ee_geom_afetadas
+                                if (area_protegida != "Nenhuma" and not areas_afetadas.empty)
+                                else ee_geom_complex
+                            )
+                            def calc_mes(m):
+                                m_num = ee.Number(m)
+                                ini = ee.Date.fromYMD(ano_modis, m_num, 1)
+                                img_mes = (
+                                    ee.ImageCollection('MODIS/061/MCD64A1')
+                                    .filterDate(ini, ini.advance(1, 'month'))
+                                    .select('BurnDate').max().clip(geom_temporal)
+                                )
+                                val = (ee.Image.pixelArea().divide(1000000)
+                                    .updateMask(img_mes.gt(0))
+                                    .reduceRegion(reducer=ee.Reducer.sum(),
+                                        geometry=geom_temporal, scale=1000,
+                                        maxPixels=1e13, tileScale=4, bestEffort=True
+                                    ).get('area'))
+                                return ee.Feature(None, {'mes': m_num, 'area': val})
+                            fc_meses = ee.FeatureCollection(ee.List.sequence(1,12).map(calc_mes)).getInfo()
+                            meses_map_label = {1:'Jan',2:'Fev',3:'Mar',4:'Abr',5:'Mai',6:'Jun',
+                                               7:'Jul',8:'Ago',9:'Set',10:'Out',11:'Nov',12:'Dez'}
+                            df_modis_temporal = pd.DataFrame([
+                                {'Mês': f['properties']['mes'],
+                                 'Área (km²)': round(f['properties'].get('area') or 0, 2)}
+                                for f in fc_meses['features']
+                            ])
+                            df_modis_temporal['Mês Nome'] = df_modis_temporal['Mês'].map(meses_map_label)
+                        except Exception as _e_temp:
+                            st.warning(f"⚠️ Não foi possível calcular a série temporal: {_e_temp}")
+
+                if df_top_mun_modis.empty and tipo_analise != "Por Município" and total_valor > 0:
+                    with st.spinner("🏙️ Calculando ranking de municípios..."):
+                        try:
+                            muns_ee = ee.FeatureCollection("FAO/GAUL/2015/level2").filterBounds(ee_geom_complex)
+                            img_area_km2_mun = (ee.Image.pixelArea().divide(1000000)
+                                .updateMask(area_queimada_img.gt(0)))
+                            stats_mun = img_area_km2_mun.reduceRegions(
+                                collection=muns_ee, reducer=ee.Reducer.sum(), scale=1000
+                            ).getInfo()
+                            recs_mun = [
+                                {'Município': f['properties']['ADM2_NAME'],
+                                 'Valor': round(f['properties'].get('sum', 0), 2)}
+                                for f in stats_mun['features']
+                                if f['properties'].get('sum', 0) > 0
+                            ]
+                            if recs_mun:
+                                df_top_mun_modis = (pd.DataFrame(recs_mun)
+                                    .sort_values(by='Valor', ascending=False).head(5))
+                        except Exception as _e_mun:
+                            st.warning(f"⚠️ Não foi possível calcular ranking de municípios: {_e_mun}")
+
                 # Série temporal MODIS
                 if not df_modis_temporal.empty:
                     st.subheader(f"📈 Evolução Mensal — {ano_modis}")
