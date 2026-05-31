@@ -628,6 +628,12 @@ st.sidebar.markdown("---")
 gmail_logo_url = "https://upload.wikimedia.org/wikipedia/commons/7/7e/Gmail_icon_%282020%29.svg"
 linkedin_logo_url = "https://upload.wikimedia.org/wikipedia/commons/c/ca/LinkedIn_logo_initials.png"
 
+# Verifica se cache foi limpo para mostrar mensagem dentro do HTML
+_cache_msg = ""
+if st.session_state.get("_cache_limpo"):
+    _cache_msg = '<p style="color:#4CAF50; font-size:11px; margin-top:8px;">✅ Cache limpo!</p>'
+    st.session_state["_cache_limpo"] = False
+
 html_contato_novo = f"""
 <div style="text-align: center;">
 <p style="font-size: 12px; color: #888; margin-bottom: 2px; margin-top: 10px;">Desenvolvido por</p>
@@ -648,14 +654,15 @@ html_contato_novo = f"""
   <img src="{linkedin_logo_url}" alt="LinkedIn" style="width: 22px; height: auto; display: block; margin: 0 auto;">
 </a>
 </div>
+{_cache_msg}
 </div>
 """
 st.sidebar.markdown(html_contato_novo, unsafe_allow_html=True)
-
-if st.sidebar.button("♻️ Limpar Cache", use_container_width=True, type="secondary"):
+if st.sidebar.button("♻️ Limpar Cache", type="secondary", use_container_width=True):
     st.cache_data.clear()
     st.cache_resource.clear()
-    st.sidebar.success("Cache limpo!")
+    st.session_state["_cache_limpo"] = True
+    st.rerun()
 
 
 # =============================================================
