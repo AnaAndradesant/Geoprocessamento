@@ -287,16 +287,14 @@ def carregar_areas_protegidas(tipo_area):
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satelites):
     """
-    P3 FIX (v3): loop sequencial com blocos adaptativos.
-    ThreadPoolExecutor removido — trava o Streamlit dentro de @st.cache_data.
-    Ganho de performance vem do tamanho do bloco (semanal/quinzenal), não do paralelismo.
-    - 30 dias  → 5 requests  (blocos diários)
-    - 6 meses  → 26 requests (blocos semanais)
-    - 2 anos   → 49 requests (blocos quinzenais)
-    vs. código original: 730 requests diários para 2 anos.
+    Loop sequencial com blocos adaptativos (sem cache no nível da função).
+    O cache era o problema: servia DataFrame vazio de execuções com erro anterior.
+    O cache agora fica no nível do botão Gerar Dashboard via session_state.
+    - 30 dias  → ~5 blocos semanais
+    - 6 meses  → ~26 blocos semanais
+    - 2 anos   → ~49 blocos quinzenais
     """
     url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -324,7 +322,6 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
     periodo_dias = (dt_fim - dt_ini).days
     sat_str = "','".join(satelites)
 
-    # Granularidade adaptativa — menos requests, menos chance de timeout
     if periodo_dias <= 7:
         passo = timedelta(days=1)
     elif periodo_dias <= 90:
@@ -333,6 +330,7 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
         passo = timedelta(days=15)
 
     all_records = []
+    erros = 0
     cursor = dt_ini
 
     while cursor <= dt_fim:
@@ -361,12 +359,19 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
                          **f["properties"]}
                         for f in dados["features"]
                     ])
+            else:
+                erros += 1
         except Exception:
-            pass  # timeout ou erro de rede — ignora o bloco, continua
+            erros += 1
 
         cursor = fim_bloco + timedelta(days=1)
 
     session.close()
+
+    # Retorna None em vez de DF vazio quando TODOS os blocos falharam
+    # (permite distinguir "sem dados" de "erro de rede" no chamador)
+    if not all_records and erros > 0 and erros == _contar_blocos(dt_ini, dt_fim, passo):
+        return None  # sinaliza falha total de rede
 
     if not all_records:
         return pd.DataFrame()
@@ -377,6 +382,15 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
     else:
         df_final = df_final.drop_duplicates()
     return df_final
+
+
+def _contar_blocos(dt_ini, dt_fim, passo):
+    n, cursor = 0, dt_ini
+    while cursor <= dt_fim:
+        fim_bloco = min(cursor + passo - timedelta(days=1), dt_fim)
+        n += 1
+        cursor = fim_bloco + timedelta(days=1)
+    return n
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -618,10 +632,12 @@ if "qa" in st.query_params and st.query_params["qa"].lower() == "true":
 
 if st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True):
     st.session_state.gerar_dashboard = True
-    # Limpa caches de sessão ao gerar novo dashboard com filtros potencialmente diferentes
+    # Limpa caches de sessão — garante consulta fresca com novos filtros
     st.session_state.modis_temporal = {}
     st.session_state.modis_top_mun = {}
-    # Não limpa anomalia_cache — é caro de recalcular e os dados mudam pouco
+    # Limpa resultados INPE anteriores (chaves começam com "inpe_")
+    for k in [k for k in st.session_state if k.startswith("inpe_")]:
+        del st.session_state[k]
 
 # --- SEÇÃO DE CONTATO ---
 st.sidebar.markdown("---")
@@ -709,17 +725,25 @@ if st.session_state.gerar_dashboard:
                 st.stop()
 
             periodo_dias = (hoje - dt_ini).days
-            st.write(f"📡 Consultando satélites do INPE ({periodo_dias} dias, blocos paralelos)...")
 
-            if modo_debug:
-                passo_debug = "diário" if periodo_dias <= 7 else "semanal" if periodo_dias <= 90 else "quinzenal"
-                n_blocos = periodo_dias // (1 if periodo_dias <= 7 else 7 if periodo_dias <= 90 else 15) + 1
-                st.info(f"[QA] Granularidade: {passo_debug} | ~{n_blocos} blocos | 6 workers paralelos")
+            # Cache manual via session_state — evita repetir a consulta se os
+            # parâmetros não mudaram, sem o risco de cachear resultado vazio por erro.
+            _inpe_key = f"inpe_{tipo_analise}_{estado_dd}_{bioma_dd}_{municipio_dd}_{dt_ini.date()}_{hoje.date()}_{'_'.join(sorted(satelites_sel))}"
 
-            df = buscar_focos_inpe(
-                tipo_analise, estado_dd, bioma_dd, municipio_dd,
-                dt_ini.strftime("%Y-%m-%d"), hoje.strftime("%Y-%m-%d"), satelites_sel
-            )
+            if _inpe_key not in st.session_state:
+                st.write(f"📡 Consultando INPE ({periodo_dias} dias, blocos adaptativos)...")
+                resultado_inpe = buscar_focos_inpe(
+                    tipo_analise, estado_dd, bioma_dd, municipio_dd,
+                    dt_ini.strftime("%Y-%m-%d"), hoje.strftime("%Y-%m-%d"), satelites_sel
+                )
+                if resultado_inpe is None:
+                    st.warning("⚠️ Erro de comunicação com o servidor do INPE. Tente novamente.")
+                    st.stop()
+                st.session_state[_inpe_key] = resultado_inpe
+            else:
+                st.write("📡 Dados INPE carregados do cache de sessão.")
+
+            df = st.session_state[_inpe_key]
 
             if not df.empty:
                 gdf = gpd.GeoDataFrame(
