@@ -14,25 +14,73 @@ from io import BytesIO
 import traceback
 
 
+# =============================================================
+# CONSTANTES GLOBAIS (P6: meses_map e ESTADO_BIOMA centralizados)
+# =============================================================
+
+MESES_MAP = {
+    1: 'Jan', 2: 'Fev', 3: 'Mar', 4: 'Abr',
+    5: 'Mai', 6: 'Jun', 7: 'Jul', 8: 'Ago',
+    9: 'Set', 10: 'Out', 11: 'Nov', 12: 'Dez'
+}
+
+# P7: mapeamento corrigido — bioma PREDOMINANTE por estado (fonte: IBGE/MMA)
+# MT: ~50% Amazônia, ~40% Cerrado → Amazônia
+# MA: ~34% Amazônia, ~33% Cerrado, ~25% Caatinga → Cerrado (transição, mantido por área total)
+# PA: >80% Amazônia
+ESTADO_BIOMA = {
+    "AC": "Amazônia",      "AL": "Caatinga",       "AP": "Amazônia",
+    "AM": "Amazônia",      "BA": "Caatinga",        "CE": "Caatinga",
+    "DF": "Cerrado",       "ES": "Mata Atlântica",  "GO": "Cerrado",
+    "MA": "Cerrado",       "MT": "Amazônia",        "MS": "Pantanal",
+    "MG": "Mata Atlântica","PA": "Amazônia",        "PB": "Caatinga",
+    "PR": "Mata Atlântica","PE": "Caatinga",        "PI": "Caatinga",
+    "RJ": "Mata Atlântica","RN": "Caatinga",        "RS": "Pampa",
+    "RO": "Amazônia",      "RR": "Amazônia",        "SC": "Mata Atlântica",
+    "SP": "Mata Atlântica","SE": "Caatinga",        "TO": "Cerrado",
+}
+
+DIC_ESTADOS_WFS = {
+    "AC": "ACRE",            "AL": "ALAGOAS",         "AP": "AMAP%",
+    "AM": "AMAZONAS",        "BA": "BAHIA",           "CE": "CEAR%",
+    "DF": "DISTRITO FEDERAL","ES": "ESP%RITO SANTO",  "GO": "GOI%S",
+    "MA": "MARANH%O",        "MT": "MATO GROSSO",     "MS": "MATO GROSSO DO SUL",
+    "MG": "MINAS GERAIS",    "PA": "PAR%",            "PB": "PARA%BA",
+    "PR": "PARAN%",          "PE": "PERNAMBUCO",      "PI": "PIAU%",
+    "RJ": "RIO DE JANEIRO",  "RN": "RIO GRANDE DO NORTE", "RS": "RIO GRANDE DO SUL",
+    "RO": "ROND%NIA",        "RR": "RORAIMA",         "SC": "SANTA CATARINA",
+    "SP": "S%O PAULO",       "SE": "SERGIPE",         "TO": "TOCANTINS",
+}
+
+VALORES_ECOSSIS = {
+    "Amazônia":       {"conservador": 2000, "moderado": 4000, "otimista": 6000},
+    "Cerrado":        {"conservador": 800,  "moderado": 1650, "otimista": 2500},
+    "Mata Atlântica": {"conservador": 3000, "moderado": 5500, "otimista": 8000},
+    "Pantanal":       {"conservador": 1500, "moderado": 2750, "otimista": 4000},
+    "Caatinga":       {"conservador": 400,  "moderado": 800,  "otimista": 1200},
+    "Pampa":          {"conservador": 600,  "moderado": 1050, "otimista": 1500},
+}
+
+EMISSOES_CO2_HA = {
+    "Amazônia": 150, "Cerrado": 60, "Mata Atlântica": 120,
+    "Pantanal": 80,  "Caatinga": 30, "Pampa": 25,
+}
+
+PRECO_CARBONO_USD = 15
 
 
+# =============================================================
+# CONFIGURAÇÃO DO EARTH ENGINE — FOLIUM
+# =============================================================
 
-# Define o método para adicionar a camada do Earth Engine ao Folium
 def add_ee_layer(self, ee_image_object, vis_params, name, opacity=1):
-    # Gera as informações do tile a partir da imagem do EE
     map_id_dict = ee.Image(ee_image_object).getMapId(vis_params)
-    
-    # Cria uma camada de mapa com os tiles obtidos do EE
     folium.raster_layers.TileLayer(
         tiles=map_id_dict['tile_fetcher'].url_format,
         attr='Map Data &copy; <a href="https://earthengine.google.com/">Google Earth Engine</a>',
-        name=name,
-        overlay=True,
-        control=True,
-        opacity=opacity
+        name=name, overlay=True, control=True, opacity=opacity
     ).add_to(self)
 
-# Adiciona o método à classe folium.Map para que ele possa ser chamado como m.add_ee_layer
 folium.Map.add_ee_layer = add_ee_layer
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
@@ -43,17 +91,24 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ==========================================
-# 🛠️ KEEP-ALIVE E ESTADO
+# =============================================================
+# KEEP-ALIVE E ESTADO
+# =============================================================
 if 'last_heartbeat' not in st.session_state:
     st.session_state.last_heartbeat = datetime.now()
-
 if (datetime.now() - st.session_state.last_heartbeat).seconds > 60:
     st.session_state.last_heartbeat = datetime.now()
-
 if 'gerar_dashboard' not in st.session_state:
     st.session_state.gerar_dashboard = False
-# ==========================================
+
+# P5: session_state para resultados MODIS calculados na aba Gráficos
+# (evita recalcular em todo rerun por troca de aba ou interação)
+if 'modis_temporal' not in st.session_state:
+    st.session_state.modis_temporal = {}      # chave: (val_sel, ano) → df
+if 'modis_top_mun' not in st.session_state:
+    st.session_state.modis_top_mun = {}       # chave: (val_sel, ano, mes) → df
+if 'anomalia_cache' not in st.session_state:
+    st.session_state.anomalia_cache = {}      # chave: (geom_hash, ano) → df  (P2)
 
 warnings.filterwarnings('ignore')
 requests.packages.urllib3.disable_warnings()
@@ -70,51 +125,33 @@ except Exception as e:
     st.error("⚠️ Erro ao conectar com o Google Earth Engine. Verifique seus Secrets.")
 
 
-# =====================================================================
-# FUNÇÕES DO SENTINEL-2 (NBR) - OTIMIZADAS COM A MÁSCARA DO MODIS
-# =====================================================================
+# =============================================================
+# FUNÇÕES DO SENTINEL-2 (NBR)
+# =============================================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hint=0):
-    # === LEITURA INTELIGENTE DE GEOJSON ===
     geom_dict = json.loads(geom_json_str)
     if 'features' in geom_dict:
         poly = ee.Geometry(geom_dict['features'][0]['geometry'])
     else:
         poly = ee.Geometry(geom_dict)
-    # ======================================
 
-    # === ESCALA E SIMPLIFICAÇÃO DINÂMICAS baseadas em area_km2_hint ===
-    # area_km2_hint é calculado localmente via Shapely — zero chamadas GEE bloqueantes.
-    # Amazônia (~5,5M km²): scale=1000 + simplify 10km evita timeout garantido.
     area_km2 = area_km2_hint
-    if area_km2 > 1_500_000:       # Biomas gigantes (ex: Amazônia ~5,5M km²)
-        scale = 1000
-        max_error_simplify = 10000
-        tile_scale = 16
-    elif area_km2 > 500_000:       # Estados grandes (AM, PA, MT) / Cerrado
-        scale = 500
-        max_error_simplify = 5000
-        tile_scale = 16
-    elif area_km2 > 100_000:       # Estados médios
-        scale = 200
-        max_error_simplify = 1000
-        tile_scale = 8
-    elif area_km2 > 10_000:        # Estados pequenos / regiões
-        scale = 100
-        max_error_simplify = 500
-        tile_scale = 4
-    else:                          # Municípios e áreas pequenas
-        scale = 50
-        max_error_simplify = 100
-        tile_scale = 2
-    # ==================================================================
+    if area_km2 > 1_500_000:
+        scale, max_error_simplify, tile_scale = 1000, 10000, 16
+    elif area_km2 > 500_000:
+        scale, max_error_simplify, tile_scale = 500, 5000, 16
+    elif area_km2 > 100_000:
+        scale, max_error_simplify, tile_scale = 200, 1000, 8
+    elif area_km2 > 10_000:
+        scale, max_error_simplify, tile_scale = 100, 500, 4
+    else:
+        scale, max_error_simplify, tile_scale = 50, 100, 2
 
-    # Simplifica a geometria no GEE — crítico para Amazônia (milhares de vértices)
     if area_km2 > 10_000:
         poly = poly.simplify(maxError=max_error_simplify)
 
-    # Datas para o Sentinel (1 mês antes e o mês atual)
     data_fim = datetime(ano, mes, 28)
     data_ini = data_fim - timedelta(days=60)
 
@@ -142,36 +179,27 @@ def calcular_stats_nbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hi
 
     stats = sld_intervals.reduceRegion(
         reducer=ee.Reducer.frequencyHistogram(),
-        geometry=poly,
-        scale=scale,
-        maxPixels=1e13,
-        tileScale=tile_scale,
-        bestEffort=True
+        geometry=poly, scale=scale, maxPixels=1e13,
+        tileScale=tile_scale, bestEffort=True
     ).getInfo()
 
     classes = {0: 'Regeneração', 1: 'Não afetado', 2: 'Baixa',
                3: 'Moderada', 4: 'Moderada-Alta', 5: 'Alta'}
     res_stats = {}
-
     if stats:
         hist = list(stats.values())[0]
         if isinstance(hist, dict):
             pixel_area_km2 = (scale * scale) / 1e6
             for k, v in hist.items():
-                area = v * pixel_area_km2
-                res_stats[classes.get(int(float(k)), 'Outros')] = round(area, 2)
-        elif not hist:
-            pass  # histograma vazio = sem pixels queimados no período
-
+                res_stats[classes.get(int(float(k)), 'Outros')] = round(v * pixel_area_km2, 2)
     return res_stats
 
 
 # =============================================================
-# --- FUNÇÕES UTILITÁRIAS ---
+# FUNÇÕES UTILITÁRIAS
 # =============================================================
 
 def normalizar_texto(txt):
-    """Remove acentos e converte para minúsculo para buscas tolerantes."""
     if pd.isna(txt):
         return ""
     return ''.join(
@@ -180,35 +208,25 @@ def normalizar_texto(txt):
     ).lower()
 
 def gerar_excel(df):
-    # 1. Cria uma cópia para não estragar os dados originais do dashboard
     df_export = df.copy()
-    
-    # 2. Varre as colunas procurando datas com Fuso Horário e remove o fuso
     for col in df_export.select_dtypes(include=['datetimetz']).columns:
         df_export[col] = df_export[col].dt.tz_localize(None)
-        
-    # 3. Varre as colunas procurando listas/dicionários (que o Excel também odeia) e vira texto
     for col in df_export.select_dtypes(include=['object']).columns:
         if any(isinstance(x, (list, dict)) for x in df_export[col].dropna()):
             df_export[col] = df_export[col].astype(str)
-
-    # 4. Gera o arquivo Excel em memória
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df_export.to_excel(writer, index=False, sheet_name='Dados')
-    
     return output.getvalue()
 
+
 # =============================================================
-# --- FUNÇÕES COM CACHE ---
+# FUNÇÕES COM CACHE
 # =============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def buscar_cotacao_dolar():
-    """Busca a cotação PTAX do dólar no Banco Central. Cache de 1h."""
-    from datetime import datetime, timedelta
     try:
-        # Tenta os últimos 5 dias úteis para garantir que ache uma cotação
         for delta in range(5):
             data = (datetime.now() - timedelta(days=delta)).strftime("%m-%d-%Y")
             url = (
@@ -222,9 +240,9 @@ def buscar_cotacao_dolar():
                     return round(float(valores[0]["cotacaoVenda"]), 2)
     except Exception:
         pass
-    return 5.04  # fallback caso a API esteja indisponível
+    return 5.04
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def buscar_cidades(uf):
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
     try:
@@ -266,53 +284,62 @@ def carregar_areas_protegidas(tipo_area):
     gdf_areas['geometry'] = gdf_areas['geometry'].simplify(tolerance=0.01, preserve_topology=True)
     return gdf_areas[['nome_area', 'geometry']]
 
-import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satelites):
+    """
+    P3 FIX: substituída a iteração diária por blocos semanais + paralelismo.
+    Para 2 anos: 104 requests (semanal) vs 730 (diário).
+    Para períodos ≤ 7 dias mantém granularidade diária.
+    """
     url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
-    
+
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-    dic_estados = {
-        "AC": "ACRE", "AL": "ALAGOAS", "AP": "AMAP%", "AM": "AMAZONAS",
-        "BA": "BAHIA", "CE": "CEAR%", "DF": "DISTRITO FEDERAL",
-        "ES": "ESP%RITO SANTO", "GO": "GOI%S", "MA": "MARANH%O",
-        "MT": "MATO GROSSO", "MS": "MATO GROSSO DO SUL", "MG": "MINAS GERAIS",
-        "PA": "PAR%", "PB": "PARA%BA", "PR": "PARAN%", "PE": "PERNAMBUCO",
-        "PI": "PIAU%", "RJ": "RIO DE JANEIRO", "RN": "RIO GRANDE DO NORTE",
-        "RS": "RIO GRANDE DO SUL", "RO": "ROND%NIA", "RR": "RORAIMA",
-        "SC": "SANTA CATARINA", "SP": "S%O PAULO", "SE": "SERGIPE",
-        "TO": "TOCANTINS"
-    }
-    
     if tipo == "Por Estado":
-        filtro_base = f"estado ILIKE '{dic_estados.get(val_estado, val_estado)}'"
+        filtro_base = f"estado ILIKE '{DIC_ESTADOS_WFS.get(val_estado, val_estado)}'"
     elif tipo == "Por Bioma":
         tradutor = {"Amazônia": "Amaz%nia", "Mata Atlântica": "Mata Atl%ntica"}
         filtro_base = f"bioma ILIKE '{tradutor.get(val_bioma, val_bioma)}'"
     elif tipo == "Por Município":
         muni_curinga = re.sub(r'[aeiouáéíóúãõâêîôûAEIOUÁÉÍÓÚÃÕÂÊÎÔÛ]', '%', val_muni).replace(' ', '%')
-        filtro_base = f"estado ILIKE '{dic_estados.get(val_estado, val_estado)}' AND municipio ILIKE '{muni_curinga}%'"
+        filtro_base = f"estado ILIKE '{DIC_ESTADOS_WFS.get(val_estado, val_estado)}' AND municipio ILIKE '{muni_curinga}%'"
 
     dt_ini = datetime.strptime(d_ini, "%Y-%m-%d")
     dt_fim = datetime.strptime(d_fim, "%Y-%m-%d")
-    all_dfs = []
+    periodo_dias = (dt_fim - dt_ini).days
+
+    # Granularidade adaptativa: diário ≤ 7d, semanal ≤ 90d, quinzenal acima
+    if periodo_dias <= 7:
+        passo = timedelta(days=1)
+    elif periodo_dias <= 90:
+        passo = timedelta(days=7)
+    else:
+        passo = timedelta(days=15)
+
     sat_str = "','".join(satelites)
 
-    while dt_ini <= dt_fim:
-        dt_bloco_fim = min(dt_ini + timedelta(days=1), dt_fim)
+    # Monta lista de blocos
+    blocos = []
+    cursor = dt_ini
+    while cursor <= dt_fim:
+        fim_bloco = min(cursor + passo - timedelta(days=1), dt_fim)
+        blocos.append((cursor, fim_bloco))
+        cursor = fim_bloco + timedelta(days=1)
+
+    # Paraleliza os blocos com ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def fetch_bloco(bloco):
+        inicio, fim = bloco
         cql = (
-            f"data_hora_gmt >= '{dt_ini.strftime('%Y-%m-%d')}T00:00:00' "
-            f"AND data_hora_gmt <= '{dt_bloco_fim.strftime('%Y-%m-%d')}T23:59:59' "
+            f"data_hora_gmt >= '{inicio.strftime('%Y-%m-%d')}T00:00:00' "
+            f"AND data_hora_gmt <= '{fim.strftime('%Y-%m-%d')}T23:59:59' "
             f"AND satelite IN ('{sat_str}') AND {filtro_base}"
         )
         try:
@@ -323,29 +350,31 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
                     "typeName": "bdqueimadas:focos", "outputFormat": "application/json",
                     "CQL_FILTER": cql, "maxFeatures": 50000
                 },
-                headers=headers,
-                verify=False,
-                timeout=90
+                headers=headers, verify=False, timeout=90
             )
             if r.status_code == 200:
-                dados_json = r.json()
-                if "features" in dados_json and len(dados_json["features"]) > 0:
-                    registros = [
+                dados = r.json()
+                if "features" in dados and dados["features"]:
+                    return [
                         {"longitude": f["geometry"]["coordinates"][0],
-                         "latitude": f["geometry"]["coordinates"][1],
+                         "latitude":  f["geometry"]["coordinates"][1],
                          **f["properties"]}
-                        for f in dados_json["features"]
+                        for f in dados["features"]
                     ]
-                    all_dfs.append(pd.DataFrame(registros))
         except Exception:
-            pass  # Ignora erros de conexão para não parar o loop
-            
-        dt_ini = dt_bloco_fim + timedelta(days=1)
+            pass
+        return []
 
-    if not all_dfs:
+    all_records = []
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(fetch_bloco, b): b for b in blocos}
+        for future in as_completed(futures):
+            all_records.extend(future.result())
+
+    if not all_records:
         return pd.DataFrame()
 
-    df_final = pd.concat(all_dfs, ignore_index=True)
+    df_final = pd.DataFrame(all_records)
     if 'id' in df_final.columns:
         df_final = df_final.drop_duplicates(subset=['id'])
     else:
@@ -353,40 +382,16 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
     return df_final
 
 
-
-@st.cache_data
-def calcular_area_queimada_modis(geom_json, ano, mes=None):
-    poly = ee.Geometry(json.loads(geom_json)['features'][0]['geometry'])
-    dataset = ee.ImageCollection('MODIS/061/MCD64A1').filterBounds(poly)
-    
-    if mes:
-        img = dataset.filter(ee.Filter.calendarRange(ano, ano, 'year'))\
-                     .filter(ee.Filter.calendarRange(mes, mes, 'month')).max()
-        burned = img.select('BurnDate').clip(poly)
-        
-        # Correção do Efeito Fantasma
-        doy_inicio = datetime(ano, mes, 1).timetuple().tm_yday
-        ultimo_dia = calendar.monthrange(ano, mes)[1]
-        doy_fim = datetime(ano, mes, ultimo_dia).timetuple().tm_yday
-        
-        mask = burned.gte(doy_inicio).And(burned.lte(doy_fim))
-        burned = burned.updateMask(mask)
-    else:
-        img = dataset.filter(ee.Filter.calendarRange(ano, ano, 'year')).max()
-        burned = img.select('BurnDate').clip(poly)
-    
-    area_img = ee.Image.pixelArea().updateMask(burned.gt(0))
-    stats = area_img.reduceRegion(reducer=ee.Reducer.sum(), geometry=poly, scale=500, maxPixels=1e9)
-    area_km2 = ee.Number(stats.get('area')).divide(1e6).getInfo()
-    
-    return burned, area_km2 or 0
-
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def buscar_total_modis(geom_json_str, ano, mes):
-    """Busca area queimada total MODIS. Cache de 1h por geometria+periodo."""
+    """
+    P4 FIX: adicionado filtro DOY (efeito fantasma) que existia em
+    calcular_area_queimada_modis mas estava ausente aqui.
+    calcular_area_queimada_modis foi removida (era função órfã).
+    """
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     ee_geom_simple = ee_geom.simplify(maxError=10000)
+
     data_ini = ee.Date.fromYMD(ano, mes, 1)
     colecao = (
         ee.ImageCollection('MODIS/061/MCD64A1')
@@ -394,14 +399,24 @@ def buscar_total_modis(geom_json_str, ano, mes):
         .filterBounds(ee_geom_simple)
     )
     if colecao.size().getInfo() == 0:
-        return None, 0.0  # dados indisponiveis
+        return None, 0.0
+
     img = colecao.select('BurnDate').max().clip(ee_geom_simple)
+
+    # Filtro DOY — remove pixels de meses vizinhos (efeito fantasma)
+    doy_inicio = datetime(ano, mes, 1).timetuple().tm_yday
+    ultimo_dia = calendar.monthrange(ano, mes)[1]
+    doy_fim = datetime(ano, mes, ultimo_dia).timetuple().tm_yday
+    img = img.updateMask(img.gte(doy_inicio).And(img.lte(doy_fim)))
+
     stats = (
         ee.Image.pixelArea().divide(1e6)
         .updateMask(img.gt(0))
         .rename('area_km2')
-        .reduceRegion(reducer=ee.Reducer.sum(), geometry=ee_geom_simple,
-                      scale=1000, maxPixels=1e13, bestEffort=True)
+        .reduceRegion(
+            reducer=ee.Reducer.sum(), geometry=ee_geom_simple,
+            scale=1000, maxPixels=1e13, bestEffort=True
+        )
         .getInfo()
     )
     area = round(stats.get('area_km2') or 0, 2)
@@ -411,30 +426,18 @@ def buscar_total_modis(geom_json_str, ano, mes):
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_anomalia_modis(geom_json_str, ano_ref):
     ee_geom = ee.Geometry(json.loads(geom_json_str))
-
-    # Simplifica a geometria UMA VEZ fora do loop — evita recriá-la a cada imagem
     geom_simplificada = ee_geom.simplify(maxError=5000)
-
     anos_historico = list(range(2001, ano_ref))
     anos_ee = ee.List(anos_historico)
     n_anos = len(anos_historico)
-
-    meses_map = {
-        1: 'Jan', 2: 'Fev', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun',
-        7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Out', 11: 'Nov', 12: 'Dez'
-    }
 
     def get_area_km2(img):
         raw = (
             ee.Image.pixelArea().divide(1e6)
             .updateMask(img.gt(0))
             .reduceRegion(
-                reducer=ee.Reducer.sum(),
-                geometry=geom_simplificada,
-                scale=10000,
-                maxPixels=1e13,
-                tileScale=16,
-                bestEffort=True
+                reducer=ee.Reducer.sum(), geometry=geom_simplificada,
+                scale=10000, maxPixels=1e13, tileScale=16, bestEffort=True
             ).get('area')
         )
         return ee.Algorithms.If(raw, raw, 0)
@@ -463,19 +466,11 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
 
         areas_hist = anos_ee.map(area_ano_hist)
         soma = areas_hist.iterate(
-            lambda cur, acc: ee.Number(acc).add(ee.Number(cur)),
-            ee.Number(0)
+            lambda cur, acc: ee.Number(acc).add(ee.Number(cur)), ee.Number(0)
         )
         media_hist = ee.Number(soma).divide(ee.Number(n_anos))
+        return ee.Feature(None, {'mes': mes_n, 'area_ref': area_ref, 'media_hist': media_hist})
 
-        return ee.Feature(None, {
-            'mes': mes_n,
-            'area_ref': area_ref,
-            'media_hist': media_hist
-        })
-
-    # ── PROCESSAMENTO PARALELO (4 meses simultâneos) ───────────
-    # Reduz de ~60s sequencial para ~15s com 4 workers paralelos
     from concurrent.futures import ThreadPoolExecutor, as_completed
     MAX_RETRIES = 4
     registros = []
@@ -483,17 +478,15 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
     def processar_mes(mes):
         for tentativa in range(1, MAX_RETRIES + 1):
             try:
-                feat_resultado = ee.Feature(calc_mes_feature(mes)).getInfo()
-                p = feat_resultado['properties']
+                feat = ee.Feature(calc_mes_feature(mes)).getInfo()
+                p = feat['properties']
                 val_ref  = round(float(p.get('area_ref')  or 0), 2)
                 media    = round(float(p.get('media_hist') or 0), 2)
                 anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
                 return {
-                    'Mês': mes,
-                    'Mês Nome': meses_map[mes],
+                    'Mês': mes, 'Mês Nome': MESES_MAP[mes],
                     f'Área {ano_ref} (km²)': val_ref,
-                    'Média Histórica (km²)': media,
-                    'Anomalia (%)': anomalia
+                    'Média Histórica (km²)': media, 'Anomalia (%)': anomalia
                 }
             except Exception as e:
                 msg = str(e)
@@ -501,9 +494,8 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
                     time.sleep(2 ** tentativa)
                     continue
                 return {
-                    'Mês': mes, 'Mês Nome': meses_map[mes],
-                    f'Área {ano_ref} (km²)': 0,
-                    'Média Histórica (km²)': 0, 'Anomalia (%)': 0
+                    'Mês': mes, 'Mês Nome': MESES_MAP[mes],
+                    f'Área {ano_ref} (km²)': 0, 'Média Histórica (km²)': 0, 'Anomalia (%)': 0
                 }
 
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -513,15 +505,14 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
 
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
+
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hint=0):
-    # 1. LEITURA CORRETA DA GEOMETRIA
     geom_dict = json.loads(geom_json_str)
     if 'features' in geom_dict:
         poly = ee.Geometry(geom_dict['features'][0]['geometry'])
     else:
         poly = ee.Geometry(geom_dict)
 
-    # 1b. SIMPLIFICAÇÃO DA GEOMETRIA — crítico para Amazônia
     if area_km2_hint > 1_500_000:
         poly = poly.simplify(maxError=10000)
     elif area_km2_hint > 500_000:
@@ -529,45 +520,33 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hint=
     elif area_km2_hint > 10_000:
         poly = poly.simplify(maxError=1000)
 
-    # 2. JANELA TEMPORAL EXPANDIDA (Garante que sempre ache imagens limpas)
-    data_ref = datetime(ano, mes, 1)
-    data_ini_pre = data_ref - timedelta(days=90)  # 3 meses antes
+    data_ref    = datetime(ano, mes, 1)
+    data_ini_pre = data_ref - timedelta(days=90)
     data_fim_pre = data_ref
-    
     data_ini_pos = data_ref
-    data_fim_pos = data_ref + timedelta(days=60)  # 2 meses depois
+    data_fim_pos = data_ref + timedelta(days=60)
 
     def get_nbr(img):
         return img.normalizedDifference(['B8', 'B12']).rename('nbr')
 
-    # 3. BUSCA DO SENTINEL (Sem filtro estrito de nuvens para não esvaziar a coleção)
     s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterBounds(poly)
-    
     col_pre = s2.filterDate(data_ini_pre.strftime('%Y-%m-%d'), data_fim_pre.strftime('%Y-%m-%d'))
     col_pos = s2.filterDate(data_ini_pos.strftime('%Y-%m-%d'), data_fim_pos.strftime('%Y-%m-%d'))
 
-    # 4. TRAVA DE SEGURANÇA SILENCIOSA
-    # Removidas as chamadas .size().getInfo() — eram bloqueantes e lentas em regiões grandes.
-    # Se não houver imagens, o .median() retornará uma imagem vazia e o try/except externo captura.
     try:
         pre_fire  = col_pre.median()
         post_fire = col_pos.median()
     except Exception:
         return poly, ee.Image().constant(0).updateMask(0)
-    
-    # Cálculo bruto do dNBR
+
     dnbr = get_nbr(pre_fire).subtract(get_nbr(post_fire)).multiply(1000).clip(poly)
-    
-    # Aplica a máscara do MODIS (Filtro de Fogo)
     if _mascara_modis is not None:
         dnbr = dnbr.updateMask(_mascara_modis.gt(0))
-        
-    # RETORNA O DNBR ORIGINAL!
-    # Isso fará as cores do mapa combinarem perfeitamente com as do gráfico
     return poly, dnbr
 
+
 # =============================================================
-# --- INTERFACE (BARRA LATERAL) ---
+# INTERFACE — BARRA LATERAL
 # =============================================================
 
 st.sidebar.title("⚙️ Filtros da Análise")
@@ -577,7 +556,6 @@ tipo_analise = st.sidebar.radio(
     ['Por Estado', 'Por Bioma', 'Por Município'],
     index=2
 )
-
 estado_dd = st.sidebar.selectbox(
     'Selecione o Estado:',
     ["AC","AL","AM","AP","BA","CE","DF","ES","GO","MA","MG","MS","MT",
@@ -616,8 +594,7 @@ if "INPE" in fonte_escolhida:
 
     satelites_lista = ['AQUA_M-T', 'NPP-375', 'NPP-375D', 'TERRA_M-T', 'NOAA-20', 'MSG-03']
     satelites_sel = st.sidebar.multiselect(
-        "Satélites de Referência:",
-        satelites_lista,
+        "Satélites de Referência:", satelites_lista,
         default=['AQUA_M-T', 'NPP-375', 'NPP-375D']
     )
 else:
@@ -635,15 +612,19 @@ area_protegida = st.sidebar.selectbox(
     ["Nenhuma", "Terras Indígenas", "Unidades de Conservação"]
 )
 
-# ==========================================
 st.sidebar.markdown("---")
-modo_debug = False
 
+# P8 FIX: modo_debug agora exibe informações reais de diagnóstico na UI
+modo_debug = False
 if "qa" in st.query_params and st.query_params["qa"].lower() == "true":
     modo_debug = st.sidebar.toggle("🐛 Modo de Validação (QA)", value=True)
 
 if st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True):
     st.session_state.gerar_dashboard = True
+    # Limpa caches de sessão ao gerar novo dashboard com filtros potencialmente diferentes
+    st.session_state.modis_temporal = {}
+    st.session_state.modis_top_mun = {}
+    # Não limpa anomalia_cache — é caro de recalcular e os dados mudam pouco
 
 # --- SEÇÃO DE CONTATO ---
 st.sidebar.markdown("---")
@@ -676,7 +657,7 @@ st.sidebar.markdown(html_contato_novo, unsafe_allow_html=True)
 
 
 # =============================================================
-# --- TELA PRINCIPAL ---
+# TELA PRINCIPAL
 # =============================================================
 
 st.title("🔥 Dashboard de Queimadas 🔥")
@@ -699,9 +680,13 @@ if st.session_state.gerar_dashboard:
         ee_geom_complex = ee.Geometry(geom_unida.__geo_interface__)
         geom_json_str = json.dumps(geom_unida.__geo_interface__, sort_keys=True)
 
-        # Área calculada localmente via GeoPandas/Shapely — sem chamada GEE bloqueante
-        _limite_proj = limite.to_crs("EPSG:6933")  # projeção equal-area
+        # Área local via EPSG:5880 (SIRGAS 2000 / Policônica — projeção IBGE para Brasil)
+        _limite_proj = limite.to_crs("EPSG:5880")
         area_km2_local = float(_limite_proj.geometry.union_all().area / 1e6)
+
+        # P8: informações de diagnóstico (modo QA)
+        if modo_debug:
+            st.info(f"[QA] Área local calculada: {area_km2_local:,.1f} km² | Proj: EPSG:5880 | Geom vertices: {len(geom_unida.coords) if hasattr(geom_unida, 'coords') else 'N/A'}")
 
         df_ranking_areas = pd.DataFrame()
         areas_afetadas = gpd.GeoDataFrame()
@@ -709,7 +694,7 @@ if st.session_state.gerar_dashboard:
         area_queimada_img = None
         df_top_mun_modis = pd.DataFrame()
         df_modis_temporal = pd.DataFrame()
-        ee_geom_afetadas = ee_geom_complex  # fallback
+        ee_geom_afetadas = ee_geom_complex
 
         # -------------------------------------------------------
         # FONTE: INPE
@@ -726,7 +711,14 @@ if st.session_state.gerar_dashboard:
                 st.error("⚠️ Você precisa selecionar pelo menos um satélite.")
                 st.stop()
 
-            st.write("📡 Consultando satélites do INPE...")
+            periodo_dias = (hoje - dt_ini).days
+            st.write(f"📡 Consultando satélites do INPE ({periodo_dias} dias, blocos paralelos)...")
+
+            if modo_debug:
+                passo_debug = "diário" if periodo_dias <= 7 else "semanal" if periodo_dias <= 90 else "quinzenal"
+                n_blocos = periodo_dias // (1 if periodo_dias <= 7 else 7 if periodo_dias <= 90 else 15) + 1
+                st.info(f"[QA] Granularidade: {passo_debug} | ~{n_blocos} blocos | 6 workers paralelos")
+
             df = buscar_focos_inpe(
                 tipo_analise, estado_dd, bioma_dd, municipio_dd,
                 dt_ini.strftime("%Y-%m-%d"), hoje.strftime("%Y-%m-%d"), satelites_sel
@@ -734,8 +726,7 @@ if st.session_state.gerar_dashboard:
 
             if not df.empty:
                 gdf = gpd.GeoDataFrame(
-                    df,
-                    geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
+                    df, geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
                     crs="EPSG:4326"
                 )
                 gdf = gpd.sjoin(gdf, limite, predicate="within")
@@ -746,21 +737,16 @@ if st.session_state.gerar_dashboard:
                     st.write(f"🌳 Isolando focos em {area_protegida}...")
                     gdf_areas = carregar_areas_protegidas(area_protegida)
                     gdf_areas = gdf_areas.to_crs(gdf.crs)
-
                     if 'index_right' in gdf.columns:
                         gdf = gdf.drop(columns=['index_right'])
-
                     gdf_focos_risco = gpd.sjoin(gdf, gdf_areas, predicate='within')
-
                     if not gdf_focos_risco.empty:
                         areas_afetadas = gdf_areas[
                             gdf_areas['nome_area'].isin(gdf_focos_risco['nome_area'])
                         ]
                         focos_em_areas = pd.DataFrame(gdf_focos_risco.drop(columns="geometry"))
                         df_ranking_areas = (
-                            focos_em_areas['nome_area']
-                            .value_counts()
-                            .reset_index()
+                            focos_em_areas['nome_area'].value_counts().reset_index()
                         )
                         df_ranking_areas.columns = ['Área Protegida', 'Valor']
                         df_rec = focos_em_areas
@@ -775,7 +761,6 @@ if st.session_state.gerar_dashboard:
         else:
             st.write("☁️ Analisando satélite MODIS no GEE...")
             try:
-                # Usa funcao cacheada -- segunda consulta ao mesmo periodo e instantanea
                 area_queimada_img, total_valor = buscar_total_modis(
                     geom_json_str, ano_modis, mes_modis
                 )
@@ -811,10 +796,8 @@ if st.session_state.gerar_dashboard:
                                 collection=fc_areas, reducer=ee.Reducer.sum(), scale=500
                             ).getInfo()
                             recs = [
-                                {
-                                    'Área Protegida': f['properties']['nome_area'],
-                                    'Valor': round(f['properties'].get('sum', 0), 2)
-                                }
+                                {'Área Protegida': f['properties']['nome_area'],
+                                 'Valor': round(f['properties'].get('sum', 0), 2)}
                                 for f in stats['features']
                                 if f['properties'].get('sum', 0) > 0
                             ]
@@ -832,14 +815,8 @@ if st.session_state.gerar_dashboard:
                                     areas_afetadas.geometry.union_all().__geo_interface__
                                 )
                                 area_queimada_img = area_queimada_img.clip(ee_geom_afetadas)
-                                img_area_km2 = (
-                                    ee.Image.pixelArea().divide(1000000)
-                                    .updateMask(area_queimada_img.gt(0))
-                                )
                             else:
                                 total_valor = 0
-
-                    # ranking de municipios e serie temporal: calculados dentro das abas
 
             except Exception as e:
                 st.warning(f"⚠️ Erro ao processar MODIS: {e}")
@@ -847,14 +824,11 @@ if st.session_state.gerar_dashboard:
         status.update(label="✅ Análise concluída!", state="complete", expanded=False)
 
     # =============================================================
-    # --- RENDERIZAÇÃO ---
+    # RENDERIZAÇÃO
     # =============================================================
 
     if dados_indisponiveis:
-        mes_nome = {
-            1:'Jan',2:'Fev',3:'Mar',4:'Abr',5:'Mai',6:'Jun',
-            7:'Jul',8:'Ago',9:'Set',10:'Out',11:'Nov',12:'Dez'
-        }[mes_modis]
+        mes_nome = MESES_MAP[mes_modis]
         st.warning(
             f"⏳ **Aviso de Processamento NASA:** Os dados do satélite MODIS para "
             f"**{mes_nome} de {ano_modis}** ainda não foram publicados. "
@@ -917,32 +891,26 @@ if st.session_state.gerar_dashboard:
                     color_continuous_scale=px.colors.sequential.Reds,
                     title=titulo_dinamico
                 )
-                nome_eixo_x = (
-                    "Nº de Focos" if "INPE" in fonte_escolhida else "Área Afetada (km²)"
-                )
+                nome_eixo_x = "Nº de Focos" if "INPE" in fonte_escolhida else "Área Afetada (km²)"
                 fig_areas.update_layout(
-                    template='plotly_dark',
-                    xaxis_title=nome_eixo_x,
+                    template='plotly_dark', xaxis_title=nome_eixo_x,
                     yaxis={'categoryorder': 'total ascending'},
-                    height=350, margin=dict(t=40, b=20),
-                    coloraxis_showscale=False
+                    height=350, margin=dict(t=40, b=20), coloraxis_showscale=False
                 )
                 st.plotly_chart(fig_areas, use_container_width=True)
             with col_alerta2:
                 st.markdown("**Lista Completa de Áreas Afetadas**")
-                st.dataframe(
-                    df_ranking_areas, hide_index=True,
-                    height=350, use_container_width=True
-                )
+                st.dataframe(df_ranking_areas, hide_index=True, height=350, use_container_width=True)
 
         st.markdown("---")
 
-        # Inicialização de variáveis NBR
+        # P1 FIX: variáveis NBR inicializadas; o resultado do botão fica em session_state
+        # e é reutilizado em todo rerun sem reconstruir a pipeline GEE.
         stats_sev = {}
         dnbr_img = None
 
         # =============================================================
-        # --- ABAS PRINCIPAIS ---
+        # ABAS PRINCIPAIS
         # =============================================================
         aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_export = st.tabs([
             "🗺️ Mapa de Focos",
@@ -972,9 +940,7 @@ if st.session_state.gerar_dashboard:
                     )
 
             if focar_area != "Visão Geral" and not areas_afetadas.empty:
-                area_especifica = areas_afetadas[
-                    areas_afetadas['nome_area'] == focar_area
-                ]
+                area_especifica = areas_afetadas[areas_afetadas['nome_area'] == focar_area]
                 centro = area_especifica.geometry.union_all().centroid
                 bounds = area_especifica.geometry.total_bounds
                 zoom_inicio = 11
@@ -991,60 +957,44 @@ if st.session_state.gerar_dashboard:
                 },
                 "🛰️ Satélite (Google)": {
                     "url": "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
-                    "attr": "Google",
-                    "ref_url": None,
+                    "attr": "Google", "ref_url": None,
                 },
                 "🗺️ Mapa Padrão": {
                     "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-                    "attr": "OpenStreetMap",
-                    "ref_url": None,
+                    "attr": "OpenStreetMap", "ref_url": None,
                 },
             }
             cfg = tiles_config[estilo_mapa]
             m = folium.Map(
-                location=[centro.y, centro.x],
-                zoom_start=zoom_inicio,
-                tiles=cfg["url"],
-                attr=cfg["attr"],
-                zoom_control=True,
-                prefer_canvas=True,
+                location=[centro.y, centro.x], zoom_start=zoom_inicio,
+                tiles=cfg["url"], attr=cfg["attr"],
+                zoom_control=True, prefer_canvas=True,
             )
             if cfg["ref_url"]:
                 folium.TileLayer(
-                    tiles=cfg["ref_url"], attr="Esri Ref",
-                    overlay=True, control=False
+                    tiles=cfg["ref_url"], attr="Esri Ref", overlay=True, control=False
                 ).add_to(m)
 
             if focar_area != "Visão Geral":
                 m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
 
-            # Borda da região selecionada
             folium.GeoJson(
-                limite.__geo_interface__,
-                name="Região selecionada",
+                limite.__geo_interface__, name="Região selecionada",
                 style_function=lambda x: {
-                    'fillColor': '#00d4ff',
-                    'fillOpacity': 0.04,
-                    'color': '#00d4ff',
-                    'weight': 2.5,
-                    'dashArray': '6 3',
+                    'fillColor': '#00d4ff', 'fillOpacity': 0.04,
+                    'color': '#00d4ff', 'weight': 2.5, 'dashArray': '6 3',
                 },
             ).add_to(m)
 
-            # Áreas protegidas afetadas
             if not areas_afetadas.empty:
                 folium.GeoJson(
-                    areas_afetadas.__geo_interface__,
-                    name="Áreas protegidas afetadas",
+                    areas_afetadas.__geo_interface__, name="Áreas protegidas afetadas",
                     style_function=lambda x: {
-                        'fillColor': '#e74c3c',
-                        'fillOpacity': 0.18,
-                        'color': '#c0392b',
-                        'weight': 1.5,
+                        'fillColor': '#e74c3c', 'fillOpacity': 0.18,
+                        'color': '#c0392b', 'weight': 1.5,
                     },
                     tooltip=folium.GeoJsonTooltip(
-                        fields=['nome_area'],
-                        aliases=['📍 Área Protegida:'],
+                        fields=['nome_area'], aliases=['📍 Área Protegida:'],
                         style=(
                             "font-size:12px; background:white; color:#2c3e50; "
                             "border-radius:6px; box-shadow:2px 2px 6px rgba(0,0,0,0.25);"
@@ -1052,20 +1002,14 @@ if st.session_state.gerar_dashboard:
                     ),
                 ).add_to(m)
 
-            # Dados de queimada / focos
             if "INPE" in fonte_escolhida and not df_rec.empty:
                 HeatMap(
                     df_rec[["latitude", "longitude"]].dropna().values.tolist(),
-                    name="Densidade de focos",
-                    radius=8,
-                    blur=12,
-                    max_zoom=14,
+                    name="Densidade de focos", radius=8, blur=12, max_zoom=14,
                     min_opacity=0.35,
-                    gradient={0.2: '#ffffb2', 0.45: '#fecc5c',
-                               0.65: '#fd8d3c', 0.85: '#f03b20', 1.0: '#bd0026'},
+                    gradient={0.2: '#ffffb2', 0.45: '#fecc5c', 0.65: '#fd8d3c',
+                               0.85: '#f03b20', 1.0: '#bd0026'},
                 ).add_to(m)
-
-                # Legenda INPE
                 legenda_inpe = """
                 <div style="position:fixed; bottom:28px; left:12px; z-index:9999;
                             background:rgba(15,15,15,0.82); padding:10px 14px;
@@ -1090,8 +1034,6 @@ if st.session_state.gerar_dashboard:
                     area_queimada_img.updateMask(area_queimada_img.gt(0)),
                     vis_params_quente, 'Área Queimada (MODIS)', opacity=0.85
                 )
-
-                # Legenda MODIS
                 legenda_modis = """
                 <div style="position:fixed; bottom:28px; left:12px; z-index:9999;
                             background:rgba(15,15,15,0.82); padding:10px 14px;
@@ -1108,14 +1050,11 @@ if st.session_state.gerar_dashboard:
 
             folium.LayerControl(collapsed=False).add_to(m)
 
-            # Key dinâmico: muda junto com os dados, forçando re-render automático
-            # sem precisar trocar o estilo do mapa manualmente
             if "INPE" in fonte_escolhida:
                 _periodo = f"{dt_ini.strftime('%Y%m%d')}_{hoje.strftime('%Y%m%d')}_{'_'.join(sorted(satelites_sel))}"
             else:
                 _periodo = f"{ano_modis}_{mes_modis}"
             _map_key = f"mapa_{val_sel}_{_periodo}_{area_protegida}_{estilo_mapa}_{focar_area}"
-
             st_folium(m, width=None, height=700, returned_objects=[], key=_map_key)
 
         # ----------------------------------------------------------
@@ -1128,15 +1067,13 @@ if st.session_state.gerar_dashboard:
                 df_rec[data_col] = pd.to_datetime(df_rec[data_col])
                 freq = 'D' if (hoje - dt_ini).days <= 90 else 'MS'
                 df_g = (
-                    df_rec.set_index(data_col)
-                    .resample(freq).size()
+                    df_rec.set_index(data_col).resample(freq).size()
                     .reset_index(name='focos')
                 )
                 fig_line = px.line(df_g, x=data_col, y='focos', markers=True, height=350)
                 fig_line.update_traces(line_color='#e64a19', line_width=3)
                 fig_line.update_layout(
-                    template='plotly_dark',
-                    xaxis_title="Tempo", yaxis_title="Nº de Focos",
+                    template='plotly_dark', xaxis_title="Tempo", yaxis_title="Nº de Focos",
                     margin=dict(t=20, b=20)
                 )
                 st.plotly_chart(fig_line, use_container_width=True)
@@ -1153,16 +1090,18 @@ if st.session_state.gerar_dashboard:
                         color_continuous_scale=px.colors.sequential.Reds
                     )
                     fig_bar.update_layout(
-                        template='plotly_dark',
-                        yaxis={'categoryorder': 'total ascending'},
-                        height=320, margin=dict(t=20, b=20),
-                        coloraxis_showscale=False
+                        template='plotly_dark', yaxis={'categoryorder': 'total ascending'},
+                        height=320, margin=dict(t=20, b=20), coloraxis_showscale=False
                     )
                     st.plotly_chart(fig_bar, use_container_width=True)
 
             else:
-                # --- Calcula serie temporal e ranking de municipios aqui (sob demanda) ---
-                if df_modis_temporal.empty and total_valor > 0:
+                # P5 FIX: chaves de cache de sessão para evitar recálculo por troca de aba
+                _key_temporal = (val_sel, ano_modis)
+                _key_mun      = (val_sel, ano_modis, mes_modis)
+
+                # Série temporal — calcula uma vez, salva no session_state
+                if _key_temporal not in st.session_state.modis_temporal and total_valor > 0:
                     with st.spinner("📊 Calculando evolução mensal..."):
                         try:
                             geom_temporal = (
@@ -1180,29 +1119,38 @@ if st.session_state.gerar_dashboard:
                                 )
                                 val = (ee.Image.pixelArea().divide(1000000)
                                     .updateMask(img_mes.gt(0))
-                                    .reduceRegion(reducer=ee.Reducer.sum(),
-                                        geometry=geom_temporal, scale=1000,
-                                        maxPixels=1e13, tileScale=4, bestEffort=True
+                                    .reduceRegion(
+                                        reducer=ee.Reducer.sum(), geometry=geom_temporal,
+                                        scale=1000, maxPixels=1e13, tileScale=4, bestEffort=True
                                     ).get('area'))
                                 return ee.Feature(None, {'mes': m_num, 'area': val})
-                            fc_meses = ee.FeatureCollection(ee.List.sequence(1,12).map(calc_mes)).getInfo()
-                            meses_map_label = {1:'Jan',2:'Fev',3:'Mar',4:'Abr',5:'Mai',6:'Jun',
-                                               7:'Jul',8:'Ago',9:'Set',10:'Out',11:'Nov',12:'Dez'}
-                            df_modis_temporal = pd.DataFrame([
+
+                            fc_meses = ee.FeatureCollection(
+                                ee.List.sequence(1, 12).map(calc_mes)
+                            ).getInfo()
+                            df_tmp = pd.DataFrame([
                                 {'Mês': f['properties']['mes'],
                                  'Área (km²)': round(f['properties'].get('area') or 0, 2)}
                                 for f in fc_meses['features']
                             ])
-                            df_modis_temporal['Mês Nome'] = df_modis_temporal['Mês'].map(meses_map_label)
+                            df_tmp['Mês Nome'] = df_tmp['Mês'].map(MESES_MAP)
+                            st.session_state.modis_temporal[_key_temporal] = df_tmp
                         except Exception as _e_temp:
                             st.warning(f"⚠️ Não foi possível calcular a série temporal: {_e_temp}")
+                            st.session_state.modis_temporal[_key_temporal] = pd.DataFrame()
 
-                if df_top_mun_modis.empty and tipo_analise != "Por Município" and total_valor > 0:
+                df_modis_temporal = st.session_state.modis_temporal.get(_key_temporal, pd.DataFrame())
+
+                # Ranking municípios — calcula uma vez, salva no session_state
+                if (_key_mun not in st.session_state.modis_top_mun
+                        and tipo_analise != "Por Município" and total_valor > 0):
                     with st.spinner("🏙️ Calculando ranking de municípios..."):
                         try:
                             muns_ee = ee.FeatureCollection("FAO/GAUL/2015/level2").filterBounds(ee_geom_complex)
-                            img_area_km2_mun = (ee.Image.pixelArea().divide(1000000)
-                                .updateMask(area_queimada_img.gt(0)))
+                            img_area_km2_mun = (
+                                ee.Image.pixelArea().divide(1000000)
+                                .updateMask(area_queimada_img.gt(0))
+                            )
                             stats_mun = img_area_km2_mun.reduceRegions(
                                 collection=muns_ee, reducer=ee.Reducer.sum(), scale=1000
                             ).getInfo()
@@ -1212,11 +1160,16 @@ if st.session_state.gerar_dashboard:
                                 for f in stats_mun['features']
                                 if f['properties'].get('sum', 0) > 0
                             ]
-                            if recs_mun:
-                                df_top_mun_modis = (pd.DataFrame(recs_mun)
-                                    .sort_values(by='Valor', ascending=False).head(5))
+                            df_mun_tmp = (
+                                pd.DataFrame(recs_mun).sort_values(by='Valor', ascending=False).head(5)
+                                if recs_mun else pd.DataFrame()
+                            )
+                            st.session_state.modis_top_mun[_key_mun] = df_mun_tmp
                         except Exception as _e_mun:
                             st.warning(f"⚠️ Não foi possível calcular ranking de municípios: {_e_mun}")
+                            st.session_state.modis_top_mun[_key_mun] = pd.DataFrame()
+
+                df_top_mun_modis = st.session_state.modis_top_mun.get(_key_mun, pd.DataFrame())
 
                 # Série temporal MODIS
                 if not df_modis_temporal.empty:
@@ -1227,9 +1180,8 @@ if st.session_state.gerar_dashboard:
                     )
                     fig_line.update_traces(line_color='#e64a19', line_width=3)
                     fig_line.update_layout(
-                        template='plotly_dark',
-                        xaxis_title="Mês", yaxis_title="Área Afetada (km²)",
-                        margin=dict(t=20, b=20)
+                        template='plotly_dark', xaxis_title="Mês",
+                        yaxis_title="Área Afetada (km²)", margin=dict(t=20, b=20)
                     )
                     st.plotly_chart(fig_line, use_container_width=True)
 
@@ -1241,11 +1193,9 @@ if st.session_state.gerar_dashboard:
                         color_continuous_scale=px.colors.sequential.Reds
                     )
                     fig_bar.update_layout(
-                        template='plotly_dark',
-                        xaxis_title="Área Afetada (km²)",
+                        template='plotly_dark', xaxis_title="Área Afetada (km²)",
                         yaxis={'categoryorder': 'total ascending'},
-                        height=350, margin=dict(t=20, b=20),
-                        coloraxis_showscale=False
+                        height=350, margin=dict(t=20, b=20), coloraxis_showscale=False
                     )
                     st.plotly_chart(fig_bar, use_container_width=True)
 
@@ -1255,37 +1205,39 @@ if st.session_state.gerar_dashboard:
                     st.subheader(f"📊 {ano_modis} foi um ano normal para queimadas?")
                     st.caption(
                         f"Comparamos cada mês de **{ano_modis}** com a média histórica "
-                        f"do mesmo mês entre **2001 e {ano_modis - 1}**. "
-                        "Assim você vê rapidamente se o ano foi mais ou menos crítico que o habitual."
+                        f"do mesmo mês entre **2001 e {ano_modis - 1}**."
                     )
 
-                    with st.spinner("Calculando comparação histórica..."):
-                        df_anomalia = calcular_anomalia_modis(geom_json_str, ano_modis)
+                    # P2 FIX: anomalia calculada uma vez por (geom_hash, ano)
+                    # e armazenada no session_state — Export reutiliza sem recalcular
+                    _anom_key = (geom_json_str[:64], ano_modis)  # hash leve da geometria
+                    if _anom_key not in st.session_state.anomalia_cache:
+                        with st.spinner("Calculando comparação histórica..."):
+                            df_anom = calcular_anomalia_modis(geom_json_str, ano_modis)
+                            st.session_state.anomalia_cache[_anom_key] = df_anom
+                    else:
+                        df_anom = st.session_state.anomalia_cache[_anom_key]
+
+                    df_anomalia = df_anom  # alias para o bloco de renderização
 
                     if not df_anomalia.empty:
                         col_ano = f'Área {ano_modis} (km²)'
-
-                        # --- Resumo geral em linguagem simples ---
-                        meses_acima = df_anomalia[df_anomalia['Anomalia (%)'] > 20]
+                        meses_acima  = df_anomalia[df_anomalia['Anomalia (%)'] > 20]
                         meses_abaixo = df_anomalia[df_anomalia['Anomalia (%)'] < -20]
-                        mes_pior = df_anomalia.loc[df_anomalia['Anomalia (%)'].idxmax()]
-                        mes_melhor = df_anomalia.loc[df_anomalia['Anomalia (%)'].idxmin()]
+                        mes_pior    = df_anomalia.loc[df_anomalia['Anomalia (%)'].idxmax()]
+                        mes_melhor  = df_anomalia.loc[df_anomalia['Anomalia (%)'].idxmin()]
 
-                        # Card de veredicto geral
                         if len(meses_acima) >= 6:
-                            veredicto_cor = "#c0392b"
-                            veredicto_icon = "🔴"
-                            veredicto_texto = f"{ano_modis} foi um ano <b>acima do normal</b> em queimadas"
+                            veredicto_cor = "#c0392b"; veredicto_icon = "🔴"
+                            veredicto_texto  = f"{ano_modis} foi um ano <b>acima do normal</b> em queimadas"
                             veredicto_detalhe = f"{len(meses_acima)} de 12 meses ficaram acima da média histórica."
                         elif len(meses_abaixo) >= 6:
-                            veredicto_cor = "#27ae60"
-                            veredicto_icon = "🟢"
-                            veredicto_texto = f"{ano_modis} foi um ano <b>abaixo do normal</b> em queimadas"
+                            veredicto_cor = "#27ae60"; veredicto_icon = "🟢"
+                            veredicto_texto  = f"{ano_modis} foi um ano <b>abaixo do normal</b> em queimadas"
                             veredicto_detalhe = f"{len(meses_abaixo)} de 12 meses ficaram abaixo da média histórica."
                         else:
-                            veredicto_cor = "#e67e22"
-                            veredicto_icon = "🟡"
-                            veredicto_texto = f"{ano_modis} foi um ano <b>dentro do padrão histórico</b>"
+                            veredicto_cor = "#e67e22"; veredicto_icon = "🟡"
+                            veredicto_texto  = f"{ano_modis} foi um ano <b>dentro do padrão histórico</b>"
                             veredicto_detalhe = "Os meses se distribuíram equilibradamente acima e abaixo da média."
 
                         st.markdown(f"""
@@ -1297,7 +1249,6 @@ if st.session_state.gerar_dashboard:
                         </div>
                         """, unsafe_allow_html=True)
 
-                        # Cards de destaques (mês mais crítico e mais tranquilo)
                         col_dest1, col_dest2 = st.columns(2)
                         with col_dest1:
                             pct = mes_pior['Anomalia (%)']
@@ -1307,12 +1258,8 @@ if st.session_state.gerar_dashboard:
                                         border-radius:8px; padding:12px 16px; text-align:center;">
                                 <div style="font-size:12px; color:#e74c3c; text-transform:uppercase;
                                             letter-spacing:1px; margin-bottom:4px;">📛 Mês mais crítico</div>
-                                <div style="font-size:28px; font-weight:700; color:#e74c3c;">
-                                    {mes_pior['Mês Nome']}
-                                </div>
-                                <div style="font-size:20px; font-weight:600; color:#e74c3c;">
-                                    {sinal}{pct:.0f}% vs. média
-                                </div>
+                                <div style="font-size:28px; font-weight:700; color:#e74c3c;">{mes_pior['Mês Nome']}</div>
+                                <div style="font-size:20px; font-weight:600; color:#e74c3c;">{sinal}{pct:.0f}% vs. média</div>
                                 <div style="font-size:12px; color:#aaa; margin-top:4px;">
                                     {mes_pior[col_ano]:,.1f} km² queimados<br>
                                     Média histórica: {mes_pior['Média Histórica (km²)']:,.1f} km²
@@ -1327,12 +1274,8 @@ if st.session_state.gerar_dashboard:
                                         border-radius:8px; padding:12px 16px; text-align:center;">
                                 <div style="font-size:12px; color:#2ecc71; text-transform:uppercase;
                                             letter-spacing:1px; margin-bottom:4px;">✅ Mês mais tranquilo</div>
-                                <div style="font-size:28px; font-weight:700; color:#2ecc71;">
-                                    {mes_melhor['Mês Nome']}
-                                </div>
-                                <div style="font-size:20px; font-weight:600; color:#2ecc71;">
-                                    {sinal2}{pct2:.0f}% vs. média
-                                </div>
+                                <div style="font-size:28px; font-weight:700; color:#2ecc71;">{mes_melhor['Mês Nome']}</div>
+                                <div style="font-size:20px; font-weight:600; color:#2ecc71;">{sinal2}{pct2:.0f}% vs. média</div>
                                 <div style="font-size:12px; color:#aaa; margin-top:4px;">
                                     {mes_melhor[col_ano]:,.1f} km² queimados<br>
                                     Média histórica: {mes_melhor['Média Histórica (km²)']:,.1f} km²
@@ -1342,7 +1285,6 @@ if st.session_state.gerar_dashboard:
 
                         st.markdown("<div style='margin-top:20px;'></div>", unsafe_allow_html=True)
 
-                        # --- Gráfico de barras de anomalia (mais intuitivo que linhas) ---
                         cores_barras = [
                             '#c0392b' if v > 50 else
                             '#e67e22' if v > 20 else
@@ -1350,56 +1292,32 @@ if st.session_state.gerar_dashboard:
                             '#636e72'
                             for v in df_anomalia['Anomalia (%)']
                         ]
-
                         fig_anom = go.Figure()
                         fig_anom.add_bar(
-                            x=df_anomalia['Mês Nome'],
-                            y=df_anomalia['Anomalia (%)'],
+                            x=df_anomalia['Mês Nome'], y=df_anomalia['Anomalia (%)'],
                             marker_color=cores_barras,
-                            text=[
-                                f"+{v:.0f}%" if v > 0 else f"{v:.0f}%"
-                                for v in df_anomalia['Anomalia (%)']
-                            ],
+                            text=[f"+{v:.0f}%" if v > 0 else f"{v:.0f}%" for v in df_anomalia['Anomalia (%)']],
                             textposition='outside',
-                            hovertemplate=(
-                                "<b>%{x}</b><br>"
-                                "Desvio da média: %{y:.1f}%<br>"
-                                "<extra></extra>"
-                            ),
+                            hovertemplate="<b>%{x}</b><br>Desvio da média: %{y:.1f}%<br><extra></extra>",
                         )
-                        fig_anom.add_hline(
-                            y=0, line_color='rgba(255,255,255,0.4)',
-                            line_width=1.5, line_dash='dot'
-                        )
+                        fig_anom.add_hline(y=0, line_color='rgba(255,255,255,0.4)', line_width=1.5, line_dash='dot')
                         fig_anom.add_hrect(
-                            y0=-20, y1=20,
-                            fillcolor='rgba(255,255,255,0.03)',
-                            line_width=0,
-                            annotation_text="Faixa normal (±20%)",
-                            annotation_position="top right",
-                            annotation_font_size=11,
-                            annotation_font_color='rgba(255,255,255,0.4)',
+                            y0=-20, y1=20, fillcolor='rgba(255,255,255,0.03)', line_width=0,
+                            annotation_text="Faixa normal (±20%)", annotation_position="top right",
+                            annotation_font_size=11, annotation_font_color='rgba(255,255,255,0.4)',
                         )
                         fig_anom.update_layout(
                             template='plotly_dark',
-                            title=dict(
-                                text=f"Desvio de {ano_modis} em relação à média histórica (%) — por mês",
-                                font_size=14
-                            ),
-                            xaxis_title="",
-                            yaxis_title="Desvio da média histórica (%)",
-                            height=380,
-                            margin=dict(t=50, b=20),
-                            showlegend=False,
+                            title=dict(text=f"Desvio de {ano_modis} em relação à média histórica (%) — por mês", font_size=14),
+                            xaxis_title="", yaxis_title="Desvio da média histórica (%)",
+                            height=380, margin=dict(t=50, b=20), showlegend=False,
                             yaxis=dict(zeroline=False),
                         )
                         st.plotly_chart(fig_anom, use_container_width=True)
 
-                        # Legenda de cores simples
                         st.markdown("""
-                        <div style="display:flex; gap:16px; font-size:12px;
-                                    color:#aaa; margin-top:-8px; margin-bottom:8px;
-                                    flex-wrap:wrap;">
+                        <div style="display:flex; gap:16px; font-size:12px; color:#aaa;
+                                    margin-top:-8px; margin-bottom:8px; flex-wrap:wrap;">
                             <span><span style="color:#c0392b;">■</span> Muito acima (+50%)</span>
                             <span><span style="color:#e67e22;">■</span> Acima (+20% a +50%)</span>
                             <span><span style="color:#636e72;">■</span> Dentro do normal (±20%)</span>
@@ -1408,10 +1326,7 @@ if st.session_state.gerar_dashboard:
                         """, unsafe_allow_html=True)
 
                 elif ano_modis == 2001:
-                    st.info(
-                        "💡 A comparação histórica requer pelo menos 2 anos de dados. "
-                        "Selecione um ano a partir de 2002."
-                    )
+                    st.info("💡 A comparação histórica requer pelo menos 2 anos de dados. Selecione um ano a partir de 2002.")
 
         # ----------------------------------------------------------
         # ABA 3 — NBR SENTINEL-2
@@ -1419,21 +1334,18 @@ if st.session_state.gerar_dashboard:
         with aba_nbr:
             if "INPE" in fonte_escolhida:
                 st.info(
-                    "💡 A análise de severidade NBR usa imagens Sentinel-2 e avalia "
-                    "a cicatriz da queimada pixel a pixel. "
+                    "💡 A análise de severidade NBR usa imagens Sentinel-2. "
                     "Para ativá-la, selecione **🗺️ Área Queimada (NASA MODIS)** "
                     "na barra lateral e escolha o mês do evento."
                 )
             else:
                 st.subheader("🔬 Análise de Severidade da Queimada — dNBR (Sentinel-2)")
                 st.markdown(
-                    "O índice **dNBR** (delta Normalized Burn Ratio) compara a reflectância "
-                    "da vegetação **antes e depois** do fogo usando infravermelho próximo (B8) "
-                    "e SWIR (B12). Valores altos indicam maior destruição da cobertura vegetal. "
-                    "Classificação seguindo o padrão **USGS**."
+                    "O índice **dNBR** compara a reflectância da vegetação **antes e depois** do fogo "
+                    "usando infravermelho próximo (B8) e SWIR (B12). Classificação padrão **USGS**."
                 )
 
-                with st.expander("📖 Como funciona o dNBR? Clique para entender as classes de severidade", expanded=False):
+                with st.expander("📖 Como funciona o dNBR?", expanded=False):
                     st.markdown("""
                     <style>
                     .dnbr-ruler { display:flex; width:100%; height:38px; border-radius:6px; overflow:hidden; margin-bottom:4px; }
@@ -1446,45 +1358,7 @@ if st.session_state.gerar_dashboard:
                     .dnbr-name { font-size:13px; font-weight:700; margin:0 0 2px; }
                     .dnbr-range { font-size:11px; color:#999; margin:0 0 4px; font-family:monospace; }
                     .dnbr-desc { font-size:12px; color:#bbb; margin:0; line-height:1.4; }
-                    .dnbr-flow { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
-                    .dnbr-box { border-radius:8px; padding:10px 14px; font-size:12px; line-height:1.6; flex:1; min-width:140px; }
-                    .dnbr-arrow { font-size:20px; color:#888; flex-shrink:0; }
-                    .dnbr-formula { background:rgba(255,255,255,0.05); border-radius:8px; padding:10px 14px;
-                                    font-size:12px; color:#ccc; line-height:1.9; margin-bottom:0; }
-                    .dnbr-formula code { background:rgba(255,255,255,0.1); border-radius:4px; padding:1px 6px; font-family:monospace; }
                     </style>
-
-                    <p style="font-size:13px; color:#aaa; margin-bottom:10px;">
-                        O <b style="color:#eee;">dNBR</b> compara imagens Sentinel-2 antes e depois do fogo usando as bandas
-                        B8 (infravermelho próximo) e B12 (SWIR). Vegetação sã reflete muito em B8 e pouco em B12 —
-                        o inverso ocorre em área queimada.
-                    </p>
-
-                    <div class="dnbr-flow">
-                        <div class="dnbr-box" style="background:rgba(22,101,85,0.35); border:1px solid rgba(22,160,133,0.3);">
-                            <b style="color:#1abc9c;">Imagem pré-fogo</b><br>
-                            Sentinel-2 · 60–90 dias antes<br>
-                            <span style="color:#888; font-size:11px;">NBR_pré = (B8−B12)÷(B8+B12)</span><br>
-                            <span style="color:#999; font-size:11px;">valor típico: +0.4 a +0.8</span>
-                        </div>
-                        <div class="dnbr-arrow">⟶</div>
-                        <div class="dnbr-box" style="background:rgba(120,60,20,0.35); border:1px solid rgba(180,80,20,0.3);">
-                            <b style="color:#e67e22;">Imagem pós-fogo</b><br>
-                            Sentinel-2 · mês do evento<br>
-                            <span style="color:#888; font-size:11px;">NBR_pós = (B8−B12)÷(B8+B12)</span><br>
-                            <span style="color:#999; font-size:11px;">valor típico: −0.1 a +0.2</span>
-                        </div>
-                        <div class="dnbr-arrow">⟶</div>
-                        <div class="dnbr-box" style="background:rgba(150,100,0,0.35); border:1px solid rgba(200,150,0,0.3); text-align:center;">
-                            <b style="color:#f1c40f; font-size:14px;">dNBR × 1000</b><br>
-                            <span style="color:#ddd; font-size:12px;">NBR_pré − NBR_pós</span><br>
-                            <span style="color:#aaa; font-size:11px;">= severidade da queima</span>
-                        </div>
-                    </div>
-
-                    <div style="margin:16px 0 8px; font-size:12px; color:#aaa; font-weight:600; text-transform:uppercase; letter-spacing:0.5px;">
-                        Régua de severidade (padrão USGS)
-                    </div>
                     <div class="dnbr-ruler">
                         <div style="width:13%; background:#1a9850;">Reg.</div>
                         <div style="width:22%; background:#91cf60; color:#2d5010;">Não afetado</div>
@@ -1497,157 +1371,101 @@ if st.session_state.gerar_dashboard:
                         <span>≪ 0</span><span>−100</span><span>+100</span>
                         <span>+270</span><span>+440</span><span>+660</span><span>≫ 1000</span>
                     </div>
-
                     <div class="dnbr-cards">
-                        <div class="dnbr-card">
-                            <div class="dnbr-stripe" style="background:#1a9850;"></div>
-                            <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#1a9850;">🌱 Regeneração</p>
-                                <p class="dnbr-range">dNBR &lt; −100</p>
-                                <p class="dnbr-desc">Vegetação cresceu após incêndio anterior (broto)</p>
-                            </div>
-                        </div>
-                        <div class="dnbr-card">
-                            <div class="dnbr-stripe" style="background:#91cf60;"></div>
-                            <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#6a9e30;">🌿 Não afetado</p>
-                                <p class="dnbr-range">−100 a +100</p>
-                                <p class="dnbr-desc">Vegetação intacta ou variação sazonal normal</p>
-                            </div>
-                        </div>
-                        <div class="dnbr-card">
-                            <div class="dnbr-stripe" style="background:#fee08b;"></div>
-                            <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#c9a000;">🟡 Baixa severidade</p>
-                                <p class="dnbr-range">+100 a +270</p>
-                                <p class="dnbr-desc">Queima superficial; dossel parcialmente afetado</p>
-                            </div>
-                        </div>
-                        <div class="dnbr-card">
-                            <div class="dnbr-stripe" style="background:#fc8d59;"></div>
-                            <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#e05010;">🟠 Moderada</p>
-                                <p class="dnbr-range">+270 a +440</p>
-                                <p class="dnbr-desc">Danos significativos; dossel destruído em parte</p>
-                            </div>
-                        </div>
-                        <div class="dnbr-card">
-                            <div class="dnbr-stripe" style="background:#d73027;"></div>
-                            <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#d73027;">🔴 Moderada-Alta</p>
-                                <p class="dnbr-range">+440 a +660</p>
-                                <p class="dnbr-desc">Destruição extensa do dossel; solo exposto</p>
-                            </div>
-                        </div>
-                        <div class="dnbr-card">
-                            <div class="dnbr-stripe" style="background:#8c0505;"></div>
-                            <div class="dnbr-body">
-                                <p class="dnbr-name" style="color:#c0392b;">⬛ Alta severidade</p>
-                                <p class="dnbr-range">dNBR &gt; +660</p>
-                                <p class="dnbr-desc">Destruição total; solo nu, cinzas, carvão</p>
-                            </div>
-                        </div>
+                        <div class="dnbr-card"><div class="dnbr-stripe" style="background:#1a9850;"></div><div class="dnbr-body"><p class="dnbr-name" style="color:#1a9850;">🌱 Regeneração</p><p class="dnbr-range">dNBR &lt; −100</p><p class="dnbr-desc">Vegetação cresceu após incêndio anterior</p></div></div>
+                        <div class="dnbr-card"><div class="dnbr-stripe" style="background:#91cf60;"></div><div class="dnbr-body"><p class="dnbr-name" style="color:#6a9e30;">🌿 Não afetado</p><p class="dnbr-range">−100 a +100</p><p class="dnbr-desc">Vegetação intacta ou variação sazonal normal</p></div></div>
+                        <div class="dnbr-card"><div class="dnbr-stripe" style="background:#fee08b;"></div><div class="dnbr-body"><p class="dnbr-name" style="color:#c9a000;">🟡 Baixa severidade</p><p class="dnbr-range">+100 a +270</p><p class="dnbr-desc">Queima superficial; dossel parcialmente afetado</p></div></div>
+                        <div class="dnbr-card"><div class="dnbr-stripe" style="background:#fc8d59;"></div><div class="dnbr-body"><p class="dnbr-name" style="color:#e05010;">🟠 Moderada</p><p class="dnbr-range">+270 a +440</p><p class="dnbr-desc">Danos significativos; dossel destruído em parte</p></div></div>
+                        <div class="dnbr-card"><div class="dnbr-stripe" style="background:#d73027;"></div><div class="dnbr-body"><p class="dnbr-name" style="color:#d73027;">🔴 Moderada-Alta</p><p class="dnbr-range">+440 a +660</p><p class="dnbr-desc">Destruição extensa; solo exposto</p></div></div>
+                        <div class="dnbr-card"><div class="dnbr-stripe" style="background:#8c0505;"></div><div class="dnbr-body"><p class="dnbr-name" style="color:#c0392b;">⬛ Alta severidade</p><p class="dnbr-range">dNBR &gt; +660</p><p class="dnbr-desc">Destruição total; solo nu, cinzas, carvão</p></div></div>
                     </div>
                     """, unsafe_allow_html=True)
 
-                # --- CHAVE DE CACHE PARA O BOTÃO ---
+                # P1 FIX: chave de cache de sessão para resultado NBR completo
                 _nbr_cache_key = f"nbr_resultado_{val_sel}_{ano_modis}_{mes_modis}"
                 if _nbr_cache_key not in st.session_state:
                     st.session_state[_nbr_cache_key] = None
 
-                # --- BOTÃO SOB DEMANDA ---
                 if st.session_state[_nbr_cache_key] is None:
                     if area_km2_local > 500_000:
                         st.warning(
-                            f"⚠️ A área selecionada é muito grande (~{area_km2_local:,.0f} km²). "
-                            "O cálculo NBR pode levar **3–8 minutos** ou falhar por limite do Google Earth Engine. "
-                            "Para melhores resultados, prefira análises **Por Município** ou estados menores."
+                            f"⚠️ Área muito grande (~{area_km2_local:,.0f} km²). "
+                            "O cálculo NBR pode levar 3–8 minutos. "
+                            "Prefira análises **Por Município** para melhores resultados."
                         )
-                    st.info(
-                        "⚡ A análise de severidade usa imagens Sentinel-2 e pode levar "
-                        "**1–3 minutos** dependendo do tamanho da área. "
-                        "Clique quando estiver pronto."
-                    )
+                    st.info("⚡ Análise Sentinel-2 leva 1–3 minutos. Clique quando estiver pronto.")
                     if st.button(
-                        "🛰️ Calcular Severidade NBR (Sentinel-2)",
-                        type="primary",
+                        "🛰️ Calcular Severidade NBR (Sentinel-2)", type="primary",
                         use_container_width=True,
                         key=f"btn_nbr_{val_sel}_{ano_modis}_{mes_modis}"
                     ):
-                        with st.spinner("🛰️ Buscando imagens Sentinel-2 e calculando dNBR… aguarde."):
+                        with st.spinner("🛰️ Buscando imagens Sentinel-2 e calculando dNBR…"):
                             try:
-                                # Constrói o dNBR UMA VEZ e reutiliza para stats + mapa
-                                # evitando duas pipelines separadas no GEE
-                                poly_nbr, dnbr_img = _construir_dnbr(
+                                poly_nbr, dnbr_img_calc = _construir_dnbr(
                                     geom_json_str, ano_modis, mes_modis,
-                                    area_queimada_img,
-                                    area_km2_hint=area_km2_local
+                                    area_queimada_img, area_km2_hint=area_km2_local
                                 )
-                                # Calcula as estatísticas a partir do dNBR já construído
-                                stats_sev = calcular_stats_nbr(
+                                stats_sev_calc = calcular_stats_nbr(
                                     geom_json_str, ano_modis, mes_modis,
-                                    area_queimada_img,
-                                    area_km2_hint=area_km2_local
+                                    area_queimada_img, area_km2_hint=area_km2_local
                                 )
+                                # P1 FIX: salva getMapId (não o objeto GEE) no session_state
+                                # getMapId é serializável e evita reconstruir a pipeline GEE
+                                vis_dnbr = {
+                                    'min': -100, 'max': 1000,
+                                    'palette': ['#1a9850','#91cf60','#d9ef8b','#ffffbf',
+                                                '#fee08b','#fc8d59','#d73027','#7a0403']
+                                }
+                                map_id_dict = ee.Image(dnbr_img_calc).getMapId(vis_dnbr)
+                                tile_url = map_id_dict['tile_fetcher'].url_format
+
                                 st.session_state[_nbr_cache_key] = {
-                                    "stats_sev": stats_sev,
-                                    "dnbr_img": dnbr_img,
+                                    "stats_sev": stats_sev_calc,
+                                    "tile_url": tile_url,   # URL pronta — não precisa do objeto GEE
                                     "ok": True
                                 }
-                                st.success("✅ Severidade calculada com sucesso! Role a tela para ver os resultados.")
+                                st.success("✅ Severidade calculada! Role para ver os resultados.")
                                 st.rerun()
                             except ValueError as ve:
                                 st.warning(f"⚠️ {ve}")
                             except Exception as e:
-                                st.error(
-                                    f"⚠️ Erro ao processar Sentinel-2: {e}\n\n"
-                                    "Tente uma região menor ou um mês diferente."
-                                )
+                                st.error(f"⚠️ Erro ao processar Sentinel-2: {e}\nTente região menor ou mês diferente.")
 
-                # --- RECUPERA RESULTADO DO CACHE DE SESSÃO ---
+                # Recupera do session_state
                 nbr_ok = False
                 stats_sev = {}
-                dnbr_img = None
+                nbr_tile_url = None
                 if st.session_state[_nbr_cache_key] and st.session_state[_nbr_cache_key].get("ok"):
-                    stats_sev = st.session_state[_nbr_cache_key]["stats_sev"]
-                    dnbr_img  = st.session_state[_nbr_cache_key]["dnbr_img"]
+                    stats_sev    = st.session_state[_nbr_cache_key]["stats_sev"]
+                    nbr_tile_url = st.session_state[_nbr_cache_key]["tile_url"]
                     nbr_ok = True
 
                 col_nbr1, col_nbr2 = st.columns([1.4, 1])
 
                 with col_nbr1:
-
-                    if nbr_ok and dnbr_img is not None:
+                    if nbr_ok and nbr_tile_url:
                         try:
                             centro_nbr = limite.geometry.unary_union.centroid
                             m_nbr = folium.Map(
-                                location=[centro_nbr.y, centro_nbr.x],
-                                zoom_start=8,
+                                location=[centro_nbr.y, centro_nbr.x], zoom_start=8,
                                 tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
                                 attr='Google'
                             )
-                            
                             folium.GeoJson(
                                 limite.__geo_interface__,
                                 style_function=lambda x: {
-                                    'fillColor': 'transparent',
-                                    'color': '#00d4ff', 'weight': 2
+                                    'fillColor': 'transparent', 'color': '#00d4ff', 'weight': 2
                                 }
                             ).add_to(m_nbr)
-                            
-                            vis_dnbr = {
-                                'min': -100, 'max': 1000,
-                                'palette': [
-                                    '#1a9850', '#91cf60', '#d9ef8b', '#ffffbf',
-                                    '#fee08b', '#fc8d59', '#d73027', '#7a0403'
-                                ]
-                            }
-                            
-                            m_nbr.add_ee_layer(
-                                dnbr_img, vis_dnbr,
-                                'dNBR (severidade contínua)', opacity=0.85
-                            )
-                            
+
+                            # P1 FIX: usa tile_url pré-computada em vez de reprocessar no GEE
+                            folium.raster_layers.TileLayer(
+                                tiles=nbr_tile_url,
+                                attr='Google Earth Engine',
+                                name='dNBR (severidade contínua)',
+                                overlay=True, control=True, opacity=0.85
+                            ).add_to(m_nbr)
+
                             legenda_html = """
                             <div style="position:fixed; bottom:28px; right:10px; z-index:9999;
                                         background:rgba(20,20,20,0.88); padding:12px 16px;
@@ -1662,9 +1480,8 @@ if st.session_state.gerar_dashboard:
                                 <span style="color:#7a0403;">■</span> Alta (&gt; 0.66)
                             </div>"""
                             m_nbr.get_root().html.add_child(folium.Element(legenda_html))
-                            
                             folium.LayerControl().add_to(m_nbr)
-                            
+
                             _nbr_key = f"nbr_{val_sel}_{ano_modis}_{mes_modis}"
                             st_folium(m_nbr, width=None, height=620, returned_objects=[], key=_nbr_key)
 
@@ -1676,43 +1493,32 @@ if st.session_state.gerar_dashboard:
                             ):
                                 st.session_state[_nbr_cache_key] = None
                                 st.rerun()
-                            
+
                         except Exception as erro_mapa:
-                            st.error(f"⚠️ Os dados foram calculados, mas ocorreu um erro ao desenhar o mapa Folium: {erro_mapa}")
+                            st.error(f"⚠️ Erro ao desenhar o mapa Folium: {erro_mapa}")
 
                 with col_nbr2:
-                    if stats_sev:       
+                    if stats_sev:
                         st.markdown("---")
                         st.markdown("**Distribuição de Severidade NBR (Sentinel-2):**")
                         df_sev_exp = pd.DataFrame(
                             list(stats_sev.items()), columns=['Classe', 'Área (km²)']
                         )
-
                         cores_sev = {
-                            'Regeneração':   '#1a9850',
-                            'Não afetado':   '#91cf60',
-                            'Baixa':         '#fee08b',
-                            'Moderada':      '#fc8d59',
-                            'Moderada-Alta': '#d73027',
-                            'Alta':          '#7a0403'
+                            'Regeneração': '#1a9850', 'Não afetado': '#91cf60',
+                            'Baixa': '#fee08b', 'Moderada': '#fc8d59',
+                            'Moderada-Alta': '#d73027', 'Alta': '#7a0403'
                         }
-
-                        # Gráfico de pizza
                         fig_pizza = px.pie(
                             df_sev_exp, values='Área (km²)', names='Classe',
                             color='Classe', color_discrete_map=cores_sev, hole=0.45
                         )
-                        fig_pizza.update_layout(
-                            template='plotly_dark',
-                            height=280, margin=dict(t=10, b=10)
-                        )
+                        fig_pizza.update_layout(template='plotly_dark', height=280, margin=dict(t=10, b=10))
                         st.plotly_chart(fig_pizza, use_container_width=True)
 
-                        # Gráfico de barras
                         fig_bar_sev = px.bar(
                             df_sev_exp, x='Área (km²)', y='Classe', orientation='h',
-                            color='Classe', color_discrete_map=cores_sev,
-                            text='Área (km²)'
+                            color='Classe', color_discrete_map=cores_sev, text='Área (km²)'
                         )
                         fig_bar_sev.update_layout(
                             template='plotly_dark', showlegend=False,
@@ -1721,16 +1527,11 @@ if st.session_state.gerar_dashboard:
                         )
                         st.plotly_chart(fig_bar_sev, use_container_width=True)
 
-                        # Métricas de destaque
-                        area_alta = (
-                            stats_sev.get('Alta', 0)
-                            + stats_sev.get('Moderada-Alta', 0)
-                        )
+                        area_alta = stats_sev.get('Alta', 0) + stats_sev.get('Moderada-Alta', 0)
                         area_total_afetada = sum(
                             v for k, v in stats_sev.items()
                             if k not in ['Não afetado', 'Regeneração']
                         )
-
                         col_m1, col_m2 = st.columns(2)
                         with col_m1:
                             st.metric("🔴 Alta Severidade", f"{area_alta:.2f} km²")
@@ -1745,50 +1546,18 @@ if st.session_state.gerar_dashboard:
                             "- **Alta:** destruição quase total da cobertura vegetal"
                         )
 
-
-
-        # ----------------------------------------------------------
         # ----------------------------------------------------------
         # ABA 4 — IMPACTO ECONÔMICO
         # ----------------------------------------------------------
         with aba_impacto:
           try:
-            # --- TABELAS DE REFERÊNCIA ---
-            VALORES_ECOSSIS = {
-                "Amazônia":      {"conservador": 2000,  "moderado": 4000,  "otimista": 6000},
-                "Cerrado":       {"conservador": 800,   "moderado": 1650,  "otimista": 2500},
-                "Mata Atlântica":{"conservador": 3000,  "moderado": 5500,  "otimista": 8000},
-                "Pantanal":      {"conservador": 1500,  "moderado": 2750,  "otimista": 4000},
-                "Caatinga":      {"conservador": 400,   "moderado": 800,   "otimista": 1200},
-                "Pampa":         {"conservador": 600,   "moderado": 1050,  "otimista": 1500},
-            }
-            EMISSOES_CO2_HA = {
-                "Amazônia": 150, "Cerrado": 60, "Mata Atlântica": 120,
-                "Pantanal": 80, "Caatinga": 30, "Pampa": 25,
-            }
-            PRECO_CARBONO_USD = 15
             CAMBIO_FIXO = buscar_cotacao_dolar()
 
-            # --- DETECTAR BIOMA ---
-            ESTADO_BIOMA = {
-                "AM": "Amazônia", "PA": "Amazônia", "AC": "Amazônia",
-                "RO": "Amazônia", "RR": "Amazônia", "AP": "Amazônia",
-                "MT": "Cerrado",  "GO": "Cerrado",  "TO": "Cerrado",
-                "MA": "Cerrado",  "PI": "Caatinga", "BA": "Caatinga",
-                "CE": "Caatinga", "RN": "Caatinga", "PB": "Caatinga",
-                "PE": "Caatinga", "AL": "Caatinga", "SE": "Caatinga",
-                "MS": "Pantanal", "PR": "Mata Atlântica",
-                "SC": "Mata Atlântica", "RS": "Pampa",
-                "SP": "Mata Atlântica", "RJ": "Mata Atlântica",
-                "ES": "Mata Atlântica", "MG": "Mata Atlântica",
-                "DF": "Cerrado",
-            }
             bioma_detectado = (
                 bioma_dd if tipo_analise == "Por Bioma"
                 else ESTADO_BIOMA.get(estado_dd, "Cerrado")
             )
 
-            # --- ÁREA QUEIMADA ---
             area_km2_calc = 0.0
             if "MODIS" in fonte_escolhida and total_valor > 0:
                 area_km2_calc = float(total_valor)
@@ -1808,19 +1577,14 @@ if st.session_state.gerar_dashboard:
             )
 
             if area_km2_calc == 0:
-                st.warning(
-                    "⚠️ Nenhuma área queimada detectada para o período selecionado. "
-                    "Selecione outro mês ou ano."
-                )
+                st.warning("⚠️ Nenhuma área queimada detectada para o período selecionado.")
             else:
-                # Leitura dos parâmetros do session_state (definidos no expander abaixo)
                 bioma_calc = st.session_state.get("bioma_impacto",
                     bioma_detectado if bioma_detectado in VALORES_ECOSSIS
                     else list(VALORES_ECOSSIS.keys())[0])
                 cenario    = st.session_state.get("cenario_impacto", "moderado")
                 cambio_usd = st.session_state.get("cambio_impacto", CAMBIO_FIXO)
 
-                # --- CÁLCULOS ---
                 valor_usd_ha        = VALORES_ECOSSIS[bioma_calc][cenario]
                 valor_brl_ha        = valor_usd_ha * cambio_usd
                 fator_co2_ha        = EMISSOES_CO2_HA.get(bioma_calc, 60)
@@ -1829,7 +1593,6 @@ if st.session_state.gerar_dashboard:
                 credito_carbono_brl = co2_emitido_t * PRECO_CARBONO_USD * cambio_usd
                 total_impacto_brl   = perda_ecossis_brl + credito_carbono_brl
 
-                # --- CARD PRINCIPAL ---
                 st.markdown(f"""
                 <div style="background: linear-gradient(135deg, #c0392b22, #e74c3c11);
                             border-left: 6px solid #e74c3c; border-radius: 10px;
@@ -1847,29 +1610,18 @@ if st.session_state.gerar_dashboard:
                 </div>
                 """, unsafe_allow_html=True)
 
-                # --- 3 CARDS SECUNDÁRIOS ---
                 m1, m2, m3 = st.columns(3)
                 with m1:
-                    st.metric("🌍 Área Queimada",
-                              f"{area_km2_calc:,.1f} km²",
-                              f"{area_ha:,.0f} hectares")
+                    st.metric("🌍 Área Queimada", f"{area_km2_calc:,.1f} km²", f"{area_ha:,.0f} hectares")
                 with m2:
-                    st.metric("🌳 Perda de Serviços Ambientais",
-                              f"R$ {perda_ecossis_brl/1e9:,.2f} bi",
+                    st.metric("🌳 Perda de Serviços Ambientais", f"R$ {perda_ecossis_brl/1e9:,.2f} bi",
                               f"R$ {valor_brl_ha:,.0f}/ha · {bioma_calc}")
                 with m3:
-                    st.metric("☁️ Carbono Emitido",
-                              f"{co2_emitido_t/1e6:,.2f} Mt CO₂e",
+                    st.metric("☁️ Carbono Emitido", f"{co2_emitido_t/1e6:,.2f} Mt CO₂e",
                               f"≈ R$ {credito_carbono_brl/1e9:,.2f} bi em créditos perdidos")
 
                 st.markdown("---")
-
-                # --- GRÁFICO: COMPARAÇÃO DOS 3 CENÁRIOS ---
                 st.markdown("### Como o valor muda conforme o cenário?")
-                st.caption(
-                    "Cada cenário reflete um intervalo da literatura científica — "
-                    "do mais conservador (menor impacto estimado) ao otimista (maior)."
-                )
                 dados_cen = []
                 for cen_k in ["conservador", "moderado", "otimista"]:
                     v_brl_ha_cen = VALORES_ECOSSIS[bioma_calc][cen_k] * cambio_usd
@@ -1877,8 +1629,7 @@ if st.session_state.gerar_dashboard:
                     co2_cen      = area_ha * fator_co2_ha * PRECO_CARBONO_USD * cambio_usd
                     total_cen    = perda_cen + co2_cen
                     dados_cen.append({
-                        "Cenário": {"conservador": "Conservador", "moderado": "Moderado",
-                                  "otimista": "Otimista"}[cen_k],
+                        "Cenário": {"conservador": "Conservador", "moderado": "Moderado", "otimista": "Otimista"}[cen_k],
                         "Serviços Ambientais (R$ bi)": round(perda_cen / 1e9, 2),
                         "Créditos de Carbono (R$ bi)":  round(co2_cen / 1e9, 2),
                         "Total (R$ bi)":                   round(total_cen / 1e9, 2),
@@ -1886,18 +1637,14 @@ if st.session_state.gerar_dashboard:
                 df_cen = pd.DataFrame(dados_cen)
                 fig_cen = go.Figure()
                 fig_cen.add_bar(
-                    name="Serviços Ambientais",
-                    x=df_cen["Cenário"],
-                    y=df_cen["Serviços Ambientais (R$ bi)"],
-                    marker_color="#e74c3c",
+                    name="Serviços Ambientais", x=df_cen["Cenário"],
+                    y=df_cen["Serviços Ambientais (R$ bi)"], marker_color="#e74c3c",
                     text=df_cen["Serviços Ambientais (R$ bi)"].apply(lambda v: f"R$ {v:.2f} bi"),
                     textposition="inside",
                 )
                 fig_cen.add_bar(
-                    name="Créditos de Carbono",
-                    x=df_cen["Cenário"],
-                    y=df_cen["Créditos de Carbono (R$ bi)"],
-                    marker_color="#f39c12",
+                    name="Créditos de Carbono", x=df_cen["Cenário"],
+                    y=df_cen["Créditos de Carbono (R$ bi)"], marker_color="#f39c12",
                     text=df_cen["Créditos de Carbono (R$ bi)"].apply(lambda v: f"R$ {v:.2f} bi"),
                     textposition="inside",
                 )
@@ -1914,81 +1661,57 @@ if st.session_state.gerar_dashboard:
                 )
 
                 st.markdown("---")
-
-                # --- CONTEXTO EXPLICATIVO ---
                 st.markdown("### O que significa esse prejuízo?")
                 col_ctx1, col_ctx2 = st.columns(2)
                 with col_ctx1:
                     st.markdown(f"""
-**Serviços ambientais** são os benefícios que a floresta entrega à sociedade sem custo:
-regulação das chuvas, filtragem da água, controle da temperatura e manutenção
-do solo e da biodiversidade. Quando uma área queima, esses benefícios deixam
-de existir por anos.
-
-Para o **{bioma_calc}**, cada hectare vale em média **R$ {valor_brl_ha:,.0f}**
-no cenário {cenario} — valor que a sociedade perde enquanto a vegetação não se recupera.
+**Serviços ambientais** são os benefícios que a floresta entrega à sociedade sem custo.
+Para o **{bioma_calc}**, cada hectare vale em média **R$ {valor_brl_ha:,.0f}** no cenário {cenario}.
                     """)
                 with col_ctx2:
                     st.markdown(f"""
-**Carbono emitido:** as queimadas lançaram aproximadamente
-**{co2_emitido_t/1e6:,.2f} milhões de toneladas de CO₂** na atmosfera.
-
-No mercado voluntário de carbono, cada tonelada vale em torno de
-**R$ {PRECO_CARBONO_USD * cambio_usd:,.0f}** — o equivalente a
-**R$ {credito_carbono_brl/1e9:,.2f} bilhões** em créditos que não poderão mais
-ser gerados por essa floresta perdida.
+**Carbono emitido:** aproximadamente **{co2_emitido_t/1e6:,.2f} milhões de toneladas de CO₂**.
+No mercado voluntário (~R$ {PRECO_CARBONO_USD * cambio_usd:,.0f}/t), equivale a
+**R$ {credito_carbono_brl/1e9:,.2f} bilhões** em créditos perdidos.
                     """)
 
-                st.info(
-                    "Estimativa indicativa com base em literatura científica. "
-                    "Não substitui laudo técnico para fins legais ou regulatórios."
-                )
+                st.info("Estimativa indicativa com base em literatura científica. Não substitui laudo técnico.")
 
                 with st.expander("⚙️ Ajustar parâmetros do cálculo"):
                     pc1, pc2, pc3 = st.columns(3)
                     with pc1:
-                        st.selectbox(
-                            "Bioma:", list(VALORES_ECOSSIS.keys()),
+                        st.selectbox("Bioma:", list(VALORES_ECOSSIS.keys()),
                             index=list(VALORES_ECOSSIS.keys()).index(bioma_calc),
-                            key="bioma_impacto"
-                        )
+                            key="bioma_impacto")
                     with pc2:
-                        st.selectbox(
-                            "Cenário:",
-                            ["conservador", "moderado", "otimista"],
+                        st.selectbox("Cenário:", ["conservador", "moderado", "otimista"],
                             index=["conservador","moderado","otimista"].index(cenario),
                             format_func=lambda x: {"conservador": "Conservador (mínimo)",
                                                    "moderado": "Moderado (referência)",
                                                    "otimista": "Otimista (máximo)"}[x],
-                            key="cenario_impacto"
-                        )
+                            key="cenario_impacto")
                     with pc3:
                         st.number_input(
-                            f"Câmbio R$/US$ (PTAX hoje: R$ {CAMBIO_FIXO:.2f}):",
+                            f"Câmbio R$/US$ (PTAX: R$ {CAMBIO_FIXO:.2f}):",
                             min_value=1.0, max_value=20.0,
-                            value=float(cambio_usd), step=0.10, key="cambio_impacto"
-                        )
-                    st.caption(
-                        "Altere os parâmetros e clique em **Gerar Dashboard** novamente para recalcular."
-                    )
+                            value=float(cambio_usd), step=0.10, key="cambio_impacto")
+                    st.caption("Altere os parâmetros e clique em **Gerar Dashboard** para recalcular.")
 
                 with st.expander("📚 Fontes e referências"):
                     st.markdown("""
 | Fonte | O que fornece | Site |
 |---|---|---|
-| Costanza et al. (2014) — *Global Policy* | Valor de serviços ecossistêmicos por bioma | [acessar](https://www.sciencedirect.com/science/article/pii/S0959378014000685) |
-| IPAM — Inst. de Pesquisa Ambiental da Amazônia | Custo de restauração e carbono na Amazônia | [ipam.org.br](https://ipam.org.br) |
-| TNC Brasil — The Nature Conservancy | Custo-benefício de conservação por bioma | [tnc.org.br](https://www.tnc.org.br) |
-| SEEG / Observatório do Clima | Fator de emissão de CO₂ por bioma (tCO₂e/ha) | [seeg.eco.br](https://seeg.eco.br) |
-| Ecosystem Marketplace (2023) | Preço médio de carbono no mercado voluntário | [ecosystemmarketplace.com](https://www.ecosystemmarketplace.com) |
-| CEPEA/USP | Custo de oportunidade agrícola e perdas em cadeias produtivas | [cepea.esalq.usp.br](https://www.cepea.esalq.usp.br) |
+| Costanza et al. (2014) | Valor de serviços ecossistêmicos por bioma | [acessar](https://www.sciencedirect.com/science/article/pii/S0959378014000685) |
+| IPAM | Custo de restauração e carbono na Amazônia | [ipam.org.br](https://ipam.org.br) |
+| TNC Brasil | Custo-benefício de conservação por bioma | [tnc.org.br](https://www.tnc.org.br) |
+| SEEG / Obs. do Clima | Fator de emissão de CO₂ por bioma (tCO₂e/ha) | [seeg.eco.br](https://seeg.eco.br) |
+| Ecosystem Marketplace (2023) | Preço médio de carbono voluntário | [ecosystemmarketplace.com](https://www.ecosystemmarketplace.com) |
+| CEPEA/USP | Perdas em cadeias produtivas | [cepea.esalq.usp.br](https://www.cepea.esalq.usp.br) |
                     """)
 
           except Exception as _err_impacto:
             st.error(f"⚠️ Erro na aba de Impacto Econômico: {_err_impacto}")
-            import traceback
             st.code(traceback.format_exc(), language="python")
-
 
         # ----------------------------------------------------------
         # ABA 5 — EXPORTAR DADOS
@@ -1998,24 +1721,18 @@ ser gerados por essa floresta perdida.
 
             if "INPE" in fonte_escolhida:
                 if not df_rec.empty:
-                    st.markdown(
-                        f"**{len(df_rec)} registros** disponíveis para exportação."
-                    )
+                    st.markdown(f"**{len(df_rec)} registros** disponíveis para exportação.")
                     col_dl1, col_dl2 = st.columns(2)
                     with col_dl1:
                         csv = df_rec.to_csv(index=False).encode('utf-8-sig')
                         st.download_button(
-                            label="📄 Baixar CSV — Focos INPE",
-                            data=csv,
+                            label="📄 Baixar CSV — Focos INPE", data=csv,
                             file_name=f"focos_{val_sel}_{hoje.strftime('%Y%m%d')}.csv",
-                            mime="text/csv",
-                            use_container_width=True
+                            mime="text/csv", use_container_width=True
                         )
                     with col_dl2:
-                        excel_data = gerar_excel(df_rec)
                         st.download_button(
-                            label="📊 Baixar Excel — Focos INPE",
-                            data=excel_data,
+                            label="📊 Baixar Excel — Focos INPE", data=gerar_excel(df_rec),
                             file_name=f"focos_{val_sel}_{hoje.strftime('%Y%m%d')}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True
@@ -2028,112 +1745,88 @@ ser gerados por essa floresta perdida.
                     st.markdown("**Ranking de Áreas Protegidas:**")
                     col_dl3, col_dl4 = st.columns(2)
                     with col_dl3:
-                        csv_areas = df_ranking_areas.to_csv(index=False).encode('utf-8-sig')
                         st.download_button(
                             label="📄 Baixar CSV — Áreas Protegidas",
-                            data=csv_areas,
+                            data=df_ranking_areas.to_csv(index=False).encode('utf-8-sig'),
                             file_name=f"areas_protegidas_{val_sel}_{hoje.strftime('%Y%m%d')}.csv",
-                            mime="text/csv",
-                            use_container_width=True
+                            mime="text/csv", use_container_width=True
                         )
                     with col_dl4:
-                        excel_areas = gerar_excel(df_ranking_areas)
                         st.download_button(
                             label="📊 Baixar Excel — Áreas Protegidas",
-                            data=excel_areas,
+                            data=gerar_excel(df_ranking_areas),
                             file_name=f"areas_protegidas_{val_sel}_{hoje.strftime('%Y%m%d')}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True
                         )
 
             else:
-                # MODIS — Série temporal
-                if not df_modis_temporal.empty:
+                # P2 FIX: reutiliza df_modis_temporal e anomalia do session_state
+                # sem recalcular — Export é apenas leitura dos dados já produzidos.
+                _key_temporal = (val_sel, ano_modis)
+                _anom_key     = (geom_json_str[:64], ano_modis)
+                df_modis_temporal_exp = st.session_state.modis_temporal.get(_key_temporal, pd.DataFrame())
+                df_anomalia_exp       = st.session_state.anomalia_cache.get(_anom_key, pd.DataFrame())
+
+                if not df_modis_temporal_exp.empty:
                     st.markdown("**Série Temporal Mensal (MODIS):**")
                     col_dl1, col_dl2 = st.columns(2)
                     with col_dl1:
-                        csv_mod = df_modis_temporal.to_csv(
-                            index=False
-                        ).encode('utf-8-sig')
                         st.download_button(
                             label="📄 Baixar CSV — Série Temporal",
-                            data=csv_mod,
+                            data=df_modis_temporal_exp.to_csv(index=False).encode('utf-8-sig'),
                             file_name=f"modis_temporal_{val_sel}_{ano_modis}.csv",
-                            mime="text/csv",
-                            use_container_width=True
+                            mime="text/csv", use_container_width=True
                         )
                     with col_dl2:
-                        excel_mod = gerar_excel(df_modis_temporal)
                         st.download_button(
                             label="📊 Baixar Excel — Série Temporal",
-                            data=excel_mod,
+                            data=gerar_excel(df_modis_temporal_exp),
                             file_name=f"modis_temporal_{val_sel}_{ano_modis}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True
                         )
 
-                # MODIS — Áreas protegidas
                 if not df_ranking_areas.empty:
                     st.markdown("---")
                     st.markdown("**Ranking de Áreas Protegidas (MODIS):**")
                     col_dl3, col_dl4 = st.columns(2)
                     with col_dl3:
-                        csv_areas = df_ranking_areas.to_csv(
-                            index=False
-                        ).encode('utf-8-sig')
                         st.download_button(
                             label="📄 Baixar CSV — Áreas Protegidas",
-                            data=csv_areas,
+                            data=df_ranking_areas.to_csv(index=False).encode('utf-8-sig'),
                             file_name=f"areas_afetadas_{val_sel}_{ano_modis}.csv",
-                            mime="text/csv",
-                            use_container_width=True
+                            mime="text/csv", use_container_width=True
                         )
                     with col_dl4:
-                        excel_areas = gerar_excel(df_ranking_areas)
                         st.download_button(
                             label="📊 Baixar Excel — Áreas Protegidas",
-                            data=excel_areas,
+                            data=gerar_excel(df_ranking_areas),
                             file_name=f"areas_afetadas_{val_sel}_{ano_modis}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True
                         )
 
-                # MODIS — Anomalia histórica (se calculada)
-                if not df_modis_temporal.empty and ano_modis > 2001:
-                    try:
-                        df_anomalia_exp = calcular_anomalia_modis(
-                            geom_json_str, ano_modis
-                        )
-                        if not df_anomalia_exp.empty:
-                            st.markdown("---")
-                            st.markdown("**Dados de Anomalia Histórica:**")
-                            csv_anom = df_anomalia_exp.to_csv(
-                                index=False
-                            ).encode('utf-8-sig')
-                            st.download_button(
-                                label="📄 Baixar CSV — Anomalia Histórica",
-                                data=csv_anom,
-                                file_name=f"anomalia_{val_sel}_{ano_modis}.csv",
-                                mime="text/csv",
-                                use_container_width=True
-                            )
-                    except:
-                        pass
+                # P2 FIX: usa anomalia já calculada do session_state (zero chamadas GEE aqui)
+                if not df_anomalia_exp.empty:
+                    st.markdown("---")
+                    st.markdown("**Dados de Anomalia Histórica:**")
+                    st.download_button(
+                        label="📄 Baixar CSV — Anomalia Histórica",
+                        data=df_anomalia_exp.to_csv(index=False).encode('utf-8-sig'),
+                        file_name=f"anomalia_{val_sel}_{ano_modis}.csv",
+                        mime="text/csv", use_container_width=True
+                    )
 
-                # NBR Severidade
-                if stats_sev:  # <-- DEIXE ASSIM, SIMPLES
+                if stats_sev:
                     st.markdown("---")
                     st.markdown("**Distribuição de Severidade NBR (Sentinel-2):**")
-                    df_sev_exp = pd.DataFrame(
-                        list(stats_sev.items()), columns=['Classe', 'Área (km²)']
-                    )
-                    csv_sev = df_sev_exp.to_csv(index=False).encode('utf-8-sig')
+                    df_sev_exp = pd.DataFrame(list(stats_sev.items()), columns=['Classe', 'Área (km²)'])
                     st.download_button(
                         label="📄 Baixar CSV — Severidade NBR",
-                        data=csv_sev,
+                        data=df_sev_exp.to_csv(index=False).encode('utf-8-sig'),
                         file_name=f"nbr_{val_sel}_{ano_modis}_{mes_modis:02d}.csv",
-                        mime="text/csv",
-                        use_container_width=True
+                        mime="text/csv", use_container_width=True
                     )
 
 else:
