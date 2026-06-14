@@ -287,34 +287,32 @@ def carregar_areas_protegidas(tipo_area):
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satelites):
+def _fazer_request_inpe(url, params, headers):
     """
-    P3 FIX: substituída a iteração diária por blocos semanais + paralelismo.
-    Para 2 anos: 104 requests (semanal) vs 730 (diário).
-    Para períodos ≤ 7 dias mantém granularidade diária.
+    Sessão isolada por chamada — thread-safe.
+    Cada worker do ThreadPoolExecutor cria sua própria conexão.
+    Mantida fora do cache para não serializar objetos de rede.
     """
-    url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
-
-    session = requests.Session()
+    sess = requests.Session()
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-    session.mount('https://', HTTPAdapter(max_retries=retries))
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    sess.mount('https://', HTTPAdapter(max_retries=retries))
+    try:
+        r = sess.get(url, params=params, headers=headers, verify=False, timeout=90)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    finally:
+        sess.close()
+    return None
 
-    if tipo == "Por Estado":
-        filtro_base = f"estado ILIKE '{DIC_ESTADOS_WFS.get(val_estado, val_estado)}'"
-    elif tipo == "Por Bioma":
-        tradutor = {"Amazônia": "Amaz%nia", "Mata Atlântica": "Mata Atl%ntica"}
-        filtro_base = f"bioma ILIKE '{tradutor.get(val_bioma, val_bioma)}'"
-    elif tipo == "Por Município":
-        muni_curinga = re.sub(r'[aeiouáéíóúãõâêîôûAEIOUÁÉÍÓÚÃÕÂÊÎÔÛ]', '%', val_muni).replace(' ', '%')
-        filtro_base = f"estado ILIKE '{DIC_ESTADOS_WFS.get(val_estado, val_estado)}' AND municipio ILIKE '{muni_curinga}%'"
 
-    dt_ini = datetime.strptime(d_ini, "%Y-%m-%d")
-    dt_fim = datetime.strptime(d_fim, "%Y-%m-%d")
+def _montar_blocos_inpe(d_ini_str, d_fim_str):
+    """Retorna lista de (inicio, fim) com granularidade adaptativa."""
+    dt_ini = datetime.strptime(d_ini_str, "%Y-%m-%d")
+    dt_fim = datetime.strptime(d_fim_str, "%Y-%m-%d")
     periodo_dias = (dt_fim - dt_ini).days
 
-    # Granularidade adaptativa: diário ≤ 7d, semanal ≤ 90d, quinzenal acima
     if periodo_dias <= 7:
         passo = timedelta(days=1)
     elif periodo_dias <= 90:
@@ -322,18 +320,43 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
     else:
         passo = timedelta(days=15)
 
-    sat_str = "','".join(satelites)
-
-    # Monta lista de blocos
-    blocos = []
-    cursor = dt_ini
+    blocos, cursor = [], dt_ini
     while cursor <= dt_fim:
         fim_bloco = min(cursor + passo - timedelta(days=1), dt_fim)
         blocos.append((cursor, fim_bloco))
         cursor = fim_bloco + timedelta(days=1)
+    return blocos
 
-    # Paraleliza os blocos com ThreadPoolExecutor
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satelites):
+    """
+    P3 FIX (v2): granularidade adaptativa + paralelismo com sessão por thread.
+    - session isolada por request (_fazer_request_inpe) — thread-safe
+    - ThreadPoolExecutor fora da lógica de cache para compatibilidade com Streamlit
+    - Para 2 anos: ~100 blocos paralelos vs 730 requests sequenciais
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    if tipo == "Por Estado":
+        filtro_base = f"estado ILIKE '{DIC_ESTADOS_WFS.get(val_estado, val_estado)}'"
+    elif tipo == "Por Bioma":
+        tradutor = {"Amazônia": "Amaz%nia", "Mata Atlântica": "Mata Atl%ntica"}
+        filtro_base = f"bioma ILIKE '{tradutor.get(val_bioma, val_bioma)}'"
+    else:  # Por Município
+        muni_curinga = re.sub(
+            r'[aeiouáéíóúãõâêîôûAEIOUÁÉÍÓÚÃÕÂÊÎÔÛ]', '%', val_muni
+        ).replace(' ', '%')
+        filtro_base = (
+            f"estado ILIKE '{DIC_ESTADOS_WFS.get(val_estado, val_estado)}' "
+            f"AND municipio ILIKE '{muni_curinga}%'"
+        )
+
+    sat_str = "','".join(satelites)
+    blocos  = _montar_blocos_inpe(d_ini, d_fim)
 
     def fetch_bloco(bloco):
         inicio, fim = bloco
@@ -342,34 +365,29 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
             f"AND data_hora_gmt <= '{fim.strftime('%Y-%m-%d')}T23:59:59' "
             f"AND satelite IN ('{sat_str}') AND {filtro_base}"
         )
-        try:
-            r = session.get(
-                url,
-                params={
-                    "service": "WFS", "version": "1.0.0", "request": "GetFeature",
-                    "typeName": "bdqueimadas:focos", "outputFormat": "application/json",
-                    "CQL_FILTER": cql, "maxFeatures": 50000
-                },
-                headers=headers, verify=False, timeout=90
-            )
-            if r.status_code == 200:
-                dados = r.json()
-                if "features" in dados and dados["features"]:
-                    return [
-                        {"longitude": f["geometry"]["coordinates"][0],
-                         "latitude":  f["geometry"]["coordinates"][1],
-                         **f["properties"]}
-                        for f in dados["features"]
-                    ]
-        except Exception:
-            pass
+        params = {
+            "service": "WFS", "version": "1.0.0", "request": "GetFeature",
+            "typeName": "bdqueimadas:focos", "outputFormat": "application/json",
+            "CQL_FILTER": cql, "maxFeatures": 50000,
+        }
+        dados = _fazer_request_inpe(url, params, headers)
+        if dados and "features" in dados and dados["features"]:
+            return [
+                {"longitude": f["geometry"]["coordinates"][0],
+                 "latitude":  f["geometry"]["coordinates"][1],
+                 **f["properties"]}
+                for f in dados["features"]
+            ]
         return []
 
     all_records = []
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    # max_workers=4: conservador para não sobrecarregar o servidor do INPE
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(fetch_bloco, b): b for b in blocos}
         for future in as_completed(futures):
-            all_records.extend(future.result())
+            result = future.result()
+            if result:
+                all_records.extend(result)
 
     if not all_records:
         return pd.DataFrame()
