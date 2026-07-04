@@ -8,7 +8,7 @@ from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 import plotly.express as px
 import plotly.graph_objects as go
-import requests, warnings, time, unicodedata, re, json, io, calendar
+import requests, warnings, time, unicodedata, re, json, calendar
 import ee
 from io import BytesIO
 import traceback
@@ -44,13 +44,7 @@ st.set_page_config(
 )
 
 # ==========================================
-# 🛠️ KEEP-ALIVE E ESTADO
-if 'last_heartbeat' not in st.session_state:
-    st.session_state.last_heartbeat = datetime.now()
-
-if (datetime.now() - st.session_state.last_heartbeat).seconds > 60:
-    st.session_state.last_heartbeat = datetime.now()
-
+# 🛠️ ESTADO DA SESSÃO
 if 'gerar_dashboard' not in st.session_state:
     st.session_state.gerar_dashboard = False
 # ==========================================
@@ -67,7 +61,7 @@ try:
     )
     ee.Initialize(credentials, project='ee-anacarolinasantos580')
 except Exception as e:
-    st.error("⚠️ Erro ao conectar com o Google Earth Engine. Verifique seus Secrets.")
+    st.error(f"⚠️ Erro ao conectar com o Google Earth Engine. Verifique seus Secrets. Detalhe: {e}")
 
 
 # =====================================================================
@@ -231,7 +225,7 @@ def buscar_cidades(uf):
         resp = requests.get(url, timeout=5)
         if resp.status_code == 200:
             return sorted([d['nome'] for d in resp.json()])
-    except:
+    except Exception:
         pass
     return ["Erro ao carregar cidades"]
 
@@ -637,6 +631,8 @@ area_protegida = st.sidebar.selectbox(
 
 # ==========================================
 st.sidebar.markdown("---")
+# TODO: modo_debug ainda não é consumido em nenhuma outra parte do código.
+# Reservado para uma futura tela/painel de validação (QA) — acessível via ?qa=true.
 modo_debug = False
 
 if "qa" in st.query_params and st.query_params["qa"].lower() == "true":
@@ -1124,7 +1120,13 @@ if st.session_state.gerar_dashboard:
         with aba_graficos:
             if "INPE" in fonte_escolhida:
                 st.subheader("📈 Evolução Temporal dos Focos")
-                data_col = next(c for c in df_rec.columns if 'data' in c)
+                data_col = next((c for c in df_rec.columns if 'data' in c), None)
+                if data_col is None:
+                    st.warning(
+                        "⚠️ Não foi possível identificar a coluna de data retornada pelo INPE "
+                        "para montar o gráfico de evolução temporal."
+                    )
+                    st.stop()
                 df_rec[data_col] = pd.to_datetime(df_rec[data_col])
                 freq = 'D' if (hoje - dt_ini).days <= 90 else 'MS'
                 df_g = (
@@ -1986,7 +1988,6 @@ ser gerados por essa floresta perdida.
 
           except Exception as _err_impacto:
             st.error(f"⚠️ Erro na aba de Impacto Econômico: {_err_impacto}")
-            import traceback
             st.code(traceback.format_exc(), language="python")
 
 
@@ -2117,7 +2118,7 @@ ser gerados por essa floresta perdida.
                                 mime="text/csv",
                                 use_container_width=True
                             )
-                    except:
+                    except Exception:
                         pass
 
                 # NBR Severidade
