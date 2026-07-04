@@ -510,6 +510,133 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
 
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
+
+# =============================================================
+# --- PREVISÃO DE SÉRIE TEMPORAL (MBA — Item 1) ---
+# =============================================================
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def buscar_serie_historica_modis(geom_json_str, anos_historico=8):
+    """
+    Busca a série MENSAL (não agregada por mês-calendário, mas contínua no
+    tempo) de área queimada MODIS para os últimos `anos_historico` anos.
+    Essa série contínua é o insumo do modelo de previsão — diferente da
+    anomalia, que compara mês-a-mês contra a média histórica do mesmo mês.
+    """
+    ee_geom = ee.Geometry(json.loads(geom_json_str))
+    geom_simplificada = ee_geom.simplify(maxError=5000)
+
+    hoje = datetime.now()
+    # MODIS tem defasagem de publicação de ~1-2 meses; ignora os 2 últimos
+    ref = hoje.replace(day=1) - timedelta(days=45)
+    ano_fim, mes_fim = ref.year, ref.month
+    ano_ini = ano_fim - anos_historico
+
+    periodos = []
+    ano, mes = ano_ini, 1
+    while (ano, mes) <= (ano_fim, mes_fim):
+        periodos.append((ano, mes))
+        mes += 1
+        if mes > 12:
+            mes = 1
+            ano += 1
+
+    def get_mes(par):
+        ano_p, mes_p = par
+        for tentativa in range(1, 4):
+            try:
+                ini = ee.Date.fromYMD(ano_p, mes_p, 1)
+                col = (
+                    ee.ImageCollection('MODIS/061/MCD64A1')
+                    .filterDate(ini, ini.advance(1, 'month'))
+                    .filterBounds(geom_simplificada)
+                )
+                if col.size().getInfo() == 0:
+                    return {'ano': ano_p, 'mes': mes_p, 'area_km2': None}
+                img = col.select('BurnDate').max().clip(geom_simplificada)
+                area = (
+                    ee.Image.pixelArea().divide(1e6)
+                    .updateMask(img.gt(0))
+                    .reduceRegion(
+                        reducer=ee.Reducer.sum(), geometry=geom_simplificada,
+                        scale=10000, maxPixels=1e13, tileScale=16, bestEffort=True
+                    ).get('area')
+                )
+                valor = area.getInfo()
+                return {'ano': ano_p, 'mes': mes_p, 'area_km2': round(valor or 0, 2)}
+            except Exception as e:
+                if ('Too many concurrent' in str(e) or '429' in str(e)) and tentativa < 3:
+                    time.sleep(2 ** tentativa)
+                    continue
+                return {'ano': ano_p, 'mes': mes_p, 'area_km2': None}
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    registros = []
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(get_mes, p): p for p in periodos}
+        for future in as_completed(futures):
+            registros.append(future.result())
+
+    df = pd.DataFrame(registros).dropna(subset=['area_km2'])
+    if df.empty:
+        return df
+    df['data'] = pd.to_datetime(
+        df['ano'].astype(str) + '-' + df['mes'].astype(str) + '-01'
+    )
+    return df.sort_values('data').reset_index(drop=True)[['data', 'area_km2']]
+
+
+def prever_serie_temporal(df_serie, meses_previsao=6, meses_teste=6):
+    """
+    Ajusta um modelo SARIMA (sazonalidade anual, período=12) à série mensal
+    de área queimada e projeta os próximos `meses_previsao` meses.
+
+    Validação: treina com todos os dados MENOS os últimos `meses_teste`
+    meses, prevê esse período de teste e compara com o valor real
+    observado — só assim dá pra confiar (ou não) na previsão futura.
+    """
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+    serie = df_serie.set_index('data')['area_km2'].asfreq('MS').fillna(0)
+
+    if len(serie) < meses_teste + 24:
+        return None  # histórico curto demais pra validar com segurança
+
+    treino, teste = serie.iloc[:-meses_teste], serie.iloc[-meses_teste:]
+
+    modelo_val = SARIMAX(
+        treino, order=(1, 1, 1), seasonal_order=(1, 1, 1, 12),
+        enforce_stationarity=False, enforce_invertibility=False
+    ).fit(disp=False)
+    pred_teste = modelo_val.forecast(meses_teste)
+
+    erro = teste - pred_teste
+    mae = erro.abs().mean()
+    rmse = (erro ** 2).mean() ** 0.5
+    teste_nao_zero = teste.replace(0, pd.NA)
+    mape = (erro.abs() / teste_nao_zero).dropna().mean() * 100
+
+    # Reajusta com a série INTEIRA (treino+teste) pra prever o futuro de fato
+    modelo_final = SARIMAX(
+        serie, order=(1, 1, 1), seasonal_order=(1, 1, 1, 12),
+        enforce_stationarity=False, enforce_invertibility=False
+    ).fit(disp=False)
+    previsao = modelo_final.get_forecast(meses_previsao)
+    df_prev = previsao.summary_frame(alpha=0.20)  # intervalo de confiança de 80%
+    df_prev = df_prev.rename(columns={
+        'mean': 'previsto', 'mean_ci_lower': 'ic_inferior', 'mean_ci_upper': 'ic_superior'
+    })
+    df_prev.index.name = 'data'
+    df_prev = df_prev.reset_index()
+    df_prev['previsto'] = df_prev['previsto'].clip(lower=0)
+    df_prev['ic_inferior'] = df_prev['ic_inferior'].clip(lower=0)
+
+    return {
+        'previsao': df_prev[['data', 'previsto', 'ic_inferior', 'ic_superior']],
+        'mae': mae, 'rmse': rmse, 'mape': mape if pd.notna(mape) else None,
+    }
+
+
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hint=0):
     # 1. LEITURA CORRETA DA GEOMETRIA
     geom_dict = json.loads(geom_json_str)
@@ -998,10 +1125,11 @@ if st.session_state.gerar_dashboard:
         # =============================================================
         # --- ABAS PRINCIPAIS ---
         # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_export = st.tabs([
+        aba_mapa, aba_graficos, aba_nbr, aba_previsao, aba_impacto, aba_export = st.tabs([
             "🗺️ Mapa de Focos",
             "📈 Gráficos & Anomalia",
             "🔬 Severidade (NBR Sentinel-2)",
+            "🔮 Previsão",
             "💰 Impacto Econômico",
             "⬇️ Exportar Dados"
         ])
@@ -1805,6 +1933,145 @@ if st.session_state.gerar_dashboard:
                             "- **Alta:** destruição quase total da cobertura vegetal"
                         )
 
+
+
+        # ----------------------------------------------------------
+        # ABA 3B — PREVISÃO DE SÉRIE TEMPORAL
+        # ----------------------------------------------------------
+        with aba_previsao:
+            if "INPE" in fonte_escolhida:
+                st.info(
+                    "💡 A previsão usa a série histórica mensal do MODIS (desde 2001), "
+                    "que é uma medida mais estável de área queimada do que a contagem de focos. "
+                    "Para ativá-la, selecione **🗺️ Área Queimada (NASA MODIS)** na barra lateral."
+                )
+            else:
+                st.subheader("🔮 Previsão de Área Queimada — Próximos Meses")
+                st.markdown(
+                    f"Modelo estatístico **SARIMA** (com sazonalidade anual) treinado com a série "
+                    f"histórica mensal de área queimada MODIS para projetar os próximos meses "
+                    f"em **{val_sel}**."
+                )
+
+                col_p1, col_p2 = st.columns(2)
+                with col_p1:
+                    anos_hist_sel = st.slider(
+                        "Anos de histórico para treinar o modelo:", 4, 15, 8,
+                        help=(
+                            "Mais anos = modelo mais robusto, porém mais lento "
+                            "(mais chamadas ao Earth Engine)."
+                        )
+                    )
+                with col_p2:
+                    meses_prev_sel = st.slider("Meses a projetar no futuro:", 3, 12, 6)
+
+                _prev_key = f"previsao_{val_sel}_{anos_hist_sel}"
+
+                if st.button(
+                    "📈 Gerar Previsão", type="primary",
+                    use_container_width=True, key=f"btn_prev_{val_sel}"
+                ):
+                    with st.spinner(
+                        f"🛰️ Buscando {anos_hist_sel} anos de histórico MODIS "
+                        "e ajustando o modelo… isso pode levar alguns minutos."
+                    ):
+                        try:
+                            df_serie_hist = buscar_serie_historica_modis(
+                                geom_json_str, anos_historico=anos_hist_sel
+                            )
+                            if len(df_serie_hist) < 30:
+                                st.warning(
+                                    "⚠️ Histórico insuficiente para um modelo confiável "
+                                    "(menos de ~2,5 anos de dados válidos). Tente aumentar "
+                                    "os anos de histórico ou escolher uma área diferente."
+                                )
+                            else:
+                                resultado_prev = prever_serie_temporal(
+                                    df_serie_hist, meses_previsao=meses_prev_sel
+                                )
+                                if resultado_prev is None:
+                                    st.warning(
+                                        "⚠️ Dados insuficientes para validar o modelo "
+                                        "(mínimo de ~2,5 anos de histórico é necessário)."
+                                    )
+                                else:
+                                    st.session_state[_prev_key] = {
+                                        'serie': df_serie_hist, 'resultado': resultado_prev
+                                    }
+                        except Exception as e_prev:
+                            st.error(f"⚠️ Erro ao gerar previsão: {e_prev}")
+
+                if _prev_key in st.session_state:
+                    df_serie_hist = st.session_state[_prev_key]['serie']
+                    resultado_prev = st.session_state[_prev_key]['resultado']
+                    df_prev = resultado_prev['previsao']
+
+                    st.markdown("---")
+                    st.markdown("#### 📏 Qualidade do modelo (validada com meses reais)")
+                    cm1, cm2, cm3 = st.columns(3)
+                    cm1.metric("MAE (erro médio)", f"{resultado_prev['mae']:.1f} km²")
+                    cm2.metric("RMSE", f"{resultado_prev['rmse']:.1f} km²")
+                    cm3.metric(
+                        "MAPE",
+                        f"{resultado_prev['mape']:.1f}%" if resultado_prev['mape'] is not None else "N/D"
+                    )
+                    st.caption(
+                        "MAE/RMSE em km² de área queimada · MAPE em % de erro relativo. "
+                        "Calculados comparando a previsão do modelo com os **últimos meses reais já "
+                        "observados** (holdout de validação) — não com o futuro, que ainda vai acontecer."
+                    )
+
+                    st.markdown("#### 📊 Histórico + Previsão")
+                    fig_prev = go.Figure()
+                    fig_prev.add_scatter(
+                        x=df_serie_hist['data'], y=df_serie_hist['area_km2'],
+                        mode='lines', name='Histórico (MODIS)',
+                        line=dict(color='#3498db', width=2)
+                    )
+                    fig_prev.add_scatter(
+                        x=df_prev['data'], y=df_prev['previsto'],
+                        mode='lines+markers', name='Previsão',
+                        line=dict(color='#e74c3c', width=3, dash='dash')
+                    )
+                    fig_prev.add_scatter(
+                        x=pd.concat([df_prev['data'], df_prev['data'][::-1]]),
+                        y=pd.concat([df_prev['ic_superior'], df_prev['ic_inferior'][::-1]]),
+                        fill='toself', fillcolor='rgba(231,76,60,0.15)',
+                        line=dict(width=0), name='Intervalo de confiança (80%)',
+                        hoverinfo='skip'
+                    )
+                    fig_prev.update_layout(
+                        template='plotly_dark', height=420,
+                        yaxis_title="Área Queimada (km²)", xaxis_title="",
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02),
+                        margin=dict(t=40, b=20)
+                    )
+                    st.plotly_chart(fig_prev, use_container_width=True)
+
+                    st.markdown("#### 📋 Valores projetados")
+                    df_tabela_prev = df_prev.copy()
+                    df_tabela_prev['data'] = df_tabela_prev['data'].dt.strftime('%b/%Y')
+                    df_tabela_prev = df_tabela_prev.rename(columns={
+                        'data': 'Mês', 'previsto': 'Previsto (km²)',
+                        'ic_inferior': 'Mínimo esperado (km²)',
+                        'ic_superior': 'Máximo esperado (km²)'
+                    }).round(1)
+                    st.dataframe(df_tabela_prev, hide_index=True, use_container_width=True)
+
+                    area_prevista_total = df_prev['previsto'].sum()
+                    st.markdown("---")
+                    st.info(
+                        f"💰 Se a projeção se confirmar, os próximos {meses_prev_sel} meses podem "
+                        f"somar aproximadamente **{area_prevista_total:,.0f} km²** de área queimada "
+                        f"adicional em {val_sel}. Veja o prejuízo econômico estimado disso na aba "
+                        f"**💰 Impacto Econômico**."
+                    )
+                    st.caption(
+                        "⚠️ Projeção estatística baseada em padrões históricos — não considera "
+                        "eventos excepcionais (secas extremas, mudanças de política pública, "
+                        "novas frentes de desmatamento etc). Use como referência de tendência, "
+                        "não como certeza."
+                    )
 
 
         # ----------------------------------------------------------
