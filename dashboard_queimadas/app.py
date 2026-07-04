@@ -8,7 +8,7 @@ from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 import plotly.express as px
 import plotly.graph_objects as go
-import requests, warnings, time, unicodedata, re, json, calendar
+import requests, warnings, time, unicodedata, re, json, io, calendar
 import ee
 from io import BytesIO
 import traceback
@@ -44,7 +44,13 @@ st.set_page_config(
 )
 
 # ==========================================
-# 🛠️ ESTADO DA SESSÃO
+# 🛠️ KEEP-ALIVE E ESTADO
+if 'last_heartbeat' not in st.session_state:
+    st.session_state.last_heartbeat = datetime.now()
+
+if (datetime.now() - st.session_state.last_heartbeat).seconds > 60:
+    st.session_state.last_heartbeat = datetime.now()
+
 if 'gerar_dashboard' not in st.session_state:
     st.session_state.gerar_dashboard = False
 # ==========================================
@@ -61,7 +67,7 @@ try:
     )
     ee.Initialize(credentials, project='ee-anacarolinasantos580')
 except Exception as e:
-    st.error(f"⚠️ Erro ao conectar com o Google Earth Engine. Verifique seus Secrets. Detalhe: {e}")
+    st.error("⚠️ Erro ao conectar com o Google Earth Engine. Verifique seus Secrets.")
 
 
 # =====================================================================
@@ -225,7 +231,7 @@ def buscar_cidades(uf):
         resp = requests.get(url, timeout=5)
         if resp.status_code == 200:
             return sorted([d['nome'] for d in resp.json()])
-    except Exception:
+    except:
         pass
     return ["Erro ao carregar cidades"]
 
@@ -257,10 +263,7 @@ def carregar_areas_protegidas(tipo_area):
             gdf_areas = gdf_areas.rename(columns={'name_conservation_unit': 'nome_area'})
     gdf_areas['geometry'] = gdf_areas['geometry'].make_valid()
     gdf_areas = gdf_areas.to_crs("EPSG:4326")
-    # Tolerância baixa (~110m) para não distorcer áreas pequenas/estreitas
-    # (ex: terras indígenas em faixa de rio), o que antes fazia o sjoin
-    # "perder" focos que na realidade estão dentro do polígono.
-    gdf_areas['geometry'] = gdf_areas['geometry'].simplify(tolerance=0.001, preserve_topology=True)
+    gdf_areas['geometry'] = gdf_areas['geometry'].simplify(tolerance=0.01, preserve_topology=True)
     return gdf_areas[['nome_area', 'geometry']]
 
 import requests
@@ -510,372 +513,6 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
 
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
-
-# =============================================================
-# --- PREVISÃO DE SÉRIE TEMPORAL (MBA — Item 1) ---
-# =============================================================
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def buscar_serie_historica_modis(geom_json_str, anos_historico=8):
-    """
-    Busca a série MENSAL (não agregada por mês-calendário, mas contínua no
-    tempo) de área queimada MODIS para os últimos `anos_historico` anos.
-    Essa série contínua é o insumo do modelo de previsão — diferente da
-    anomalia, que compara mês-a-mês contra a média histórica do mesmo mês.
-    """
-    ee_geom = ee.Geometry(json.loads(geom_json_str))
-    geom_simplificada = ee_geom.simplify(maxError=5000)
-
-    hoje = datetime.now()
-    # MODIS tem defasagem de publicação de ~1-2 meses; ignora os 2 últimos
-    ref = hoje.replace(day=1) - timedelta(days=45)
-    ano_fim, mes_fim = ref.year, ref.month
-    ano_ini = ano_fim - anos_historico
-
-    periodos = []
-    ano, mes = ano_ini, 1
-    while (ano, mes) <= (ano_fim, mes_fim):
-        periodos.append((ano, mes))
-        mes += 1
-        if mes > 12:
-            mes = 1
-            ano += 1
-
-    def get_mes(par):
-        ano_p, mes_p = par
-        for tentativa in range(1, 4):
-            try:
-                ini = ee.Date.fromYMD(ano_p, mes_p, 1)
-                col = (
-                    ee.ImageCollection('MODIS/061/MCD64A1')
-                    .filterDate(ini, ini.advance(1, 'month'))
-                    .filterBounds(geom_simplificada)
-                )
-                if col.size().getInfo() == 0:
-                    return {'ano': ano_p, 'mes': mes_p, 'area_km2': None}
-                img = col.select('BurnDate').max().clip(geom_simplificada)
-                area = (
-                    ee.Image.pixelArea().divide(1e6)
-                    .updateMask(img.gt(0))
-                    .reduceRegion(
-                        reducer=ee.Reducer.sum(), geometry=geom_simplificada,
-                        scale=10000, maxPixels=1e13, tileScale=16, bestEffort=True
-                    ).get('area')
-                )
-                valor = area.getInfo()
-                return {'ano': ano_p, 'mes': mes_p, 'area_km2': round(valor or 0, 2)}
-            except Exception as e:
-                if ('Too many concurrent' in str(e) or '429' in str(e)) and tentativa < 3:
-                    time.sleep(2 ** tentativa)
-                    continue
-                return {'ano': ano_p, 'mes': mes_p, 'area_km2': None}
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    registros = []
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(get_mes, p): p for p in periodos}
-        for future in as_completed(futures):
-            registros.append(future.result())
-
-    df = pd.DataFrame(registros).dropna(subset=['area_km2'])
-    if df.empty:
-        return df
-    df['data'] = pd.to_datetime(
-        df['ano'].astype(str) + '-' + df['mes'].astype(str) + '-01'
-    )
-    return df.sort_values('data').reset_index(drop=True)[['data', 'area_km2']]
-
-
-def prever_serie_temporal(df_serie, meses_previsao=6, meses_teste=6):
-    """
-    Ajusta um modelo SARIMA (sazonalidade anual, período=12) à série mensal
-    de área queimada e projeta os próximos `meses_previsao` meses.
-
-    Validação: treina com todos os dados MENOS os últimos `meses_teste`
-    meses, prevê esse período de teste e compara com o valor real
-    observado — só assim dá pra confiar (ou não) na previsão futura.
-    """
-    from statsmodels.tsa.statespace.sarimax import SARIMAX
-
-    serie = df_serie.set_index('data')['area_km2'].asfreq('MS').fillna(0)
-
-    if len(serie) < meses_teste + 24:
-        return None  # histórico curto demais pra validar com segurança
-
-    treino, teste = serie.iloc[:-meses_teste], serie.iloc[-meses_teste:]
-
-    modelo_val = SARIMAX(
-        treino, order=(1, 1, 1), seasonal_order=(1, 1, 1, 12),
-        enforce_stationarity=False, enforce_invertibility=False
-    ).fit(disp=False)
-    pred_teste = modelo_val.forecast(meses_teste)
-
-    erro = teste - pred_teste
-    mae = erro.abs().mean()
-    rmse = (erro ** 2).mean() ** 0.5
-    teste_nao_zero = teste.replace(0, pd.NA)
-    mape = (erro.abs() / teste_nao_zero).dropna().mean() * 100
-
-    # Reajusta com a série INTEIRA (treino+teste) pra prever o futuro de fato
-    modelo_final = SARIMAX(
-        serie, order=(1, 1, 1), seasonal_order=(1, 1, 1, 12),
-        enforce_stationarity=False, enforce_invertibility=False
-    ).fit(disp=False)
-    previsao = modelo_final.get_forecast(meses_previsao)
-    df_prev = previsao.summary_frame(alpha=0.20)  # intervalo de confiança de 80%
-    df_prev = df_prev.rename(columns={
-        'mean': 'previsto', 'mean_ci_lower': 'ic_inferior', 'mean_ci_upper': 'ic_superior'
-    })
-    df_prev.index.name = 'data'
-    df_prev = df_prev.reset_index()
-    df_prev['previsto'] = df_prev['previsto'].clip(lower=0)
-    df_prev['ic_inferior'] = df_prev['ic_inferior'].clip(lower=0)
-
-    return {
-        'previsao': df_prev[['data', 'previsto', 'ic_inferior', 'ic_superior']],
-        'mae': mae, 'rmse': rmse, 'mape': mape if pd.notna(mape) else None,
-    }
-
-
-def _renderizar_impacto_economico():
-        with aba_impacto:
-          try:
-            # --- TABELAS DE REFERÊNCIA ---
-            VALORES_ECOSSIS = {
-                "Amazônia":      {"conservador": 2000,  "moderado": 4000,  "otimista": 6000},
-                "Cerrado":       {"conservador": 800,   "moderado": 1650,  "otimista": 2500},
-                "Mata Atlântica":{"conservador": 3000,  "moderado": 5500,  "otimista": 8000},
-                "Pantanal":      {"conservador": 1500,  "moderado": 2750,  "otimista": 4000},
-                "Caatinga":      {"conservador": 400,   "moderado": 800,   "otimista": 1200},
-                "Pampa":         {"conservador": 600,   "moderado": 1050,  "otimista": 1500},
-            }
-            EMISSOES_CO2_HA = {
-                "Amazônia": 150, "Cerrado": 60, "Mata Atlântica": 120,
-                "Pantanal": 80, "Caatinga": 30, "Pampa": 25,
-            }
-            PRECO_CARBONO_USD = 15
-            CAMBIO_FIXO = buscar_cotacao_dolar()
-
-            # --- DETECTAR BIOMA ---
-            ESTADO_BIOMA = {
-                "AM": "Amazônia", "PA": "Amazônia", "AC": "Amazônia",
-                "RO": "Amazônia", "RR": "Amazônia", "AP": "Amazônia",
-                "MT": "Cerrado",  "GO": "Cerrado",  "TO": "Cerrado",
-                "MA": "Cerrado",  "PI": "Caatinga", "BA": "Caatinga",
-                "CE": "Caatinga", "RN": "Caatinga", "PB": "Caatinga",
-                "PE": "Caatinga", "AL": "Caatinga", "SE": "Caatinga",
-                "MS": "Pantanal", "PR": "Mata Atlântica",
-                "SC": "Mata Atlântica", "RS": "Pampa",
-                "SP": "Mata Atlântica", "RJ": "Mata Atlântica",
-                "ES": "Mata Atlântica", "MG": "Mata Atlântica",
-                "DF": "Cerrado",
-            }
-            bioma_detectado = (
-                bioma_dd if tipo_analise == "Por Bioma"
-                else ESTADO_BIOMA.get(estado_dd, "Cerrado")
-            )
-
-            # --- ÁREA QUEIMADA ---
-            area_km2_calc = 0.0
-            if "MODIS" in fonte_escolhida and total_valor > 0:
-                area_km2_calc = float(total_valor)
-                fonte_area = f"Satélite MODIS — {area_km2_calc:,.1f} km² queimados detectados"
-            elif "INPE" in fonte_escolhida and not df_rec.empty:
-                area_km2_calc = len(df_rec) * 0.5
-                fonte_area = f"{len(df_rec):,} focos INPE (estimativa: ~0,5 km²/foco)"
-            else:
-                fonte_area = "Sem dados de área disponíveis"
-
-            area_ha = area_km2_calc * 100
-
-            st.markdown("## 💰 Impacto Econômico das Queimadas")
-            st.markdown(
-                f"Estimativa do prejuízo causado pelas queimadas em **{val_sel}**, "
-                f"com base na área afetada e no valor dos serviços que o ecossistema presta à sociedade."
-            )
-
-            if area_km2_calc == 0:
-                st.warning(
-                    "⚠️ Nenhuma área queimada detectada para o período selecionado. "
-                    "Selecione outro mês ou ano."
-                )
-            else:
-                # Leitura dos parâmetros do session_state (definidos no expander abaixo)
-                bioma_calc = st.session_state.get("bioma_impacto",
-                    bioma_detectado if bioma_detectado in VALORES_ECOSSIS
-                    else list(VALORES_ECOSSIS.keys())[0])
-                cenario    = st.session_state.get("cenario_impacto", "moderado")
-                cambio_usd = st.session_state.get("cambio_impacto", CAMBIO_FIXO)
-
-                # --- CÁLCULOS ---
-                valor_usd_ha        = VALORES_ECOSSIS[bioma_calc][cenario]
-                valor_brl_ha        = valor_usd_ha * cambio_usd
-                fator_co2_ha        = EMISSOES_CO2_HA.get(bioma_calc, 60)
-                perda_ecossis_brl   = area_ha * valor_brl_ha
-                co2_emitido_t       = area_ha * fator_co2_ha
-                credito_carbono_brl = co2_emitido_t * PRECO_CARBONO_USD * cambio_usd
-                total_impacto_brl   = perda_ecossis_brl + credito_carbono_brl
-
-                # --- CARD PRINCIPAL ---
-                st.markdown(f"""
-                <div style="background: linear-gradient(135deg, #c0392b22, #e74c3c11);
-                            border-left: 6px solid #e74c3c; border-radius: 10px;
-                            padding: 22px 26px; margin: 16px 0;">
-                    <p style="margin: 0 0 4px 0; color: #aaa; font-size: 13px;
-                              text-transform: uppercase; letter-spacing: 1px;">
-                        Prejuízo econômico estimado — {bioma_calc} · Cenário {cenario.capitalize()}
-                    </p>
-                    <p style="font-size: 42px; font-weight: 800; margin: 0; color: #e74c3c;">
-                        R$ {total_impacto_brl/1e9:,.2f} bilhões
-                    </p>
-                    <p style="margin: 6px 0 0 0; color: #bbb; font-size: 13px;">
-                        📡 Base: {fonte_area}
-                    </p>
-                </div>
-                """, unsafe_allow_html=True)
-
-                # --- 3 CARDS SECUNDÁRIOS ---
-                m1, m2, m3 = st.columns(3)
-                with m1:
-                    st.metric("🌍 Área Queimada",
-                              f"{area_km2_calc:,.1f} km²",
-                              f"{area_ha:,.0f} hectares")
-                with m2:
-                    st.metric("🌳 Perda de Serviços Ambientais",
-                              f"R$ {perda_ecossis_brl/1e9:,.2f} bi",
-                              f"R$ {valor_brl_ha:,.0f}/ha · {bioma_calc}")
-                with m3:
-                    st.metric("☁️ Carbono Emitido",
-                              f"{co2_emitido_t/1e6:,.2f} Mt CO₂e",
-                              f"≈ R$ {credito_carbono_brl/1e9:,.2f} bi em créditos perdidos")
-
-                st.markdown("---")
-
-                # --- GRÁFICO: COMPARAÇÃO DOS 3 CENÁRIOS ---
-                st.markdown("### Como o valor muda conforme o cenário?")
-                st.caption(
-                    "Cada cenário reflete um intervalo da literatura científica — "
-                    "do mais conservador (menor impacto estimado) ao otimista (maior)."
-                )
-                dados_cen = []
-                for cen_k in ["conservador", "moderado", "otimista"]:
-                    v_brl_ha_cen = VALORES_ECOSSIS[bioma_calc][cen_k] * cambio_usd
-                    perda_cen    = area_ha * v_brl_ha_cen
-                    co2_cen      = area_ha * fator_co2_ha * PRECO_CARBONO_USD * cambio_usd
-                    total_cen    = perda_cen + co2_cen
-                    dados_cen.append({
-                        "Cenário": {"conservador": "Conservador", "moderado": "Moderado",
-                                  "otimista": "Otimista"}[cen_k],
-                        "Serviços Ambientais (R$ bi)": round(perda_cen / 1e9, 2),
-                        "Créditos de Carbono (R$ bi)":  round(co2_cen / 1e9, 2),
-                        "Total (R$ bi)":                   round(total_cen / 1e9, 2),
-                    })
-                df_cen = pd.DataFrame(dados_cen)
-                fig_cen = go.Figure()
-                fig_cen.add_bar(
-                    name="Serviços Ambientais",
-                    x=df_cen["Cenário"],
-                    y=df_cen["Serviços Ambientais (R$ bi)"],
-                    marker_color="#e74c3c",
-                    text=df_cen["Serviços Ambientais (R$ bi)"].apply(lambda v: f"R$ {v:.2f} bi"),
-                    textposition="inside",
-                )
-                fig_cen.add_bar(
-                    name="Créditos de Carbono",
-                    x=df_cen["Cenário"],
-                    y=df_cen["Créditos de Carbono (R$ bi)"],
-                    marker_color="#f39c12",
-                    text=df_cen["Créditos de Carbono (R$ bi)"].apply(lambda v: f"R$ {v:.2f} bi"),
-                    textposition="inside",
-                )
-                fig_cen.update_layout(
-                    barmode="stack", template="plotly_dark", height=360,
-                    yaxis_title="R$ Bilhões",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                    margin=dict(t=40, b=20),
-                )
-                st.plotly_chart(fig_cen, use_container_width=True)
-                st.dataframe(
-                    df_cen.rename(columns={"Total (R$ bi)": "💰 Total (R$ bi)"}),
-                    hide_index=True, use_container_width=True
-                )
-
-                st.markdown("---")
-
-                # --- CONTEXTO EXPLICATIVO ---
-                st.markdown("### O que significa esse prejuízo?")
-                col_ctx1, col_ctx2 = st.columns(2)
-                with col_ctx1:
-                    st.markdown(f"""
-**Serviços ambientais** são os benefícios que a floresta entrega à sociedade sem custo:
-regulação das chuvas, filtragem da água, controle da temperatura e manutenção
-do solo e da biodiversidade. Quando uma área queima, esses benefícios deixam
-de existir por anos.
-
-Para o **{bioma_calc}**, cada hectare vale em média **R$ {valor_brl_ha:,.0f}**
-no cenário {cenario} — valor que a sociedade perde enquanto a vegetação não se recupera.
-                    """)
-                with col_ctx2:
-                    st.markdown(f"""
-**Carbono emitido:** as queimadas lançaram aproximadamente
-**{co2_emitido_t/1e6:,.2f} milhões de toneladas de CO₂** na atmosfera.
-
-No mercado voluntário de carbono, cada tonelada vale em torno de
-**R$ {PRECO_CARBONO_USD * cambio_usd:,.0f}** — o equivalente a
-**R$ {credito_carbono_brl/1e9:,.2f} bilhões** em créditos que não poderão mais
-ser gerados por essa floresta perdida.
-                    """)
-
-                st.info(
-                    "Estimativa indicativa com base em literatura científica. "
-                    "Não substitui laudo técnico para fins legais ou regulatórios."
-                )
-
-                with st.expander("⚙️ Ajustar parâmetros do cálculo"):
-                    pc1, pc2, pc3 = st.columns(3)
-                    with pc1:
-                        st.selectbox(
-                            "Bioma:", list(VALORES_ECOSSIS.keys()),
-                            index=list(VALORES_ECOSSIS.keys()).index(bioma_calc),
-                            key="bioma_impacto"
-                        )
-                    with pc2:
-                        st.selectbox(
-                            "Cenário:",
-                            ["conservador", "moderado", "otimista"],
-                            index=["conservador","moderado","otimista"].index(cenario),
-                            format_func=lambda x: {"conservador": "Conservador (mínimo)",
-                                                   "moderado": "Moderado (referência)",
-                                                   "otimista": "Otimista (máximo)"}[x],
-                            key="cenario_impacto"
-                        )
-                    with pc3:
-                        st.number_input(
-                            f"Câmbio R$/US$ (PTAX hoje: R$ {CAMBIO_FIXO:.2f}):",
-                            min_value=1.0, max_value=20.0,
-                            value=float(cambio_usd), step=0.10, key="cambio_impacto"
-                        )
-                    st.caption(
-                        "Altere os parâmetros e clique em **Gerar Dashboard** novamente para recalcular."
-                    )
-
-                with st.expander("📚 Fontes e referências"):
-                    st.markdown("""
-| Fonte | O que fornece | Site |
-|---|---|---|
-| Costanza et al. (2014) — *Global Policy* | Valor de serviços ecossistêmicos por bioma | [acessar](https://www.sciencedirect.com/science/article/pii/S0959378014000685) |
-| IPAM — Inst. de Pesquisa Ambiental da Amazônia | Custo de restauração e carbono na Amazônia | [ipam.org.br](https://ipam.org.br) |
-| TNC Brasil — The Nature Conservancy | Custo-benefício de conservação por bioma | [tnc.org.br](https://www.tnc.org.br) |
-| SEEG / Observatório do Clima | Fator de emissão de CO₂ por bioma (tCO₂e/ha) | [seeg.eco.br](https://seeg.eco.br) |
-| Ecosystem Marketplace (2023) | Preço médio de carbono no mercado voluntário | [ecosystemmarketplace.com](https://www.ecosystemmarketplace.com) |
-| CEPEA/USP | Custo de oportunidade agrícola e perdas em cadeias produtivas | [cepea.esalq.usp.br](https://www.cepea.esalq.usp.br) |
-                    """)
-
-          except Exception as _err_impacto:
-            st.error(f"⚠️ Erro na aba de Impacto Econômico: {_err_impacto}")
-            st.code(traceback.format_exc(), language="python")
-
-
 def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hint=0):
     # 1. LEITURA CORRETA DA GEOMETRIA
     geom_dict = json.loads(geom_json_str)
@@ -1000,8 +637,6 @@ area_protegida = st.sidebar.selectbox(
 
 # ==========================================
 st.sidebar.markdown("---")
-# TODO: modo_debug ainda não é consumido em nenhuma outra parte do código.
-# Reservado para uma futura tela/painel de validação (QA) — acessível via ?qa=true.
 modo_debug = False
 
 if "qa" in st.query_params and st.query_params["qa"].lower() == "true":
@@ -1109,52 +744,30 @@ if st.session_state.gerar_dashboard:
 
                 if area_protegida != "Nenhuma" and not df_rec.empty:
                     st.write(f"🌳 Isolando focos em {area_protegida}...")
-                    try:
-                        gdf_areas = carregar_areas_protegidas(area_protegida)
-                        gdf_areas = gdf_areas.to_crs(gdf.crs)
+                    gdf_areas = carregar_areas_protegidas(area_protegida)
+                    gdf_areas = gdf_areas.to_crs(gdf.crs)
 
-                        if 'index_right' in gdf.columns:
-                            gdf = gdf.drop(columns=['index_right'])
+                    if 'index_right' in gdf.columns:
+                        gdf = gdf.drop(columns=['index_right'])
 
-                        # Restringe às áreas protegidas que efetivamente tocam a região
-                        # analisada — usado tanto pro join com os focos quanto pra
-                        # desenhar o contorno no mapa (mesmo sem focos dentro).
-                        gdf_areas_regiao = gpd.sjoin(
-                            gdf_areas, limite[['geometry']], predicate='intersects'
-                        ).drop(columns=['index_right'], errors='ignore')[['nome_area', 'geometry']]
+                    gdf_focos_risco = gpd.sjoin(gdf, gdf_areas, predicate='within')
 
-                        if gdf_areas_regiao.empty:
-                            st.info(f"ℹ️ Não há {area_protegida.lower()} demarcadas na região selecionada.")
-                            df_rec = pd.DataFrame()
-                            total_valor = 0
-                        else:
-                            gdf_focos_risco = gpd.sjoin(gdf, gdf_areas_regiao, predicate='within')
-
-                            if not gdf_focos_risco.empty:
-                                areas_afetadas = gdf_areas_regiao[
-                                    gdf_areas_regiao['nome_area'].isin(gdf_focos_risco['nome_area'])
-                                ]
-                                focos_em_areas = pd.DataFrame(gdf_focos_risco.drop(columns="geometry"))
-                                df_ranking_areas = (
-                                    focos_em_areas['nome_area']
-                                    .value_counts()
-                                    .reset_index()
-                                )
-                                df_ranking_areas.columns = ['Área Protegida', 'Valor']
-                                df_rec = focos_em_areas
-                                total_valor = len(df_rec)
-                            else:
-                                # Nenhum foco caiu dentro das áreas protegidas da região,
-                                # mas o contorno delas ainda deve aparecer no mapa.
-                                areas_afetadas = gdf_areas_regiao
-                                df_rec = pd.DataFrame()
-                                total_valor = 0
-                    except Exception as _erro_areas:
-                        st.warning(
-                            f"⚠️ Não foi possível carregar os limites de {area_protegida}. "
-                            f"Mostrando todos os focos da região, sem o recorte. "
-                            f"Detalhe técnico: {_erro_areas}"
+                    if not gdf_focos_risco.empty:
+                        areas_afetadas = gdf_areas[
+                            gdf_areas['nome_area'].isin(gdf_focos_risco['nome_area'])
+                        ]
+                        focos_em_areas = pd.DataFrame(gdf_focos_risco.drop(columns="geometry"))
+                        df_ranking_areas = (
+                            focos_em_areas['nome_area']
+                            .value_counts()
+                            .reset_index()
                         )
+                        df_ranking_areas.columns = ['Área Protegida', 'Valor']
+                        df_rec = focos_em_areas
+                        total_valor = len(df_rec)
+                    else:
+                        df_rec = pd.DataFrame()
+                        total_valor = 0
 
         # -------------------------------------------------------
         # FONTE: MODIS
@@ -1180,66 +793,51 @@ if st.session_state.gerar_dashboard:
 
                     if area_protegida != "Nenhuma" and total_valor > 0:
                         st.write(f"🌳 Isolando km² afetados em {area_protegida}...")
-                        try:
-                            gdf_areas_br = carregar_areas_protegidas(tipo_area=area_protegida)
-                            gdf_areas = gpd.sjoin(
-                                gdf_areas_br, limite, predicate='intersects'
-                            ).drop(columns=['index_right'])
+                        gdf_areas_br = carregar_areas_protegidas(tipo_area=area_protegida)
+                        gdf_areas = gpd.sjoin(
+                            gdf_areas_br, limite, predicate='intersects'
+                        ).drop(columns=['index_right'])
 
-                            if not gdf_areas.empty:
-                                features_ee = [
-                                    ee.Feature(
-                                        ee.Geometry(row['geometry'].__geo_interface__),
-                                        {'nome_area': row['nome_area']}
-                                    )
-                                    for _, row in gdf_areas.iterrows()
-                                ]
-                                fc_areas = ee.FeatureCollection(features_ee)
-                                stats = img_area_km2.reduceRegions(
-                                    collection=fc_areas, reducer=ee.Reducer.sum(), scale=500
-                                ).getInfo()
-                                recs = [
-                                    {
-                                        'Área Protegida': f['properties']['nome_area'],
-                                        'Valor': round(f['properties'].get('sum', 0), 2)
-                                    }
-                                    for f in stats['features']
-                                    if f['properties'].get('sum', 0) > 0
-                                ]
-                                df_ranking_areas = pd.DataFrame(recs).sort_values(
-                                    by='Valor', ascending=False
+                        if not gdf_areas.empty:
+                            features_ee = [
+                                ee.Feature(
+                                    ee.Geometry(row['geometry'].__geo_interface__),
+                                    {'nome_area': row['nome_area']}
                                 )
-                                if not df_ranking_areas.empty:
-                                    areas_afetadas = gdf_areas[
-                                        gdf_areas['nome_area'].isin(
-                                            df_ranking_areas['Área Protegida']
-                                        )
-                                    ]
-                                    total_valor = round(df_ranking_areas['Valor'].sum(), 2)
-                                    ee_geom_afetadas = ee.Geometry(
-                                        areas_afetadas.geometry.union_all().__geo_interface__
-                                    )
-                                    area_queimada_img = area_queimada_img.clip(ee_geom_afetadas)
-                                    img_area_km2 = (
-                                        ee.Image.pixelArea().divide(1000000)
-                                        .updateMask(area_queimada_img.gt(0))
-                                    )
-                                else:
-                                    # Nenhuma área protegida teve queima detectada, mas o
-                                    # contorno das áreas da região ainda deve aparecer no mapa.
-                                    areas_afetadas = gdf_areas
-                                    total_valor = 0
-                            else:
-                                st.info(f"ℹ️ Não há {area_protegida.lower()} demarcadas na região selecionada.")
-                                total_valor = 0
-                        except Exception as _erro_areas_modis:
-                            st.warning(
-                                f"⚠️ Não foi possível carregar os limites de {area_protegida}. "
-                                f"Mostrando a área queimada total da região, sem o recorte. "
-                                f"Detalhe técnico: {_erro_areas_modis}"
+                                for _, row in gdf_areas.iterrows()
+                            ]
+                            fc_areas = ee.FeatureCollection(features_ee)
+                            stats = img_area_km2.reduceRegions(
+                                collection=fc_areas, reducer=ee.Reducer.sum(), scale=500
+                            ).getInfo()
+                            recs = [
+                                {
+                                    'Área Protegida': f['properties']['nome_area'],
+                                    'Valor': round(f['properties'].get('sum', 0), 2)
+                                }
+                                for f in stats['features']
+                                if f['properties'].get('sum', 0) > 0
+                            ]
+                            df_ranking_areas = pd.DataFrame(recs).sort_values(
+                                by='Valor', ascending=False
                             )
-                        else:
-                            st.info(f"ℹ️ Não há {area_protegida.lower()} demarcadas na região selecionada.")
+                            if not df_ranking_areas.empty:
+                                areas_afetadas = gdf_areas[
+                                    gdf_areas['nome_area'].isin(
+                                        df_ranking_areas['Área Protegida']
+                                    )
+                                ]
+                                total_valor = round(df_ranking_areas['Valor'].sum(), 2)
+                                ee_geom_afetadas = ee.Geometry(
+                                    areas_afetadas.geometry.union_all().__geo_interface__
+                                )
+                                area_queimada_img = area_queimada_img.clip(ee_geom_afetadas)
+                                img_area_km2 = (
+                                    ee.Image.pixelArea().divide(1000000)
+                                    .updateMask(area_queimada_img.gt(0))
+                                )
+                            else:
+                                total_valor = 0
 
                     # ranking de municipios e serie temporal: calculados dentro das abas
 
@@ -1261,41 +859,6 @@ if st.session_state.gerar_dashboard:
             f"⏳ **Aviso de Processamento NASA:** Os dados do satélite MODIS para "
             f"**{mes_nome} de {ano_modis}** ainda não foram publicados. "
             f"(Geralmente há atraso de 1 a 2 meses). Por favor, tente um mês anterior."
-        )
-
-    elif area_protegida != "Nenhuma" and not areas_afetadas.empty and total_valor == 0:
-        st.success(
-            f"✅ Nenhum registro de queimada foi detectado dentro de **{area_protegida}** "
-            f"em **{val_sel}** no período selecionado. A área demarcada é mostrada abaixo."
-        )
-        _centro_vazio = limite.geometry.union_all().centroid
-        m_vazio = folium.Map(
-            location=[_centro_vazio.y, _centro_vazio.x], zoom_start=8,
-            tiles="CartoDB positron"
-        )
-        folium.GeoJson(
-            limite.__geo_interface__,
-            name="Região selecionada",
-            style_function=lambda x: {
-                'fillColor': '#00d4ff', 'fillOpacity': 0.04,
-                'color': '#00d4ff', 'weight': 2, 'dashArray': '6 3',
-            },
-        ).add_to(m_vazio)
-        folium.GeoJson(
-            areas_afetadas.__geo_interface__,
-            name=area_protegida,
-            style_function=lambda x: {
-                'fillColor': '#27ae60', 'fillOpacity': 0.15,
-                'color': '#27ae60', 'weight': 1.5,
-            },
-            tooltip=folium.GeoJsonTooltip(
-                fields=['nome_area'], aliases=['📍 Área Protegida:']
-            ),
-        ).add_to(m_vazio)
-        folium.LayerControl(collapsed=False).add_to(m_vazio)
-        st_folium(
-            m_vazio, width=None, height=500, returned_objects=[],
-            key=f"mapa_vazio_{val_sel}_{area_protegida}"
         )
 
     elif total_valor == 0:
@@ -1381,26 +944,13 @@ if st.session_state.gerar_dashboard:
         # =============================================================
         # --- ABAS PRINCIPAIS ---
         # =============================================================
-        # A aba de Impacto Econômico só faz sentido com área queimada real
-        # (MODIS) — no modo Focos (INPE) ela nem aparece na barra de abas.
-        if "MODIS" in fonte_escolhida:
-            aba_mapa, aba_graficos, aba_nbr, aba_previsao, aba_impacto, aba_export = st.tabs([
-                "🗺️ Mapa de Focos",
-                "📈 Gráficos & Anomalia",
-                "🔬 Severidade (NBR Sentinel-2)",
-                "🔮 Previsão",
-                "💰 Impacto Econômico",
-                "⬇️ Exportar Dados"
-            ])
-        else:
-            aba_mapa, aba_graficos, aba_nbr, aba_previsao, aba_export = st.tabs([
-                "🗺️ Mapa de Focos",
-                "📈 Gráficos & Anomalia",
-                "🔬 Severidade (NBR Sentinel-2)",
-                "🔮 Previsão",
-                "⬇️ Exportar Dados"
-            ])
-            aba_impacto = None
+        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_export = st.tabs([
+            "🗺️ Mapa de Focos",
+            "📈 Gráficos & Anomalia",
+            "🔬 Severidade (NBR Sentinel-2)",
+            "💰 Impacto Econômico",
+            "⬇️ Exportar Dados"
+        ])
 
         # ----------------------------------------------------------
         # ABA 1 — MAPA
@@ -1574,13 +1124,7 @@ if st.session_state.gerar_dashboard:
         with aba_graficos:
             if "INPE" in fonte_escolhida:
                 st.subheader("📈 Evolução Temporal dos Focos")
-                data_col = next((c for c in df_rec.columns if 'data' in c), None)
-                if data_col is None:
-                    st.warning(
-                        "⚠️ Não foi possível identificar a coluna de data retornada pelo INPE "
-                        "para montar o gráfico de evolução temporal."
-                    )
-                    st.stop()
+                data_col = next(c for c in df_rec.columns if 'data' in c)
                 df_rec[data_col] = pd.to_datetime(df_rec[data_col])
                 freq = 'D' if (hoje - dt_ini).days <= 90 else 'MS'
                 df_g = (
@@ -2204,150 +1748,246 @@ if st.session_state.gerar_dashboard:
 
 
         # ----------------------------------------------------------
-        # ABA 3B — PREVISÃO DE SÉRIE TEMPORAL
-        # ----------------------------------------------------------
-        with aba_previsao:
-            if "INPE" in fonte_escolhida:
-                st.info(
-                    "💡 A previsão usa a série histórica mensal do MODIS (desde 2001), "
-                    "que é uma medida mais estável de área queimada do que a contagem de focos. "
-                    "Para ativá-la, selecione **🗺️ Área Queimada (NASA MODIS)** na barra lateral."
-                )
-            else:
-                st.subheader("🔮 Previsão de Área Queimada — Próximos Meses")
-                st.markdown(
-                    f"Modelo estatístico **SARIMA** (com sazonalidade anual) treinado com a série "
-                    f"histórica mensal de área queimada MODIS para projetar os próximos meses "
-                    f"em **{val_sel}**."
-                )
-
-                col_p1, col_p2 = st.columns(2)
-                with col_p1:
-                    anos_hist_sel = st.slider(
-                        "Anos de histórico para treinar o modelo:", 4, 15, 8,
-                        help=(
-                            "Mais anos = modelo mais robusto, porém mais lento "
-                            "(mais chamadas ao Earth Engine)."
-                        )
-                    )
-                with col_p2:
-                    meses_prev_sel = st.slider("Meses a projetar no futuro:", 3, 12, 6)
-
-                _prev_key = f"previsao_{val_sel}_{anos_hist_sel}"
-
-                if st.button(
-                    "📈 Gerar Previsão", type="primary",
-                    use_container_width=True, key=f"btn_prev_{val_sel}"
-                ):
-                    with st.spinner(
-                        f"🛰️ Buscando {anos_hist_sel} anos de histórico MODIS "
-                        "e ajustando o modelo… isso pode levar alguns minutos."
-                    ):
-                        try:
-                            df_serie_hist = buscar_serie_historica_modis(
-                                geom_json_str, anos_historico=anos_hist_sel
-                            )
-                            if len(df_serie_hist) < 30:
-                                st.warning(
-                                    "⚠️ Histórico insuficiente para um modelo confiável "
-                                    "(menos de ~2,5 anos de dados válidos). Tente aumentar "
-                                    "os anos de histórico ou escolher uma área diferente."
-                                )
-                            else:
-                                resultado_prev = prever_serie_temporal(
-                                    df_serie_hist, meses_previsao=meses_prev_sel
-                                )
-                                if resultado_prev is None:
-                                    st.warning(
-                                        "⚠️ Dados insuficientes para validar o modelo "
-                                        "(mínimo de ~2,5 anos de histórico é necessário)."
-                                    )
-                                else:
-                                    st.session_state[_prev_key] = {
-                                        'serie': df_serie_hist, 'resultado': resultado_prev
-                                    }
-                        except Exception as e_prev:
-                            st.error(f"⚠️ Erro ao gerar previsão: {e_prev}")
-
-                if _prev_key in st.session_state:
-                    df_serie_hist = st.session_state[_prev_key]['serie']
-                    resultado_prev = st.session_state[_prev_key]['resultado']
-                    df_prev = resultado_prev['previsao']
-
-                    st.markdown("---")
-                    st.markdown("#### 📏 Qualidade do modelo (validada com meses reais)")
-                    cm1, cm2, cm3 = st.columns(3)
-                    cm1.metric("MAE (erro médio)", f"{resultado_prev['mae']:.1f} km²")
-                    cm2.metric("RMSE", f"{resultado_prev['rmse']:.1f} km²")
-                    cm3.metric(
-                        "MAPE",
-                        f"{resultado_prev['mape']:.1f}%" if resultado_prev['mape'] is not None else "N/D"
-                    )
-                    st.caption(
-                        "MAE/RMSE em km² de área queimada · MAPE em % de erro relativo. "
-                        "Calculados comparando a previsão do modelo com os **últimos meses reais já "
-                        "observados** (holdout de validação) — não com o futuro, que ainda vai acontecer."
-                    )
-
-                    st.markdown("#### 📊 Histórico + Previsão")
-                    fig_prev = go.Figure()
-                    fig_prev.add_scatter(
-                        x=df_serie_hist['data'], y=df_serie_hist['area_km2'],
-                        mode='lines', name='Histórico (MODIS)',
-                        line=dict(color='#3498db', width=2)
-                    )
-                    fig_prev.add_scatter(
-                        x=df_prev['data'], y=df_prev['previsto'],
-                        mode='lines+markers', name='Previsão',
-                        line=dict(color='#e74c3c', width=3, dash='dash')
-                    )
-                    fig_prev.add_scatter(
-                        x=pd.concat([df_prev['data'], df_prev['data'][::-1]]),
-                        y=pd.concat([df_prev['ic_superior'], df_prev['ic_inferior'][::-1]]),
-                        fill='toself', fillcolor='rgba(231,76,60,0.15)',
-                        line=dict(width=0), name='Intervalo de confiança (80%)',
-                        hoverinfo='skip'
-                    )
-                    fig_prev.update_layout(
-                        template='plotly_dark', height=420,
-                        yaxis_title="Área Queimada (km²)", xaxis_title="",
-                        legend=dict(orientation='h', yanchor='bottom', y=1.02),
-                        margin=dict(t=40, b=20)
-                    )
-                    st.plotly_chart(fig_prev, use_container_width=True)
-
-                    st.markdown("#### 📋 Valores projetados")
-                    df_tabela_prev = df_prev.copy()
-                    df_tabela_prev['data'] = df_tabela_prev['data'].dt.strftime('%b/%Y')
-                    df_tabela_prev = df_tabela_prev.rename(columns={
-                        'data': 'Mês', 'previsto': 'Previsto (km²)',
-                        'ic_inferior': 'Mínimo esperado (km²)',
-                        'ic_superior': 'Máximo esperado (km²)'
-                    }).round(1)
-                    st.dataframe(df_tabela_prev, hide_index=True, use_container_width=True)
-
-                    area_prevista_total = df_prev['previsto'].sum()
-                    st.markdown("---")
-                    st.info(
-                        f"💰 Se a projeção se confirmar, os próximos {meses_prev_sel} meses podem "
-                        f"somar aproximadamente **{area_prevista_total:,.0f} km²** de área queimada "
-                        f"adicional em {val_sel}. Veja o prejuízo econômico estimado disso na aba "
-                        f"**💰 Impacto Econômico**."
-                    )
-                    st.caption(
-                        "⚠️ Projeção estatística baseada em padrões históricos — não considera "
-                        "eventos excepcionais (secas extremas, mudanças de política pública, "
-                        "novas frentes de desmatamento etc). Use como referência de tendência, "
-                        "não como certeza."
-                    )
-
-
-        # ----------------------------------------------------------
         # ----------------------------------------------------------
         # ABA 4 — IMPACTO ECONÔMICO
         # ----------------------------------------------------------
-        if aba_impacto is not None:
-            _renderizar_impacto_economico()
+        with aba_impacto:
+          try:
+            # --- TABELAS DE REFERÊNCIA ---
+            VALORES_ECOSSIS = {
+                "Amazônia":      {"conservador": 2000,  "moderado": 4000,  "otimista": 6000},
+                "Cerrado":       {"conservador": 800,   "moderado": 1650,  "otimista": 2500},
+                "Mata Atlântica":{"conservador": 3000,  "moderado": 5500,  "otimista": 8000},
+                "Pantanal":      {"conservador": 1500,  "moderado": 2750,  "otimista": 4000},
+                "Caatinga":      {"conservador": 400,   "moderado": 800,   "otimista": 1200},
+                "Pampa":         {"conservador": 600,   "moderado": 1050,  "otimista": 1500},
+            }
+            EMISSOES_CO2_HA = {
+                "Amazônia": 150, "Cerrado": 60, "Mata Atlântica": 120,
+                "Pantanal": 80, "Caatinga": 30, "Pampa": 25,
+            }
+            PRECO_CARBONO_USD = 15
+            CAMBIO_FIXO = buscar_cotacao_dolar()
+
+            # --- DETECTAR BIOMA ---
+            ESTADO_BIOMA = {
+                "AM": "Amazônia", "PA": "Amazônia", "AC": "Amazônia",
+                "RO": "Amazônia", "RR": "Amazônia", "AP": "Amazônia",
+                "MT": "Cerrado",  "GO": "Cerrado",  "TO": "Cerrado",
+                "MA": "Cerrado",  "PI": "Caatinga", "BA": "Caatinga",
+                "CE": "Caatinga", "RN": "Caatinga", "PB": "Caatinga",
+                "PE": "Caatinga", "AL": "Caatinga", "SE": "Caatinga",
+                "MS": "Pantanal", "PR": "Mata Atlântica",
+                "SC": "Mata Atlântica", "RS": "Pampa",
+                "SP": "Mata Atlântica", "RJ": "Mata Atlântica",
+                "ES": "Mata Atlântica", "MG": "Mata Atlântica",
+                "DF": "Cerrado",
+            }
+            bioma_detectado = (
+                bioma_dd if tipo_analise == "Por Bioma"
+                else ESTADO_BIOMA.get(estado_dd, "Cerrado")
+            )
+
+            # --- ÁREA QUEIMADA ---
+            area_km2_calc = 0.0
+            if "MODIS" in fonte_escolhida and total_valor > 0:
+                area_km2_calc = float(total_valor)
+                fonte_area = f"Satélite MODIS — {area_km2_calc:,.1f} km² queimados detectados"
+            elif "INPE" in fonte_escolhida and not df_rec.empty:
+                area_km2_calc = len(df_rec) * 0.5
+                fonte_area = f"{len(df_rec):,} focos INPE (estimativa: ~0,5 km²/foco)"
+            else:
+                fonte_area = "Sem dados de área disponíveis"
+
+            area_ha = area_km2_calc * 100
+
+            st.markdown("## 💰 Impacto Econômico das Queimadas")
+            st.markdown(
+                f"Estimativa do prejuízo causado pelas queimadas em **{val_sel}**, "
+                f"com base na área afetada e no valor dos serviços que o ecossistema presta à sociedade."
+            )
+
+            if area_km2_calc == 0:
+                st.warning(
+                    "⚠️ Nenhuma área queimada detectada para o período selecionado. "
+                    "Selecione outro mês ou ano."
+                )
+            else:
+                # Leitura dos parâmetros do session_state (definidos no expander abaixo)
+                bioma_calc = st.session_state.get("bioma_impacto",
+                    bioma_detectado if bioma_detectado in VALORES_ECOSSIS
+                    else list(VALORES_ECOSSIS.keys())[0])
+                cenario    = st.session_state.get("cenario_impacto", "moderado")
+                cambio_usd = st.session_state.get("cambio_impacto", CAMBIO_FIXO)
+
+                # --- CÁLCULOS ---
+                valor_usd_ha        = VALORES_ECOSSIS[bioma_calc][cenario]
+                valor_brl_ha        = valor_usd_ha * cambio_usd
+                fator_co2_ha        = EMISSOES_CO2_HA.get(bioma_calc, 60)
+                perda_ecossis_brl   = area_ha * valor_brl_ha
+                co2_emitido_t       = area_ha * fator_co2_ha
+                credito_carbono_brl = co2_emitido_t * PRECO_CARBONO_USD * cambio_usd
+                total_impacto_brl   = perda_ecossis_brl + credito_carbono_brl
+
+                # --- CARD PRINCIPAL ---
+                st.markdown(f"""
+                <div style="background: linear-gradient(135deg, #c0392b22, #e74c3c11);
+                            border-left: 6px solid #e74c3c; border-radius: 10px;
+                            padding: 22px 26px; margin: 16px 0;">
+                    <p style="margin: 0 0 4px 0; color: #aaa; font-size: 13px;
+                              text-transform: uppercase; letter-spacing: 1px;">
+                        Prejuízo econômico estimado — {bioma_calc} · Cenário {cenario.capitalize()}
+                    </p>
+                    <p style="font-size: 42px; font-weight: 800; margin: 0; color: #e74c3c;">
+                        R$ {total_impacto_brl/1e9:,.2f} bilhões
+                    </p>
+                    <p style="margin: 6px 0 0 0; color: #bbb; font-size: 13px;">
+                        📡 Base: {fonte_area}
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # --- 3 CARDS SECUNDÁRIOS ---
+                m1, m2, m3 = st.columns(3)
+                with m1:
+                    st.metric("🌍 Área Queimada",
+                              f"{area_km2_calc:,.1f} km²",
+                              f"{area_ha:,.0f} hectares")
+                with m2:
+                    st.metric("🌳 Perda de Serviços Ambientais",
+                              f"R$ {perda_ecossis_brl/1e9:,.2f} bi",
+                              f"R$ {valor_brl_ha:,.0f}/ha · {bioma_calc}")
+                with m3:
+                    st.metric("☁️ Carbono Emitido",
+                              f"{co2_emitido_t/1e6:,.2f} Mt CO₂e",
+                              f"≈ R$ {credito_carbono_brl/1e9:,.2f} bi em créditos perdidos")
+
+                st.markdown("---")
+
+                # --- GRÁFICO: COMPARAÇÃO DOS 3 CENÁRIOS ---
+                st.markdown("### Como o valor muda conforme o cenário?")
+                st.caption(
+                    "Cada cenário reflete um intervalo da literatura científica — "
+                    "do mais conservador (menor impacto estimado) ao otimista (maior)."
+                )
+                dados_cen = []
+                for cen_k in ["conservador", "moderado", "otimista"]:
+                    v_brl_ha_cen = VALORES_ECOSSIS[bioma_calc][cen_k] * cambio_usd
+                    perda_cen    = area_ha * v_brl_ha_cen
+                    co2_cen      = area_ha * fator_co2_ha * PRECO_CARBONO_USD * cambio_usd
+                    total_cen    = perda_cen + co2_cen
+                    dados_cen.append({
+                        "Cenário": {"conservador": "Conservador", "moderado": "Moderado",
+                                  "otimista": "Otimista"}[cen_k],
+                        "Serviços Ambientais (R$ bi)": round(perda_cen / 1e9, 2),
+                        "Créditos de Carbono (R$ bi)":  round(co2_cen / 1e9, 2),
+                        "Total (R$ bi)":                   round(total_cen / 1e9, 2),
+                    })
+                df_cen = pd.DataFrame(dados_cen)
+                fig_cen = go.Figure()
+                fig_cen.add_bar(
+                    name="Serviços Ambientais",
+                    x=df_cen["Cenário"],
+                    y=df_cen["Serviços Ambientais (R$ bi)"],
+                    marker_color="#e74c3c",
+                    text=df_cen["Serviços Ambientais (R$ bi)"].apply(lambda v: f"R$ {v:.2f} bi"),
+                    textposition="inside",
+                )
+                fig_cen.add_bar(
+                    name="Créditos de Carbono",
+                    x=df_cen["Cenário"],
+                    y=df_cen["Créditos de Carbono (R$ bi)"],
+                    marker_color="#f39c12",
+                    text=df_cen["Créditos de Carbono (R$ bi)"].apply(lambda v: f"R$ {v:.2f} bi"),
+                    textposition="inside",
+                )
+                fig_cen.update_layout(
+                    barmode="stack", template="plotly_dark", height=360,
+                    yaxis_title="R$ Bilhões",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                    margin=dict(t=40, b=20),
+                )
+                st.plotly_chart(fig_cen, use_container_width=True)
+                st.dataframe(
+                    df_cen.rename(columns={"Total (R$ bi)": "💰 Total (R$ bi)"}),
+                    hide_index=True, use_container_width=True
+                )
+
+                st.markdown("---")
+
+                # --- CONTEXTO EXPLICATIVO ---
+                st.markdown("### O que significa esse prejuízo?")
+                col_ctx1, col_ctx2 = st.columns(2)
+                with col_ctx1:
+                    st.markdown(f"""
+**Serviços ambientais** são os benefícios que a floresta entrega à sociedade sem custo:
+regulação das chuvas, filtragem da água, controle da temperatura e manutenção
+do solo e da biodiversidade. Quando uma área queima, esses benefícios deixam
+de existir por anos.
+
+Para o **{bioma_calc}**, cada hectare vale em média **R$ {valor_brl_ha:,.0f}**
+no cenário {cenario} — valor que a sociedade perde enquanto a vegetação não se recupera.
+                    """)
+                with col_ctx2:
+                    st.markdown(f"""
+**Carbono emitido:** as queimadas lançaram aproximadamente
+**{co2_emitido_t/1e6:,.2f} milhões de toneladas de CO₂** na atmosfera.
+
+No mercado voluntário de carbono, cada tonelada vale em torno de
+**R$ {PRECO_CARBONO_USD * cambio_usd:,.0f}** — o equivalente a
+**R$ {credito_carbono_brl/1e9:,.2f} bilhões** em créditos que não poderão mais
+ser gerados por essa floresta perdida.
+                    """)
+
+                st.info(
+                    "Estimativa indicativa com base em literatura científica. "
+                    "Não substitui laudo técnico para fins legais ou regulatórios."
+                )
+
+                with st.expander("⚙️ Ajustar parâmetros do cálculo"):
+                    pc1, pc2, pc3 = st.columns(3)
+                    with pc1:
+                        st.selectbox(
+                            "Bioma:", list(VALORES_ECOSSIS.keys()),
+                            index=list(VALORES_ECOSSIS.keys()).index(bioma_calc),
+                            key="bioma_impacto"
+                        )
+                    with pc2:
+                        st.selectbox(
+                            "Cenário:",
+                            ["conservador", "moderado", "otimista"],
+                            index=["conservador","moderado","otimista"].index(cenario),
+                            format_func=lambda x: {"conservador": "Conservador (mínimo)",
+                                                   "moderado": "Moderado (referência)",
+                                                   "otimista": "Otimista (máximo)"}[x],
+                            key="cenario_impacto"
+                        )
+                    with pc3:
+                        st.number_input(
+                            f"Câmbio R$/US$ (PTAX hoje: R$ {CAMBIO_FIXO:.2f}):",
+                            min_value=1.0, max_value=20.0,
+                            value=float(cambio_usd), step=0.10, key="cambio_impacto"
+                        )
+                    st.caption(
+                        "Altere os parâmetros e clique em **Gerar Dashboard** novamente para recalcular."
+                    )
+
+                with st.expander("📚 Fontes e referências"):
+                    st.markdown("""
+| Fonte | O que fornece | Site |
+|---|---|---|
+| Costanza et al. (2014) — *Global Policy* | Valor de serviços ecossistêmicos por bioma | [acessar](https://www.sciencedirect.com/science/article/pii/S0959378014000685) |
+| IPAM — Inst. de Pesquisa Ambiental da Amazônia | Custo de restauração e carbono na Amazônia | [ipam.org.br](https://ipam.org.br) |
+| TNC Brasil — The Nature Conservancy | Custo-benefício de conservação por bioma | [tnc.org.br](https://www.tnc.org.br) |
+| SEEG / Observatório do Clima | Fator de emissão de CO₂ por bioma (tCO₂e/ha) | [seeg.eco.br](https://seeg.eco.br) |
+| Ecosystem Marketplace (2023) | Preço médio de carbono no mercado voluntário | [ecosystemmarketplace.com](https://www.ecosystemmarketplace.com) |
+| CEPEA/USP | Custo de oportunidade agrícola e perdas em cadeias produtivas | [cepea.esalq.usp.br](https://www.cepea.esalq.usp.br) |
+                    """)
+
+          except Exception as _err_impacto:
+            st.error(f"⚠️ Erro na aba de Impacto Econômico: {_err_impacto}")
+            import traceback
+            st.code(traceback.format_exc(), language="python")
 
 
         # ----------------------------------------------------------
@@ -2477,7 +2117,7 @@ if st.session_state.gerar_dashboard:
                                 mime="text/csv",
                                 use_container_width=True
                             )
-                    except Exception:
+                    except:
                         pass
 
                 # NBR Severidade
