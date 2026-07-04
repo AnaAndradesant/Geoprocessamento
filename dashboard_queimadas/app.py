@@ -257,7 +257,10 @@ def carregar_areas_protegidas(tipo_area):
             gdf_areas = gdf_areas.rename(columns={'name_conservation_unit': 'nome_area'})
     gdf_areas['geometry'] = gdf_areas['geometry'].make_valid()
     gdf_areas = gdf_areas.to_crs("EPSG:4326")
-    gdf_areas['geometry'] = gdf_areas['geometry'].simplify(tolerance=0.01, preserve_topology=True)
+    # Tolerância baixa (~110m) para não distorcer áreas pequenas/estreitas
+    # (ex: terras indígenas em faixa de rio), o que antes fazia o sjoin
+    # "perder" focos que na realidade estão dentro do polígono.
+    gdf_areas['geometry'] = gdf_areas['geometry'].simplify(tolerance=0.001, preserve_topology=True)
     return gdf_areas[['nome_area', 'geometry']]
 
 import requests
@@ -746,24 +749,39 @@ if st.session_state.gerar_dashboard:
                     if 'index_right' in gdf.columns:
                         gdf = gdf.drop(columns=['index_right'])
 
-                    gdf_focos_risco = gpd.sjoin(gdf, gdf_areas, predicate='within')
+                    # Restringe às áreas protegidas que efetivamente tocam a região
+                    # analisada — usado tanto pro join com os focos quanto pra
+                    # desenhar o contorno no mapa (mesmo sem focos dentro).
+                    gdf_areas_regiao = gpd.sjoin(
+                        gdf_areas, limite[['geometry']], predicate='intersects'
+                    ).drop(columns=['index_right'], errors='ignore')[['nome_area', 'geometry']]
 
-                    if not gdf_focos_risco.empty:
-                        areas_afetadas = gdf_areas[
-                            gdf_areas['nome_area'].isin(gdf_focos_risco['nome_area'])
-                        ]
-                        focos_em_areas = pd.DataFrame(gdf_focos_risco.drop(columns="geometry"))
-                        df_ranking_areas = (
-                            focos_em_areas['nome_area']
-                            .value_counts()
-                            .reset_index()
-                        )
-                        df_ranking_areas.columns = ['Área Protegida', 'Valor']
-                        df_rec = focos_em_areas
-                        total_valor = len(df_rec)
-                    else:
+                    if gdf_areas_regiao.empty:
+                        st.info(f"ℹ️ Não há {area_protegida.lower()} demarcadas na região selecionada.")
                         df_rec = pd.DataFrame()
                         total_valor = 0
+                    else:
+                        gdf_focos_risco = gpd.sjoin(gdf, gdf_areas_regiao, predicate='within')
+
+                        if not gdf_focos_risco.empty:
+                            areas_afetadas = gdf_areas_regiao[
+                                gdf_areas_regiao['nome_area'].isin(gdf_focos_risco['nome_area'])
+                            ]
+                            focos_em_areas = pd.DataFrame(gdf_focos_risco.drop(columns="geometry"))
+                            df_ranking_areas = (
+                                focos_em_areas['nome_area']
+                                .value_counts()
+                                .reset_index()
+                            )
+                            df_ranking_areas.columns = ['Área Protegida', 'Valor']
+                            df_rec = focos_em_areas
+                            total_valor = len(df_rec)
+                        else:
+                            # Nenhum foco caiu dentro das áreas protegidas da região,
+                            # mas o contorno delas ainda deve aparecer no mapa.
+                            areas_afetadas = gdf_areas_regiao
+                            df_rec = pd.DataFrame()
+                            total_valor = 0
 
         # -------------------------------------------------------
         # FONTE: MODIS
@@ -833,7 +851,12 @@ if st.session_state.gerar_dashboard:
                                     .updateMask(area_queimada_img.gt(0))
                                 )
                             else:
+                                # Nenhuma área protegida teve queima detectada, mas o
+                                # contorno das áreas da região ainda deve aparecer no mapa.
+                                areas_afetadas = gdf_areas
                                 total_valor = 0
+                        else:
+                            st.info(f"ℹ️ Não há {area_protegida.lower()} demarcadas na região selecionada.")
 
                     # ranking de municipios e serie temporal: calculados dentro das abas
 
@@ -855,6 +878,41 @@ if st.session_state.gerar_dashboard:
             f"⏳ **Aviso de Processamento NASA:** Os dados do satélite MODIS para "
             f"**{mes_nome} de {ano_modis}** ainda não foram publicados. "
             f"(Geralmente há atraso de 1 a 2 meses). Por favor, tente um mês anterior."
+        )
+
+    elif area_protegida != "Nenhuma" and not areas_afetadas.empty and total_valor == 0:
+        st.success(
+            f"✅ Nenhum registro de queimada foi detectado dentro de **{area_protegida}** "
+            f"em **{val_sel}** no período selecionado. A área demarcada é mostrada abaixo."
+        )
+        _centro_vazio = limite.geometry.union_all().centroid
+        m_vazio = folium.Map(
+            location=[_centro_vazio.y, _centro_vazio.x], zoom_start=8,
+            tiles="CartoDB positron"
+        )
+        folium.GeoJson(
+            limite.__geo_interface__,
+            name="Região selecionada",
+            style_function=lambda x: {
+                'fillColor': '#00d4ff', 'fillOpacity': 0.04,
+                'color': '#00d4ff', 'weight': 2, 'dashArray': '6 3',
+            },
+        ).add_to(m_vazio)
+        folium.GeoJson(
+            areas_afetadas.__geo_interface__,
+            name=area_protegida,
+            style_function=lambda x: {
+                'fillColor': '#27ae60', 'fillOpacity': 0.15,
+                'color': '#27ae60', 'weight': 1.5,
+            },
+            tooltip=folium.GeoJsonTooltip(
+                fields=['nome_area'], aliases=['📍 Área Protegida:']
+            ),
+        ).add_to(m_vazio)
+        folium.LayerControl(collapsed=False).add_to(m_vazio)
+        st_folium(
+            m_vazio, width=None, height=500, returned_objects=[],
+            key=f"mapa_vazio_{val_sel}_{area_protegida}"
         )
 
     elif total_valor == 0:
