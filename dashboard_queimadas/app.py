@@ -12,6 +12,10 @@ import requests, warnings, time, unicodedata, re, json, io, calendar
 import ee
 from io import BytesIO
 import traceback
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
 
 
 
@@ -352,6 +356,212 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
         df_final = df_final.drop_duplicates()
     return df_final
 
+
+# =====================================================================
+# 🎯 MODELO PREDITIVO DE RISCO DE QUEIMADA (ML)
+# =====================================================================
+# Ideia: usar o histórico de focos (INPE) + clima diário (NASA POWER, API
+# pública e gratuita) para treinar, sob demanda, um modelo simples e
+# interpretável (Regressão Logística) que estima a probabilidade de
+# ocorrência de foco de calor na região selecionada nos próximos dias.
+# O modelo é treinado on-the-fly para a região escolhida nos filtros e
+# fica em cache por 24h (st.cache_data) para não retreinar a cada clique.
+# =====================================================================
+
+FEATURES_RISCO = [
+    "T2M", "RH2M", "PRECTOTCORR", "WS10M", "dias_secos_consecutivos",
+    "temp_media_3d", "umidade_media_3d", "chuva_acumulada_3d",
+    "temp_media_7d", "umidade_media_7d", "chuva_acumulada_7d",
+    "mes_sin", "mes_cos",
+]
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def buscar_clima_nasa_power(lat, lon, d_ini, d_fim):
+    """Clima diário (temp, umidade, chuva, vento) via NASA POWER — API pública, sem chave."""
+    url = "https://power.larc.nasa.gov/api/temporal/daily/point"
+    params = {
+        "parameters": "T2M,RH2M,PRECTOTCORR,WS10M",
+        "community": "AG",
+        "longitude": lon,
+        "latitude": lat,
+        "start": d_ini.replace("-", ""),
+        "end": d_fim.replace("-", ""),
+        "format": "JSON",
+    }
+    r = requests.get(url, params=params, timeout=60, verify=False)
+    r.raise_for_status()
+    payload = r.json()["properties"]["parameter"]
+    df = pd.DataFrame(payload)
+    df.index = pd.to_datetime(df.index, format="%Y%m%d")
+    df = df.rename_axis("data").reset_index()
+    df[["T2M", "RH2M", "PRECTOTCORR", "WS10M"]] = df[
+        ["T2M", "RH2M", "PRECTOTCORR", "WS10M"]
+    ].replace(-999, np.nan)
+    return df
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def buscar_historico_focos_diario(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim):
+    """
+    Versão 'leve' de buscar_focos_inpe, otimizada para treino do modelo:
+    busca em blocos de 7 dias (em vez de 1) e traz só a data de cada foco,
+    reduzindo bastante o número de chamadas à API do INPE para períodos longos.
+    Retorna a contagem diária de focos na região.
+    """
+    url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    dic_estados = {
+        "AC": "ACRE", "AL": "ALAGOAS", "AP": "AMAP%", "AM": "AMAZONAS",
+        "BA": "BAHIA", "CE": "CEAR%", "DF": "DISTRITO FEDERAL",
+        "ES": "ESP%RITO SANTO", "GO": "GOI%S", "MA": "MARANH%O",
+        "MT": "MATO GROSSO", "MS": "MATO GROSSO DO SUL", "MG": "MINAS GERAIS",
+        "PA": "PAR%", "PB": "PARA%BA", "PR": "PARAN%", "PE": "PERNAMBUCO",
+        "PI": "PIAU%", "RJ": "RIO DE JANEIRO", "RN": "RIO GRANDE DO NORTE",
+        "RS": "RIO GRANDE DO SUL", "RO": "ROND%NIA", "RR": "RORAIMA",
+        "SC": "SANTA CATARINA", "SP": "S%O PAULO", "SE": "SERGIPE",
+        "TO": "TOCANTINS"
+    }
+
+    if tipo == "Por Estado":
+        filtro_base = f"estado ILIKE '{dic_estados.get(val_estado, val_estado)}'"
+    elif tipo == "Por Bioma":
+        tradutor = {"Amazônia": "Amaz%nia", "Mata Atlântica": "Mata Atl%ntica"}
+        filtro_base = f"bioma ILIKE '{tradutor.get(val_bioma, val_bioma)}'"
+    else:
+        muni_curinga = re.sub(r'[aeiouáéíóúãõâêîôûAEIOUÁÉÍÓÚÃÕÂÊÎÔÛ]', '%', val_muni).replace(' ', '%')
+        filtro_base = f"estado ILIKE '{dic_estados.get(val_estado, val_estado)}' AND municipio ILIKE '{muni_curinga}%'"
+
+    dt_ini = datetime.strptime(d_ini, "%Y-%m-%d")
+    dt_fim = datetime.strptime(d_fim, "%Y-%m-%d")
+    todas_datas = []
+    cursor = dt_ini
+    while cursor <= dt_fim:
+        bloco_fim = min(cursor + timedelta(days=7), dt_fim)
+        cql = (
+            f"data_hora_gmt >= '{cursor.strftime('%Y-%m-%d')}T00:00:00' "
+            f"AND data_hora_gmt <= '{bloco_fim.strftime('%Y-%m-%d')}T23:59:59' "
+            f"AND {filtro_base}"
+        )
+        try:
+            r = session.get(
+                url,
+                params={
+                    "service": "WFS", "version": "1.0.0", "request": "GetFeature",
+                    "typeName": "bdqueimadas:focos", "outputFormat": "application/json",
+                    "propertyName": "data_hora_gmt",
+                    "CQL_FILTER": cql, "maxFeatures": 50000
+                },
+                headers=headers, verify=False, timeout=90
+            )
+            if r.status_code == 200:
+                dados = r.json()
+                if dados.get("features"):
+                    todas_datas.extend(
+                        f["properties"]["data_hora_gmt"][:10] for f in dados["features"]
+                    )
+        except Exception:
+            pass
+        cursor = bloco_fim + timedelta(days=1)
+
+    if not todas_datas:
+        return pd.DataFrame(columns=["data", "n_focos"])
+
+    df = pd.Series(todas_datas, name="data").value_counts().rename_axis("data").reset_index(name="n_focos")
+    df["data"] = pd.to_datetime(df["data"])
+    return df
+
+
+def _engenharia_features_risco(df_clima):
+    """Cria features de sazonalidade, médias móveis e dias secos consecutivos.
+    Usa shift(1) para garantir que só usamos informação disponível ATÉ ontem
+    ao prever o risco de hoje/amanhã (evita vazamento de dados)."""
+    df_clima = df_clima.sort_values("data").reset_index(drop=True)
+
+    sem_chuva = df_clima["PRECTOTCORR"].fillna(0) < 1.0
+    grupo = (~sem_chuva).cumsum()
+    df_clima["dias_secos_consecutivos"] = sem_chuva.groupby(grupo).cumsum()
+
+    for janela in [3, 7]:
+        df_clima[f"temp_media_{janela}d"] = df_clima["T2M"].rolling(janela, min_periods=1).mean()
+        df_clima[f"umidade_media_{janela}d"] = df_clima["RH2M"].rolling(janela, min_periods=1).mean()
+        df_clima[f"chuva_acumulada_{janela}d"] = df_clima["PRECTOTCORR"].rolling(janela, min_periods=1).sum()
+
+    df_clima["mes"] = df_clima["data"].dt.month
+    df_clima["mes_sin"] = np.sin(2 * np.pi * df_clima["mes"] / 12)
+    df_clima["mes_cos"] = np.cos(2 * np.pi * df_clima["mes"] / 12)
+
+    cols_shift = [c for c in df_clima.columns if c not in ("data", "mes", "mes_sin", "mes_cos")]
+    df_clima[cols_shift] = df_clima[cols_shift].shift(1)
+    return df_clima
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def treinar_modelo_risco(geom_json_str, lat, lon, tipo_analise, estado_dd, bioma_dd, municipio_dd,
+                          anos_historico=2):
+    """
+    Monta o dataset (clima + focos) para a região selecionada, treina uma
+    Regressão Logística (interpretável) e retorna o modelo, métricas e a
+    tabela de features já pronta (a última linha = condições mais recentes,
+    usada para estimar o risco atual).
+    """
+    hoje = datetime.now()
+    d_fim = (hoje - timedelta(days=2)).strftime("%Y-%m-%d")  # NASA POWER tem ~2 dias de defasagem
+    d_ini = (hoje - timedelta(days=365 * anos_historico)).strftime("%Y-%m-%d")
+
+    df_clima = buscar_clima_nasa_power(lat, lon, d_ini, d_fim)
+    if df_clima.empty or df_clima["T2M"].isna().all():
+        return None
+
+    df_focos = buscar_historico_focos_diario(tipo_analise, estado_dd, bioma_dd, municipio_dd, d_ini, d_fim)
+
+    df = _engenharia_features_risco(df_clima)
+    df = df.merge(df_focos, on="data", how="left")
+    df["n_focos"] = df["n_focos"].fillna(0)
+    df["target_foco"] = (df["n_focos"] > 0).astype(int)
+    df = df.dropna(subset=FEATURES_RISCO)
+
+    if len(df) < 60 or df["target_foco"].nunique() < 2:
+        return {"erro": "Histórico insuficiente ou sem variação de focos para treinar um modelo confiável nesta região/período."}
+
+    # Split temporal: treina no passado, avalia no período mais recente
+    corte = int(len(df) * 0.8)
+    treino, teste = df.iloc[:corte], df.iloc[corte:]
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(treino[FEATURES_RISCO])
+    X_test = scaler.transform(teste[FEATURES_RISCO])
+
+    modelo = LogisticRegression(class_weight="balanced", max_iter=1000)
+    modelo.fit(X_train, treino["target_foco"])
+
+    auc = None
+    if teste["target_foco"].nunique() == 2:
+        proba_teste = modelo.predict_proba(X_test)[:, 1]
+        auc = roc_auc_score(teste["target_foco"], proba_teste)
+
+    # Probabilidade estimada para o próximo dia, usando as condições mais recentes disponíveis
+    ultima_linha = df.iloc[[-1]]
+    X_ultima = scaler.transform(ultima_linha[FEATURES_RISCO])
+    prob_atual = float(modelo.predict_proba(X_ultima)[0, 1])
+
+    # Contribuição de cada feature para a previsão atual (coef * valor padronizado)
+    contrib = pd.DataFrame({
+        "feature": FEATURES_RISCO,
+        "contribuicao": (modelo.coef_[0] * X_ultima[0]),
+    }).sort_values("contribuicao", key=abs, ascending=False)
+
+    return {
+        "modelo": modelo, "scaler": scaler, "auc": auc,
+        "prob_atual": prob_atual, "contrib": contrib,
+        "df_historico": df, "data_referencia": ultima_linha["data"].iloc[0],
+        "n_dias_treino": len(treino), "n_dias_teste": len(teste),
+        "taxa_base": df["target_foco"].mean(),
+    }
 
 
 @st.cache_data
@@ -944,12 +1154,13 @@ if st.session_state.gerar_dashboard:
         # =============================================================
         # --- ABAS PRINCIPAIS ---
         # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_export = st.tabs([
+        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_export, aba_risco = st.tabs([
             "🗺️ Mapa de Focos",
             "📈 Gráficos & Anomalia",
             "🔬 Severidade (NBR Sentinel-2)",
             "💰 Impacto Econômico",
-            "⬇️ Exportar Dados"
+            "⬇️ Exportar Dados",
+            "🎯 Risco Preditivo (ML)"
         ])
 
         # ----------------------------------------------------------
@@ -2135,6 +2346,117 @@ ser gerados por essa floresta perdida.
                         mime="text/csv",
                         use_container_width=True
                     )
+
+        # ----------------------------------------------------------
+        # ABA 6 — RISCO PREDITIVO (MACHINE LEARNING)
+        # ----------------------------------------------------------
+        with aba_risco:
+            st.subheader("🎯 Risco Preditivo de Queimada")
+            st.caption(
+                "Modelo de Regressão Logística treinado sob demanda com clima "
+                "(NASA POWER) e histórico de focos (INPE) da região selecionada. "
+                "Estima a probabilidade de ocorrência de foco de calor nos próximos dias."
+            )
+
+            try:
+                ponto_ref = geom_unida.representative_point()
+                lon_ref, lat_ref = ponto_ref.x, ponto_ref.y
+
+                anos_hist = st.select_slider(
+                    "Histórico usado para treinar o modelo:",
+                    options=[1, 2, 3], value=2,
+                    format_func=lambda x: f"{x} ano(s)",
+                    key="anos_hist_risco"
+                )
+
+                if st.button("🧠 Calcular Risco Preditivo", use_container_width=True):
+                    with st.spinner("Treinando modelo com dados climáticos e histórico de focos..."):
+                        resultado = treinar_modelo_risco(
+                            geom_json_str, lat_ref, lon_ref,
+                            tipo_analise, estado_dd, bioma_dd, municipio_dd,
+                            anos_historico=anos_hist
+                        )
+
+                    if resultado is None:
+                        st.error(
+                            "⚠️ Não foi possível obter dados climáticos (NASA POWER) para esta região. "
+                            "Tente novamente em instantes."
+                        )
+                    elif "erro" in resultado:
+                        st.warning(f"⚠️ {resultado['erro']}")
+                    else:
+                        prob = resultado["prob_atual"]
+                        if prob < 0.25:
+                            nivel, cor = "Baixo", "🟢"
+                        elif prob < 0.50:
+                            nivel, cor = "Moderado", "🟡"
+                        elif prob < 0.75:
+                            nivel, cor = "Alto", "🟠"
+                        else:
+                            nivel, cor = "Crítico", "🔴"
+
+                        col_r1, col_r2, col_r3 = st.columns(3)
+                        with col_r1:
+                            st.metric(
+                                "Probabilidade estimada (próximo dia)",
+                                f"{prob:.1%}",
+                                help=f"Baseado nas condições climáticas mais recentes disponíveis "
+                                     f"({resultado['data_referencia'].strftime('%d/%m/%Y')})"
+                            )
+                        with col_r2:
+                            st.metric("Nível de Risco", f"{cor} {nivel}")
+                        with col_r3:
+                            auc_txt = f"{resultado['auc']:.2f}" if resultado["auc"] is not None else "N/D"
+                            st.metric("Desempenho do modelo (AUC-ROC)", auc_txt)
+
+                        st.markdown("---")
+                        st.markdown("**🔍 O que está pesando nessa previsão:**")
+                        fig_contrib = px.bar(
+                            resultado["contrib"], x="contribuicao", y="feature",
+                            orientation="h", color="contribuicao",
+                            color_continuous_scale=["#2ecc71", "#f1c40f", "#e74c3c"],
+                            title="Contribuição de cada variável para o risco atual"
+                        )
+                        fig_contrib.update_layout(
+                            template="plotly_dark", height=400,
+                            yaxis={'categoryorder': 'total ascending'},
+                            coloraxis_showscale=False,
+                            xaxis_title="Contribuição (+ aumenta risco / - reduz risco)",
+                            yaxis_title=""
+                        )
+                        st.plotly_chart(fig_contrib, use_container_width=True)
+
+                        with st.expander("📊 Detalhes do treinamento do modelo"):
+                            st.write(
+                                f"- Dias usados no treino: **{resultado['n_dias_treino']}** | "
+                                f"Dias usados no teste (mais recentes): **{resultado['n_dias_teste']}**"
+                            )
+                            st.write(
+                                f"- Taxa histórica de dias com foco na região: "
+                                f"**{resultado['taxa_base']:.1%}**"
+                            )
+                            st.caption(
+                                "O modelo é treinado com split temporal (treino no passado, teste no "
+                                "período mais recente) para simular o uso real: prever o que ainda não "
+                                "aconteceu. AUC-ROC de 0.5 = aleatório, 1.0 = perfeito."
+                            )
+
+                        st.info(
+                            "💡 **Nota metodológica:** este modelo é uma prova de conceito educacional "
+                            "(MBA), com propósito de demonstrar como Machine Learning pode agregar uma "
+                            "camada preditiva a um dashboard hoje descritivo. Para uso operacional real, "
+                            "recomenda-se incorporar variáveis adicionais (NDVI, uso do solo, direção do "
+                            "vento, distância de estradas) e comparar com modelos mais robustos "
+                            "(Random Forest, XGBoost)."
+                        )
+                else:
+                    st.info(
+                        "👆 Clique no botão acima para treinar o modelo e calcular o risco "
+                        "para a região e período selecionados nos filtros."
+                    )
+            except Exception as _err_risco:
+                st.error(f"⚠️ Erro na aba de Risco Preditivo: {_err_risco}")
+                st.code(traceback.format_exc(), language="python")
 
 else:
     st.info(
