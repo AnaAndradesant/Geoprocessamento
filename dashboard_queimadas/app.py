@@ -402,10 +402,10 @@ def buscar_clima_nasa_power(lat, lon, d_ini, d_fim):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def buscar_historico_focos_diario(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim):
+def buscar_historico_focos_diario(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, dias_bloco=7):
     """
     Versão 'leve' de buscar_focos_inpe, otimizada para treino do modelo:
-    busca em blocos de 7 dias (em vez de 1) e traz só a data de cada foco,
+    busca em blocos de N dias (em vez de 1) e traz só a data de cada foco,
     reduzindo bastante o número de chamadas à API do INPE para períodos longos.
     Retorna a contagem diária de focos na região.
     """
@@ -441,7 +441,7 @@ def buscar_historico_focos_diario(tipo, val_estado, val_bioma, val_muni, d_ini, 
     todas_datas = []
     cursor = dt_ini
     while cursor <= dt_fim:
-        bloco_fim = min(cursor + timedelta(days=7), dt_fim)
+        bloco_fim = min(cursor + timedelta(days=dias_bloco), dt_fim)
         cql = (
             f"data_hora_gmt >= '{cursor.strftime('%Y-%m-%d')}T00:00:00' "
             f"AND data_hora_gmt <= '{bloco_fim.strftime('%Y-%m-%d')}T23:59:59' "
@@ -501,67 +501,148 @@ def _engenharia_features_risco(df_clima):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def treinar_modelo_risco(geom_json_str, lat, lon, tipo_analise, estado_dd, bioma_dd, municipio_dd,
-                          anos_historico=2):
+def obter_municipios_regiao(tipo_analise, estado_dd, bioma_dd, municipio_dd, max_municipios=50, seed=42):
     """
-    Monta o dataset (clima + focos) para a região selecionada, treina uma
-    Regressão Logística (interpretável) e retorna o modelo, métricas e a
-    tabela de features já pronta (a última linha = condições mais recentes,
-    usada para estimar o risco atual).
+    Retorna os municípios que compõem a região selecionada (estado inteiro,
+    bioma inteiro, ou o próprio município), já com lat/lon do centro de cada um.
+    Se a região tiver mais municípios que max_municipios, uma amostra aleatória
+    (com seed fixa, reprodutível) é usada — necessário para biomas enormes como
+    a Amazônia, que têm centenas de municípios.
     """
+    if tipo_analise == "Por Município":
+        gdf = read_municipality(code_muni=estado_dd, year=2020)
+        busca = normalizar_texto(municipio_dd.strip())
+        gdf['nome_norm'] = gdf['name_muni'].apply(normalizar_texto)
+        gdf = gdf[gdf['nome_norm'].str.contains(busca)]
+    elif tipo_analise == "Por Estado":
+        gdf = read_municipality(code_muni=estado_dd, year=2020)
+    else:  # Por Bioma
+        gdf_bioma = read_biomes(year=2019)
+        gdf_bioma = gdf_bioma[gdf_bioma['name_biome'] == bioma_dd]
+        gdf_todos = read_municipality(code_muni="all", year=2020)
+        gdf_bioma = gdf_bioma.to_crs(gdf_todos.crs)
+        gdf = gpd.sjoin(gdf_todos, gdf_bioma[['geometry']], predicate='intersects', how='inner')
+        gdf = gdf.drop(columns=['index_right'], errors='ignore').drop_duplicates(subset=['code_muni'])
+
+    if gdf.empty:
+        return gdf
+
+    gdf = gdf.to_crs("EPSG:4326")
+    gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.01, preserve_topology=True)
+    pontos = gdf.geometry.representative_point()
+    gdf['lat'] = pontos.y
+    gdf['lon'] = pontos.x
+
+    total_disponivel = len(gdf)
+    amostrado = total_disponivel > max_municipios
+    if amostrado:
+        gdf = gdf.sample(n=max_municipios, random_state=seed)
+
+    gdf['total_disponivel'] = total_disponivel
+    gdf['amostrado_flag'] = amostrado
+    cols = ['name_muni', 'abbrev_state', 'lat', 'lon', 'geometry', 'total_disponivel', 'amostrado_flag']
+    return gdf[[c for c in cols if c in gdf.columns]].reset_index(drop=True)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_dd,
+                                   anos_historico=2, n_amostra_treino=8):
+    """
+    Treina UM modelo (Regressão Logística) usando dados agrupados de vários
+    municípios da região selecionada (não mais um único ponto central).
+    Isso torna o modelo representativo do bioma/estado inteiro, e não só do
+    centroide. Usa TODOS OS DIAS do período de histórico para cada município
+    amostrado (clima + presença/ausência de foco), não uma amostra de dias.
+    """
+    gdf_treino = obter_municipios_regiao(tipo_analise, estado_dd, bioma_dd, municipio_dd,
+                                          max_municipios=n_amostra_treino)
+    if gdf_treino.empty:
+        return {"erro": "Não foi possível localizar municípios para esta região."}
+
     hoje = datetime.now()
-    d_fim = (hoje - timedelta(days=2)).strftime("%Y-%m-%d")  # NASA POWER tem ~2 dias de defasagem
+    d_fim = (hoje - timedelta(days=2)).strftime("%Y-%m-%d")
     d_ini = (hoje - timedelta(days=365 * anos_historico)).strftime("%Y-%m-%d")
 
-    df_clima = buscar_clima_nasa_power(lat, lon, d_ini, d_fim)
-    if df_clima.empty or df_clima["T2M"].isna().all():
-        return None
+    frames = []
+    for _, row in gdf_treino.iterrows():
+        df_clima = buscar_clima_nasa_power(row['lat'], row['lon'], d_ini, d_fim)
+        if df_clima.empty or df_clima["T2M"].isna().all():
+            continue
+        df_focos = buscar_historico_focos_diario(
+            "Por Município", row['abbrev_state'], bioma_dd, row['name_muni'], d_ini, d_fim, dias_bloco=14
+        )
+        df_m = _engenharia_features_risco(df_clima)
+        df_m = df_m.merge(df_focos, on="data", how="left")
+        df_m["n_focos"] = df_m["n_focos"].fillna(0)
+        df_m["target_foco"] = (df_m["n_focos"] > 0).astype(int)
+        df_m["municipio"] = row['name_muni']
+        frames.append(df_m)
 
-    df_focos = buscar_historico_focos_diario(tipo_analise, estado_dd, bioma_dd, municipio_dd, d_ini, d_fim)
+    if not frames:
+        return {"erro": "Não foi possível obter dados climáticos para os municípios amostrados. Tente novamente."}
 
-    df = _engenharia_features_risco(df_clima)
-    df = df.merge(df_focos, on="data", how="left")
-    df["n_focos"] = df["n_focos"].fillna(0)
-    df["target_foco"] = (df["n_focos"] > 0).astype(int)
-    df = df.dropna(subset=FEATURES_RISCO)
-
-    if len(df) < 60 or df["target_foco"].nunique() < 2:
+    df = pd.concat(frames, ignore_index=True).dropna(subset=FEATURES_RISCO)
+    if len(df) < 100 or df["target_foco"].nunique() < 2:
         return {"erro": "Histórico insuficiente ou sem variação de focos para treinar um modelo confiável nesta região/período."}
 
-    # Split temporal: treina no passado, avalia no período mais recente
-    corte = int(len(df) * 0.8)
-    treino, teste = df.iloc[:corte], df.iloc[corte:]
+    # Split TEMPORAL pooled: mesmo corte de data para todos os municípios
+    # (treina no passado de todos eles, testa no período mais recente de todos eles)
+    datas_unicas = sorted(df["data"].unique())
+    corte_data = datas_unicas[int(len(datas_unicas) * 0.8)]
+    treino, teste = df[df["data"] < corte_data], df[df["data"] >= corte_data]
 
     scaler = StandardScaler()
     X_train = scaler.fit_transform(treino[FEATURES_RISCO])
-    X_test = scaler.transform(teste[FEATURES_RISCO])
-
     modelo = LogisticRegression(class_weight="balanced", max_iter=1000)
     modelo.fit(X_train, treino["target_foco"])
 
     auc = None
-    if teste["target_foco"].nunique() == 2:
-        proba_teste = modelo.predict_proba(X_test)[:, 1]
-        auc = roc_auc_score(teste["target_foco"], proba_teste)
+    if teste["target_foco"].nunique() == 2 and len(teste) > 0:
+        X_test = scaler.transform(teste[FEATURES_RISCO])
+        auc = roc_auc_score(teste["target_foco"], modelo.predict_proba(X_test)[:, 1])
 
-    # Probabilidade estimada para o próximo dia, usando as condições mais recentes disponíveis
-    ultima_linha = df.iloc[[-1]]
-    X_ultima = scaler.transform(ultima_linha[FEATURES_RISCO])
-    prob_atual = float(modelo.predict_proba(X_ultima)[0, 1])
-
-    # Contribuição de cada feature para a previsão atual (coef * valor padronizado)
-    contrib = pd.DataFrame({
-        "feature": FEATURES_RISCO,
-        "contribuicao": (modelo.coef_[0] * X_ultima[0]),
-    }).sort_values("contribuicao", key=abs, ascending=False)
+    # Climatologia mensal: taxa histórica média de dias-com-foco por mês,
+    # calculada com TODOS os dias observados (usada para a estimativa "próximo mês")
+    climatologia_mensal = df.groupby("mes")["target_foco"].mean().to_dict()
 
     return {
         "modelo": modelo, "scaler": scaler, "auc": auc,
-        "prob_atual": prob_atual, "contrib": contrib,
-        "df_historico": df, "data_referencia": ultima_linha["data"].iloc[0],
+        "climatologia_mensal": climatologia_mensal,
+        "municipios_treino": sorted(df["municipio"].unique().tolist()),
+        "n_municipios_treino": df["municipio"].nunique(),
         "n_dias_treino": len(treino), "n_dias_teste": len(teste),
+        "n_linhas_total": len(df),
         "taxa_base": df["target_foco"].mean(),
+        "amostrado_treino": bool(gdf_treino["amostrado_flag"].iloc[0]),
+        "total_disponivel": int(gdf_treino["total_disponivel"].iloc[0]),
     }
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def buscar_condicoes_atuais(lat, lon):
+    """Busca só os últimos ~35 dias de clima (leve, rápido) para calcular o
+    risco ATUAL de um ponto específico — usado para colorir cada município no mapa."""
+    hoje = datetime.now()
+    d_fim = (hoje - timedelta(days=2)).strftime("%Y-%m-%d")
+    d_ini = (hoje - timedelta(days=35)).strftime("%Y-%m-%d")
+    df_clima = buscar_clima_nasa_power(lat, lon, d_ini, d_fim)
+    if df_clima.empty or df_clima["T2M"].isna().all():
+        return None
+    df_feat = _engenharia_features_risco(df_clima).dropna(subset=FEATURES_RISCO)
+    if df_feat.empty:
+        return None
+    return df_feat.iloc[[-1]]
+
+
+def classificar_risco(prob):
+    if prob < 0.25:
+        return "Baixo", "🟢", "#2ecc71"
+    elif prob < 0.50:
+        return "Moderado", "🟡", "#f1c40f"
+    elif prob < 0.75:
+        return "Alto", "🟠", "#e67e22"
+    else:
+        return "Crítico", "🔴", "#e74c3c"
 
 
 @st.cache_data
@@ -2351,108 +2432,251 @@ ser gerados por essa floresta perdida.
         # ABA 6 — RISCO PREDITIVO (MACHINE LEARNING)
         # ----------------------------------------------------------
         with aba_risco:
-            st.subheader("🎯 Risco Preditivo de Queimada")
-            st.caption(
-                "Modelo de Regressão Logística treinado sob demanda com clima "
-                "(NASA POWER) e histórico de focos (INPE) da região selecionada. "
-                "Estima a probabilidade de ocorrência de foco de calor nos próximos dias."
-            )
+            st.subheader("🎯 Risco Preditivo de Queimada — Mapa por Município")
 
-            try:
-                ponto_ref = geom_unida.representative_point()
-                lon_ref, lat_ref = ponto_ref.x, ponto_ref.y
-
-                anos_hist = st.select_slider(
-                    "Histórico usado para treinar o modelo:",
-                    options=[1, 2, 3], value=2,
-                    format_func=lambda x: f"{x} ano(s)",
-                    key="anos_hist_risco"
+            with st.expander("ℹ️ Como esse modelo funciona (leia antes de treinar)", expanded=False):
+                st.markdown(
+                    "- O modelo é treinado com uma **amostra de municípios** da região selecionada "
+                    "(bioma ou estado inteiro — não é mais um único ponto central).\n"
+                    "- Para **cada** município da amostra, o modelo usa **todos os dias** do período "
+                    "de histórico escolhido (clima diário + se houve ou não foco de calor naquele dia) "
+                    "— não é uma amostra de dias, é o histórico diário completo.\n"
+                    "- Depois de treinado, o mesmo modelo é aplicado às condições climáticas **atuais** "
+                    "de cada município da região (podendo ser um conjunto maior que o usado no treino) "
+                    "para colorir o mapa.\n"
+                    "- **Amanhã** usa o clima real mais recente disponível. **Próximo mês** é uma "
+                    "**estimativa sazonal** (compara o risco atual com o padrão histórico do mês "
+                    "seguinte) — não existe fonte gratuita de previsão climática de 30 dias, então isso "
+                    "não é uma previsão dia-a-dia, e sim uma tendência baseada em climatologia."
                 )
 
-                if st.button("🧠 Calcular Risco Preditivo", use_container_width=True):
-                    with st.spinner("Treinando modelo com dados climáticos e histórico de focos..."):
-                        resultado = treinar_modelo_risco(
-                            geom_json_str, lat_ref, lon_ref,
-                            tipo_analise, estado_dd, bioma_dd, municipio_dd,
-                            anos_historico=anos_hist
+            try:
+                col_p1, col_p2, col_p3 = st.columns(3)
+                with col_p1:
+                    anos_hist = st.select_slider(
+                        "Histórico para treinar o modelo:",
+                        options=[1, 2, 3], value=2,
+                        format_func=lambda x: f"{x} ano(s)",
+                        key="anos_hist_risco"
+                    )
+                with col_p2:
+                    if tipo_analise == "Por Município":
+                        n_amostra_treino = 1
+                        st.select_slider(
+                            "Municípios usados no treino:",
+                            options=[1], value=1,
+                            key="n_treino_risco_muni",
+                            disabled=True,
+                            help="Análise 'Por Município' treina só com o município selecionado."
                         )
+                    else:
+                        n_amostra_treino = st.select_slider(
+                            "Municípios usados no treino:",
+                            options=[5, 8, 12, 15, 20], value=8,
+                            key="n_treino_risco",
+                            help="Mais municípios = modelo mais representativo do bioma/estado, "
+                                 "porém mais lento para treinar."
+                        )
+                with col_p3:
+                    horizonte = st.radio(
+                        "Horizonte da previsão:",
+                        ["Amanhã", "Próximo mês"],
+                        key="horizonte_risco",
+                        help="'Próximo mês' é uma estimativa sazonal (climatologia), não uma previsão exata."
+                    )
 
-                    if resultado is None:
-                        st.error(
-                            "⚠️ Não foi possível obter dados climáticos (NASA POWER) para esta região. "
-                            "Tente novamente em instantes."
-                        )
-                    elif "erro" in resultado:
+                max_mapa = st.select_slider(
+                    "Municípios exibidos no mapa (região inteira):",
+                    options=[15, 30, 50, 80], value=30,
+                    key="max_mapa_risco",
+                    help="Quantos municípios da região terão o risco calculado e coloridos no mapa."
+                )
+
+                if st.button("🧠 Treinar Modelo e Gerar Mapa de Risco", use_container_width=True):
+                    status = st.status("Treinando modelo regional...", expanded=True)
+
+                    status.write(f"🔎 Selecionando municípios de '{val_sel}' para treino...")
+                    resultado = treinar_modelo_risco_regional(
+                        tipo_analise, estado_dd, bioma_dd, municipio_dd,
+                        anos_historico=anos_hist, n_amostra_treino=n_amostra_treino
+                    )
+
+                    if "erro" in resultado:
+                        status.update(label="Falha no treino", state="error")
                         st.warning(f"⚠️ {resultado['erro']}")
                     else:
-                        prob = resultado["prob_atual"]
-                        if prob < 0.25:
-                            nivel, cor = "Baixo", "🟢"
-                        elif prob < 0.50:
-                            nivel, cor = "Moderado", "🟡"
-                        elif prob < 0.75:
-                            nivel, cor = "Alto", "🟠"
+                        status.write(
+                            f"✅ Modelo treinado com **{resultado['n_municipios_treino']} município(s)** "
+                            f"({resultado['n_linhas_total']} dias no total, todos os dias do período). "
+                            f"AUC-ROC no teste: **{resultado['auc']:.2f}**" if resultado["auc"] else
+                            f"✅ Modelo treinado com {resultado['n_municipios_treino']} município(s)."
+                        )
+                        if resultado["amostrado_treino"]:
+                            status.write(
+                                f"ℹ️ A região tem {resultado['total_disponivel']} municípios — "
+                                f"uma amostra foi usada para o treino ser mais rápido."
+                            )
+
+                        status.write("🗺️ Buscando lista de municípios para o mapa...")
+                        gdf_mapa = obter_municipios_regiao(
+                            tipo_analise, estado_dd, bioma_dd, municipio_dd, max_municipios=max_mapa
+                        )
+
+                        status.write(f"🌡️ Calculando risco atual em {len(gdf_mapa)} município(s)...")
+                        modelo, scaler = resultado["modelo"], resultado["scaler"]
+                        hoje = datetime.now()
+                        mes_atual = hoje.month
+                        mes_alvo = (mes_atual % 12) + 1
+                        clima_mensal = resultado["climatologia_mensal"]
+                        clim_atual = clima_mensal.get(mes_atual, resultado["taxa_base"])
+                        clim_alvo = clima_mensal.get(mes_alvo, resultado["taxa_base"])
+                        fator_sazonal = clim_alvo / max(clim_atual, 1e-6)
+
+                        linhas_resultado = []
+                        cond_por_municipio = {}
+                        for _, row in gdf_mapa.iterrows():
+                            cond = buscar_condicoes_atuais(row["lat"], row["lon"])
+                            if cond is None:
+                                continue
+                            X = scaler.transform(cond[FEATURES_RISCO])
+                            prob_amanha = float(modelo.predict_proba(X)[0, 1])
+                            if horizonte == "Próximo mês":
+                                prob_final = float(np.clip(prob_amanha * fator_sazonal, 0, 1))
+                            else:
+                                prob_final = prob_amanha
+                            nivel, emoji, cor_hex = classificar_risco(prob_final)
+                            linhas_resultado.append({
+                                "name_muni": row["name_muni"], "lat": row["lat"], "lon": row["lon"],
+                                "probabilidade": prob_final, "nivel": nivel, "emoji": emoji, "cor": cor_hex,
+                            })
+                            cond_por_municipio[row["name_muni"]] = (cond, X)
+
+                        status.update(label="✅ Mapa de risco pronto", state="complete")
+
+                    if "erro" not in resultado:
+                        if not linhas_resultado:
+                            st.error("⚠️ Não foi possível calcular o risco atual para os municípios desta região.")
                         else:
-                            nivel, cor = "Crítico", "🔴"
+                            df_res = pd.DataFrame(linhas_resultado)
+                            df_res["probabilidade_fmt"] = df_res["probabilidade"].apply(lambda p: f"{p:.0%}")
 
-                        col_r1, col_r2, col_r3 = st.columns(3)
-                        with col_r1:
-                            st.metric(
-                                "Probabilidade estimada (próximo dia)",
-                                f"{prob:.1%}",
-                                help=f"Baseado nas condições climáticas mais recentes disponíveis "
-                                     f"({resultado['data_referencia'].strftime('%d/%m/%Y')})"
-                            )
-                        with col_r2:
-                            st.metric("Nível de Risco", f"{cor} {nivel}")
-                        with col_r3:
-                            auc_txt = f"{resultado['auc']:.2f}" if resultado["auc"] is not None else "N/D"
-                            st.metric("Desempenho do modelo (AUC-ROC)", auc_txt)
+                            st.markdown("---")
+                            titulo_horiz = "Amanhã" if horizonte == "Amanhã" else f"Próximo mês (estimativa sazonal)"
+                            st.markdown(f"### Risco por município — {titulo_horiz}")
 
-                        st.markdown("---")
-                        st.markdown("**🔍 O que está pesando nessa previsão:**")
-                        fig_contrib = px.bar(
-                            resultado["contrib"], x="contribuicao", y="feature",
-                            orientation="h", color="contribuicao",
-                            color_continuous_scale=["#2ecc71", "#f1c40f", "#e74c3c"],
-                            title="Contribuição de cada variável para o risco atual"
-                        )
-                        fig_contrib.update_layout(
-                            template="plotly_dark", height=400,
-                            yaxis={'categoryorder': 'total ascending'},
-                            coloraxis_showscale=False,
-                            xaxis_title="Contribuição (+ aumenta risco / - reduz risco)",
-                            yaxis_title=""
-                        )
-                        st.plotly_chart(fig_contrib, use_container_width=True)
+                            contagem = df_res["nivel"].value_counts()
+                            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                            col_m1.metric("🟢 Baixo", int(contagem.get("Baixo", 0)))
+                            col_m2.metric("🟡 Moderado", int(contagem.get("Moderado", 0)))
+                            col_m3.metric("🟠 Alto", int(contagem.get("Alto", 0)))
+                            col_m4.metric("🔴 Crítico", int(contagem.get("Crítico", 0)))
 
-                        with st.expander("📊 Detalhes do treinamento do modelo"):
-                            st.write(
-                                f"- Dias usados no treino: **{resultado['n_dias_treino']}** | "
-                                f"Dias usados no teste (mais recentes): **{resultado['n_dias_teste']}**"
+                            # ---- Mapa ----
+                            gdf_render = gdf_mapa.merge(
+                                df_res[["name_muni", "probabilidade", "probabilidade_fmt", "nivel", "cor"]],
+                                on="name_muni", how="inner"
                             )
-                            st.write(
-                                f"- Taxa histórica de dias com foco na região: "
-                                f"**{resultado['taxa_base']:.1%}**"
+                            centro_mapa = geom_unida.centroid
+                            m_risco = folium.Map(
+                                location=[centro_mapa.y, centro_mapa.x],
+                                zoom_start=6 if tipo_analise != "Por Município" else 10,
+                                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                                attr="Esri", prefer_canvas=True,
                             )
-                            st.caption(
-                                "O modelo é treinado com split temporal (treino no passado, teste no "
-                                "período mais recente) para simular o uso real: prever o que ainda não "
-                                "aconteceu. AUC-ROC de 0.5 = aleatório, 1.0 = perfeito."
+                            folium.GeoJson(
+                                gdf_render.__geo_interface__,
+                                name="Risco de queimada por município",
+                                style_function=lambda feat: {
+                                    "fillColor": feat["properties"]["cor"],
+                                    "fillOpacity": 0.6,
+                                    "color": "#2c3e50",
+                                    "weight": 1,
+                                },
+                                tooltip=folium.GeoJsonTooltip(
+                                    fields=["name_muni", "nivel", "probabilidade_fmt"],
+                                    aliases=["Município:", "Risco:", "Probabilidade:"],
+                                    style=(
+                                        "font-size:12px; background:white; color:#2c3e50; "
+                                        "border-radius:6px; box-shadow:2px 2px 6px rgba(0,0,0,0.25);"
+                                    ),
+                                ),
+                            ).add_to(m_risco)
+
+                            legenda_risco = """
+                            <div style="position: fixed; bottom: 30px; left: 30px; z-index:9999;
+                                        background: rgba(30,30,30,0.9); padding: 12px 16px; border-radius: 10px;
+                                        color: white; font-size: 13px; box-shadow: 2px 2px 8px rgba(0,0,0,0.4);">
+                                <b>🎯 Nível de Risco</b><br>
+                                <span style="color:#2ecc71;">●</span> Baixo (&lt;25%)<br>
+                                <span style="color:#f1c40f;">●</span> Moderado (25-50%)<br>
+                                <span style="color:#e67e22;">●</span> Alto (50-75%)<br>
+                                <span style="color:#e74c3c;">●</span> Crítico (≥75%)
+                            </div>
+                            """
+                            m_risco.get_root().html.add_child(folium.Element(legenda_risco))
+                            folium.LayerControl(collapsed=False).add_to(m_risco)
+                            st_folium(m_risco, width=None, height=650, returned_objects=[], key="mapa_risco_ml")
+
+                            # ---- Ranking dos municípios em maior risco ----
+                            st.markdown("**🔥 Municípios com maior risco na região:**")
+                            st.dataframe(
+                                df_res.sort_values("probabilidade", ascending=False)
+                                      .head(10)[["name_muni", "probabilidade_fmt", "nivel"]]
+                                      .rename(columns={"name_muni": "Município", "probabilidade_fmt": "Probabilidade", "nivel": "Nível"}),
+                                use_container_width=True, hide_index=True
                             )
 
-                        st.info(
-                            "💡 **Nota metodológica:** este modelo é uma prova de conceito educacional "
-                            "(MBA), com propósito de demonstrar como Machine Learning pode agregar uma "
-                            "camada preditiva a um dashboard hoje descritivo. Para uso operacional real, "
-                            "recomenda-se incorporar variáveis adicionais (NDVI, uso do solo, direção do "
-                            "vento, distância de estradas) e comparar com modelos mais robustos "
-                            "(Random Forest, XGBoost)."
-                        )
+                            # ---- Explicabilidade do município mais crítico ----
+                            municipio_top = df_res.sort_values("probabilidade", ascending=False).iloc[0]["name_muni"]
+                            cond_top, X_top = cond_por_municipio[municipio_top]
+                            contrib = pd.DataFrame({
+                                "feature": FEATURES_RISCO,
+                                "contribuicao": (modelo.coef_[0] * X_top[0]),
+                            }).sort_values("contribuicao", key=abs, ascending=False)
+
+                            st.markdown(f"**🔍 Por que {municipio_top} está com o maior risco:**")
+                            fig_contrib = px.bar(
+                                contrib, x="contribuicao", y="feature",
+                                orientation="h", color="contribuicao",
+                                color_continuous_scale=["#2ecc71", "#f1c40f", "#e74c3c"],
+                            )
+                            fig_contrib.update_layout(
+                                template="plotly_dark", height=380,
+                                yaxis={'categoryorder': 'total ascending'},
+                                coloraxis_showscale=False,
+                                xaxis_title="Contribuição (+ aumenta risco / - reduz risco)",
+                                yaxis_title=""
+                            )
+                            st.plotly_chart(fig_contrib, use_container_width=True)
+
+                            with st.expander("📊 Detalhes do treinamento do modelo"):
+                                st.write(f"- Municípios usados no treino: **{', '.join(resultado['municipios_treino'])}**")
+                                st.write(
+                                    f"- Dias de treino: **{resultado['n_dias_treino']}** | "
+                                    f"Dias de teste (mais recentes): **{resultado['n_dias_teste']}**"
+                                )
+                                st.write(f"- Taxa histórica média de dias com foco: **{resultado['taxa_base']:.1%}**")
+                                if horizonte == "Próximo mês":
+                                    st.write(
+                                        f"- Fator sazonal aplicado (mês {mes_atual} → mês {mes_alvo}): "
+                                        f"**{fator_sazonal:.2f}x**"
+                                    )
+                                st.caption(
+                                    "Split temporal: o modelo treina no passado e é testado no período mais "
+                                    "recente, simulando o uso real (prever o que ainda não aconteceu)."
+                                )
+
+                            st.info(
+                                "💡 **Nota metodológica:** prova de conceito educacional (MBA). O horizonte "
+                                "'Próximo mês' é uma estimativa sazonal baseada em climatologia histórica, "
+                                "não uma previsão climática real (não há fonte gratuita de previsão de 30 "
+                                "dias). Para uso operacional, recomenda-se incorporar NDVI, uso do solo e "
+                                "comparar com modelos mais robustos (Random Forest, XGBoost)."
+                            )
                 else:
                     st.info(
-                        "👆 Clique no botão acima para treinar o modelo e calcular o risco "
-                        "para a região e período selecionados nos filtros."
+                        "👆 Ajuste os parâmetros acima e clique no botão para treinar o modelo "
+                        "e gerar o mapa de risco da região selecionada."
                     )
             except Exception as _err_risco:
                 st.error(f"⚠️ Erro na aba de Risco Preditivo: {_err_risco}")
