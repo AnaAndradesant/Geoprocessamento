@@ -9,3 +9,4 @@ requests
 earthengine-api
 openpyxl
 plotly>=5.0
+scikit-learn
