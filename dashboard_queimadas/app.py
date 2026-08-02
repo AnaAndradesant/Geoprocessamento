@@ -935,6 +935,21 @@ if "qa" in st.query_params and st.query_params["qa"].lower() == "true":
 
 if st.sidebar.button("▶️ Gerar Dashboard", type="primary", use_container_width=True):
     st.session_state.gerar_dashboard = True
+    # Congela os filtros no momento do clique — mudar um widget depois (nesta ou em
+    # outra aba) não deve regenerar o dashboard sozinho, só um novo clique aqui.
+    st.session_state.filtros_ativos = {
+        "tipo_analise": tipo_analise, "estado_dd": estado_dd, "bioma_dd": bioma_dd,
+        "municipio_dd": municipio_dd, "fonte_escolhida": fonte_escolhida,
+        "area_protegida": area_protegida,
+    }
+    if "INPE" in fonte_escolhida:
+        st.session_state.filtros_ativos.update({
+            "unidade_dd": unidade_dd, "quantidade_sel": quantidade_sel, "satelites_sel": satelites_sel,
+        })
+    else:
+        st.session_state.filtros_ativos.update({
+            "ano_modis": ano_modis, "mes_modis": mes_modis,
+        })
 
 # --- SEÇÃO DE CONTATO ---
 st.sidebar.markdown("---")
@@ -976,6 +991,23 @@ total_valor = 0
 dados_indisponiveis = False
 
 if st.session_state.gerar_dashboard:
+    # Usa os filtros CONGELADOS no momento do último clique em "Gerar Dashboard" —
+    # não os valores atuais dos widgets (que podem ter mudado nesse meio tempo).
+    _f = st.session_state.filtros_ativos
+    tipo_analise = _f["tipo_analise"]
+    estado_dd = _f["estado_dd"]
+    bioma_dd = _f["bioma_dd"]
+    municipio_dd = _f["municipio_dd"]
+    fonte_escolhida = _f["fonte_escolhida"]
+    area_protegida = _f["area_protegida"]
+    if "INPE" in fonte_escolhida:
+        unidade_dd = _f["unidade_dd"]
+        quantidade_sel = _f["quantidade_sel"]
+        satelites_sel = _f["satelites_sel"]
+    else:
+        ano_modis = _f["ano_modis"]
+        mes_modis = _f["mes_modis"]
+
     hoje = datetime.now()
     val_sel = (
         bioma_dd if tipo_analise == "Por Bioma"
@@ -2081,15 +2113,14 @@ if st.session_state.gerar_dashboard:
             )
 
             # --- ÁREA QUEIMADA ---
+            # IMPORTANTE: só é possível estimar ÁREA (e, portanto, prejuízo em R$/ha) com
+            # dados de ÁREA QUEIMADA (MODIS). Focos de calor (INPE) são detecções pontuais —
+            # não representam uma área queimada, então não entram nesse cálculo.
             area_km2_calc = 0.0
+            fonte_area = "Sem dados de área disponíveis"
             if "MODIS" in fonte_escolhida and total_valor > 0:
                 area_km2_calc = float(total_valor)
                 fonte_area = f"Satélite MODIS — {area_km2_calc:,.1f} km² queimados detectados"
-            elif "INPE" in fonte_escolhida and not df_rec.empty:
-                area_km2_calc = len(df_rec) * 0.5
-                fonte_area = f"{len(df_rec):,} focos INPE (estimativa: ~0,5 km²/foco)"
-            else:
-                fonte_area = "Sem dados de área disponíveis"
 
             area_ha = area_km2_calc * 100
 
@@ -2099,7 +2130,16 @@ if st.session_state.gerar_dashboard:
                 f"com base na área afetada e no valor dos serviços que o ecossistema presta à sociedade."
             )
 
-            if area_km2_calc == 0:
+            if "INPE" in fonte_escolhida:
+                st.warning(
+                    "⚠️ **Esta aba precisa de dados de Área Queimada (MODIS).** Você selecionou "
+                    "'Focos de Calor (INPE)' na barra lateral — focos são **detecções pontuais** "
+                    "(um pixel de calor), não medem a área efetivamente queimada, então não é "
+                    "correto estimar hectares ou prejuízo em R$ a partir da contagem de focos. "
+                    "Troque a fonte de dados para **'🗺️ Área Queimada (NASA MODIS)'** na barra "
+                    "lateral e clique em 'Gerar Dashboard' novamente para ver o impacto econômico."
+                )
+            elif area_km2_calc == 0:
                 st.warning(
                     "⚠️ Nenhuma área queimada detectada para o período selecionado. "
                     "Selecione outro mês ou ano."
@@ -2583,34 +2623,86 @@ ser gerados por essa floresta perdida.
                                 tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
                                 attr="Esri", prefer_canvas=True,
                             )
+
+                            # --- Limites de referência (para o usuário se localizar) ---
+                            # Contorno da região selecionada (bioma/estado/município) — igual ao mapa principal
                             folium.GeoJson(
-                                gdf_render.__geo_interface__,
-                                name="Risco de queimada por município",
-                                style_function=lambda feat: {
-                                    "fillColor": feat["properties"]["cor"],
-                                    "fillOpacity": 0.6,
-                                    "color": "#2c3e50",
-                                    "weight": 1,
+                                limite.__geo_interface__,
+                                name=f"Limite — {val_sel}",
+                                style_function=lambda x: {
+                                    'fillColor': '#00d4ff', 'fillOpacity': 0.02,
+                                    'color': '#00d4ff', 'weight': 3, 'dashArray': '6 3',
+                                },
+                            ).add_to(m_risco)
+
+                            # Limites dos municípios (contorno fino, sem preenchimento)
+                            folium.GeoJson(
+                                gdf_mapa.__geo_interface__,
+                                name="Limites municipais",
+                                style_function=lambda x: {
+                                    'fillOpacity': 0, 'color': '#95a5a6', 'weight': 0.8, 'dashArray': '2 2',
                                 },
                                 tooltip=folium.GeoJsonTooltip(
-                                    fields=["name_muni", "nivel", "probabilidade_fmt"],
-                                    aliases=["Município:", "Risco:", "Probabilidade:"],
-                                    style=(
-                                        "font-size:12px; background:white; color:#2c3e50; "
-                                        "border-radius:6px; box-shadow:2px 2px 6px rgba(0,0,0,0.25);"
-                                    ),
+                                    fields=["name_muni"], aliases=["Município:"],
+                                    style="font-size:11px; background:white; color:#2c3e50; border-radius:6px;",
                                 ),
                             ).add_to(m_risco)
+
+                            # Limites estaduais (útil quando a região é um bioma, que cruza vários estados)
+                            ufs_envolvidas = sorted(gdf_mapa["abbrev_state"].dropna().unique().tolist())
+                            if tipo_analise == "Por Bioma" and 0 < len(ufs_envolvidas) <= 12:
+                                try:
+                                    frames_uf = [read_state(code_state=uf, year=2020) for uf in ufs_envolvidas]
+                                    gdf_estados = pd.concat(frames_uf, ignore_index=True).to_crs("EPSG:4326")
+                                    folium.GeoJson(
+                                        gdf_estados.__geo_interface__,
+                                        name="Limites estaduais",
+                                        style_function=lambda x: {
+                                            'fillOpacity': 0, 'color': '#ecf0f1', 'weight': 1.8,
+                                        },
+                                        tooltip=folium.GeoJsonTooltip(
+                                            fields=["abbrev_state"], aliases=["Estado:"],
+                                            style="font-size:11px; background:white; color:#2c3e50; border-radius:6px;",
+                                        ),
+                                    ).add_to(m_risco)
+                                except Exception:
+                                    pass  # limites estaduais são só um extra visual — não interrompe o mapa se falhar
+
+                            # --- Risco por município, em formato de FOCO (ponto), não polígono preenchido ---
+                            fg_focos_risco = folium.FeatureGroup(name="Risco de queimada (focos)")
+                            for _, row_r in gdf_render.iterrows():
+                                raio = 6 + (row_r["probabilidade"] * 14)  # 6px a 20px conforme a probabilidade
+                                folium.CircleMarker(
+                                    location=[row_r["lat"], row_r["lon"]],
+                                    radius=raio,
+                                    color="#1c1c1c",
+                                    weight=1,
+                                    fill=True,
+                                    fill_color=row_r["cor"],
+                                    fill_opacity=0.85,
+                                    tooltip=folium.Tooltip(
+                                        f"<b>{row_r['name_muni']}</b><br>"
+                                        f"Risco: {row_r['nivel']}<br>"
+                                        f"Probabilidade: {row_r['probabilidade_fmt']}",
+                                        style=(
+                                            "font-size:12px; background:white; color:#2c3e50; "
+                                            "border-radius:6px; box-shadow:2px 2px 6px rgba(0,0,0,0.25);"
+                                        ),
+                                    ),
+                                ).add_to(fg_focos_risco)
+                            fg_focos_risco.add_to(m_risco)
 
                             legenda_risco = """
                             <div style="position: fixed; bottom: 30px; left: 30px; z-index:9999;
                                         background: rgba(30,30,30,0.9); padding: 12px 16px; border-radius: 10px;
                                         color: white; font-size: 13px; box-shadow: 2px 2px 8px rgba(0,0,0,0.4);">
-                                <b>🎯 Nível de Risco</b><br>
+                                <b>🎯 Nível de Risco (por foco/município)</b><br>
                                 <span style="color:#2ecc71;">●</span> Baixo (&lt;25%)<br>
                                 <span style="color:#f1c40f;">●</span> Moderado (25-50%)<br>
                                 <span style="color:#e67e22;">●</span> Alto (50-75%)<br>
-                                <span style="color:#e74c3c;">●</span> Crítico (≥75%)
+                                <span style="color:#e74c3c;">●</span> Crítico (≥75%)<br>
+                                <span style="color:#95a5a6;">- - -</span> Limite municipal<br>
+                                <span style="color:#00d4ff;">- - -</span> Região selecionada
                             </div>
                             """
                             m_risco.get_root().html.add_child(folium.Element(legenda_risco))
