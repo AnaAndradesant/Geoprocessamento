@@ -13,6 +13,7 @@ import ee
 from io import BytesIO
 import traceback
 import numpy as np
+import concurrent.futures
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score
@@ -207,7 +208,7 @@ def gerar_excel(df):
 # --- FUNÇÕES COM CACHE ---
 # =============================================================
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False, persist="disk")
 def buscar_cotacao_dolar():
     """Busca a cotação PTAX do dólar no Banco Central. Cache de 1h."""
     from datetime import datetime, timedelta
@@ -228,7 +229,7 @@ def buscar_cotacao_dolar():
         pass
     return 5.04  # fallback caso a API esteja indisponível
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def buscar_cidades(uf):
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
     try:
@@ -239,7 +240,7 @@ def buscar_cidades(uf):
         pass
     return ["Erro ao carregar cidades"]
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, persist="disk")
 def carregar_fronteira(tipo, estado, bioma, municipio):
     if tipo == "Por Estado":
         limite = read_state(code_state=estado, year=2020)
@@ -255,7 +256,7 @@ def carregar_fronteira(tipo, estado, bioma, municipio):
     limite['geometry'] = limite['geometry'].simplify(tolerance=0.005, preserve_topology=True)
     return limite
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, persist="disk")
 def carregar_areas_protegidas(tipo_area):
     if tipo_area == "Terras Indígenas":
         gdf_areas = read_indigenous_land()
@@ -274,7 +275,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False, persist="disk")
 def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satelites):
     url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
     
@@ -309,14 +310,21 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
 
     dt_ini = datetime.strptime(d_ini, "%Y-%m-%d")
     dt_fim = datetime.strptime(d_fim, "%Y-%m-%d")
-    all_dfs = []
     sat_str = "','".join(satelites)
 
-    while dt_ini <= dt_fim:
-        dt_bloco_fim = min(dt_ini + timedelta(days=1), dt_fim)
+    # Monta a lista de blocos (dia a dia) ANTES de disparar as chamadas
+    blocos = []
+    cursor = dt_ini
+    while cursor <= dt_fim:
+        bloco_fim = min(cursor + timedelta(days=1), dt_fim)
+        blocos.append((cursor, bloco_fim))
+        cursor = bloco_fim + timedelta(days=1)
+
+    def _buscar_bloco(bloco):
+        b_ini, b_fim = bloco
         cql = (
-            f"data_hora_gmt >= '{dt_ini.strftime('%Y-%m-%d')}T00:00:00' "
-            f"AND data_hora_gmt <= '{dt_bloco_fim.strftime('%Y-%m-%d')}T23:59:59' "
+            f"data_hora_gmt >= '{b_ini.strftime('%Y-%m-%d')}T00:00:00' "
+            f"AND data_hora_gmt <= '{b_fim.strftime('%Y-%m-%d')}T23:59:59' "
             f"AND satelite IN ('{sat_str}') AND {filtro_base}"
         )
         try:
@@ -327,24 +335,29 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
                     "typeName": "bdqueimadas:focos", "outputFormat": "application/json",
                     "CQL_FILTER": cql, "maxFeatures": 50000
                 },
-                headers=headers,
-                verify=False,
-                timeout=90
+                headers=headers, verify=False, timeout=90
             )
             if r.status_code == 200:
                 dados_json = r.json()
                 if "features" in dados_json and len(dados_json["features"]) > 0:
-                    registros = [
+                    return [
                         {"longitude": f["geometry"]["coordinates"][0],
                          "latitude": f["geometry"]["coordinates"][1],
                          **f["properties"]}
                         for f in dados_json["features"]
                     ]
-                    all_dfs.append(pd.DataFrame(registros))
         except Exception:
-            pass  # Ignora erros de conexão para não parar o loop
-            
-        dt_ini = dt_bloco_fim + timedelta(days=1)
+            pass  # Ignora erros de conexão para não parar as outras chamadas
+        return []
+
+    # Chamadas em paralelo (são independentes — não precisa esperar uma terminar
+    # pra começar a próxima). 12 workers é um bom equilíbrio entre velocidade e
+    # não sobrecarregar o servidor do INPE.
+    all_dfs = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+        for registros in executor.map(_buscar_bloco, blocos):
+            if registros:
+                all_dfs.append(pd.DataFrame(registros))
 
     if not all_dfs:
         return pd.DataFrame()
@@ -376,7 +389,7 @@ FEATURES_RISCO = [
 ]
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def buscar_clima_nasa_power(lat, lon, d_ini, d_fim):
     """Clima diário (temp, umidade, chuva, vento) via NASA POWER — API pública, sem chave."""
     url = "https://power.larc.nasa.gov/api/temporal/daily/point"
@@ -401,7 +414,7 @@ def buscar_clima_nasa_power(lat, lon, d_ini, d_fim):
     return df
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def buscar_historico_focos_diario(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, dias_bloco=7):
     """
     Versão 'leve' de buscar_focos_inpe, otimizada para treino do modelo:
@@ -438,13 +451,19 @@ def buscar_historico_focos_diario(tipo, val_estado, val_bioma, val_muni, d_ini, 
 
     dt_ini = datetime.strptime(d_ini, "%Y-%m-%d")
     dt_fim = datetime.strptime(d_fim, "%Y-%m-%d")
-    todas_datas = []
+
+    blocos = []
     cursor = dt_ini
     while cursor <= dt_fim:
         bloco_fim = min(cursor + timedelta(days=dias_bloco), dt_fim)
+        blocos.append((cursor, bloco_fim))
+        cursor = bloco_fim + timedelta(days=1)
+
+    def _buscar_bloco(bloco):
+        b_ini, b_fim = bloco
         cql = (
-            f"data_hora_gmt >= '{cursor.strftime('%Y-%m-%d')}T00:00:00' "
-            f"AND data_hora_gmt <= '{bloco_fim.strftime('%Y-%m-%d')}T23:59:59' "
+            f"data_hora_gmt >= '{b_ini.strftime('%Y-%m-%d')}T00:00:00' "
+            f"AND data_hora_gmt <= '{b_fim.strftime('%Y-%m-%d')}T23:59:59' "
             f"AND {filtro_base}"
         )
         try:
@@ -461,12 +480,15 @@ def buscar_historico_focos_diario(tipo, val_estado, val_bioma, val_muni, d_ini, 
             if r.status_code == 200:
                 dados = r.json()
                 if dados.get("features"):
-                    todas_datas.extend(
-                        f["properties"]["data_hora_gmt"][:10] for f in dados["features"]
-                    )
+                    return [f["properties"]["data_hora_gmt"][:10] for f in dados["features"]]
         except Exception:
             pass
-        cursor = bloco_fim + timedelta(days=1)
+        return []
+
+    todas_datas = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for datas_bloco in executor.map(_buscar_bloco, blocos):
+            todas_datas.extend(datas_bloco)
 
     if not todas_datas:
         return pd.DataFrame(columns=["data", "n_focos"])
@@ -500,7 +522,7 @@ def _engenharia_features_risco(df_clima):
     return df_clima
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=604800, show_spinner=False, persist="disk")
 def obter_municipios_regiao(tipo_analise, estado_dd, bioma_dd, municipio_dd, max_municipios=50, seed=42):
     """
     Retorna os municípios que compõem a região selecionada (estado inteiro,
@@ -544,15 +566,89 @@ def obter_municipios_regiao(tipo_analise, estado_dd, bioma_dd, municipio_dd, max
     return gdf[[c for c in cols if c in gdf.columns]].reset_index(drop=True)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
+def buscar_burndate_diario_modis(geom_json_str, d_ini, d_fim):
+    """
+    Equivalente ao 'buscar_historico_focos_diario', mas usando ÁREA QUEIMADA
+    (MODIS MCD64A1, banda BurnDate) em vez de focos de calor do INPE.
+    A banda BurnDate traz o dia-do-ano em que cada pixel queimou dentro do mês,
+    então dá pra reconstruir uma contagem diária de pixels queimados — o
+    equivalente ao 'n_focos', mas baseado em área detectada, não em ponto de calor.
+
+    NOTA: mais lento que a versão INPE (cada chamada ao Earth Engine custa mais
+    que uma consulta WFS simples), por isso os parâmetros de amostra devem ser
+    menores quando essa fonte é usada.
+    """
+    poly = ee.Geometry(json.loads(geom_json_str))
+    dt_ini = datetime.strptime(d_ini, "%Y-%m-%d")
+    dt_fim = datetime.strptime(d_fim, "%Y-%m-%d")
+
+    meses = []
+    cursor = dt_ini.replace(day=1)
+    while cursor <= dt_fim:
+        prox_mes = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
+        meses.append((cursor, prox_mes))
+        cursor = prox_mes
+
+    def _buscar_mes(bloco_mes):
+        mes_ini, mes_fim = bloco_mes
+        try:
+            img = (
+                ee.ImageCollection('MODIS/061/MCD64A1')
+                .filterDate(ee.Date(mes_ini.strftime("%Y-%m-%d")), ee.Date(mes_fim.strftime("%Y-%m-%d")))
+                .select('BurnDate')
+                .max()
+                .clip(poly)
+            )
+            stats = img.reduceRegion(
+                reducer=ee.Reducer.frequencyHistogram(),
+                geometry=poly, scale=500, maxPixels=1e13, bestEffort=True
+            ).getInfo()
+            hist = (stats or {}).get('BurnDate', {})
+            registros_mes = []
+            for dia_str, contagem_px in hist.items():
+                try:
+                    dia_ano = int(float(dia_str))
+                    if dia_ano <= 0:
+                        continue  # 0 = pixel não queimado
+                    data_real = datetime(mes_ini.year, 1, 1) + timedelta(days=dia_ano - 1)
+                    if dt_ini.date() <= data_real.date() <= dt_fim.date():
+                        registros_mes.append((data_real.date(), int(contagem_px)))
+                except Exception:
+                    continue
+            return registros_mes
+        except Exception:
+            return []
+
+    todos_registros = []
+    # Um mês é independente do outro no Earth Engine também — paraleliza,
+    # mas com menos workers (a API do GEE é mais sensível a excesso de chamadas simultâneas)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        for registros_mes in executor.map(_buscar_mes, meses):
+            todos_registros.extend(registros_mes)
+
+    if not todos_registros:
+        return pd.DataFrame(columns=["data", "n_focos"])
+
+    df = pd.DataFrame(todos_registros, columns=["data", "n_focos"])
+    df["data"] = pd.to_datetime(df["data"])
+    df = df.groupby("data", as_index=False)["n_focos"].sum()
+    return df
+
+
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_dd,
-                                   anos_historico=2, n_amostra_treino=8):
+                                   anos_historico=2, n_amostra_treino=8, fonte_dados="INPE"):
     """
     Treina UM modelo (Regressão Logística) usando dados agrupados de vários
     municípios da região selecionada (não mais um único ponto central).
     Isso torna o modelo representativo do bioma/estado inteiro, e não só do
     centroide. Usa TODOS OS DIAS do período de histórico para cada município
-    amostrado (clima + presença/ausência de foco), não uma amostra de dias.
+    amostrado (clima + presença/ausência de ocorrência), não uma amostra de dias.
+
+    fonte_dados:
+      - "INPE"  -> alvo = houve foco de calor (detecção pontual) naquele dia
+      - "MODIS" -> alvo = houve pixel de área queimada detectado naquele dia
     """
     gdf_treino = obter_municipios_regiao(tipo_analise, estado_dd, bioma_dd, municipio_dd,
                                           max_municipios=n_amostra_treino)
@@ -563,27 +659,41 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
     d_fim = (hoje - timedelta(days=2)).strftime("%Y-%m-%d")
     d_ini = (hoje - timedelta(days=365 * anos_historico)).strftime("%Y-%m-%d")
 
-    frames = []
-    for _, row in gdf_treino.iterrows():
+    def _montar_dados_municipio(row):
         df_clima = buscar_clima_nasa_power(row['lat'], row['lon'], d_ini, d_fim)
         if df_clima.empty or df_clima["T2M"].isna().all():
-            continue
-        df_focos = buscar_historico_focos_diario(
-            "Por Município", row['abbrev_state'], bioma_dd, row['name_muni'], d_ini, d_fim, dias_bloco=14
-        )
+            return None
+        if fonte_dados == "MODIS":
+            geom_muni_str = json.dumps(row['geometry'].__geo_interface__, sort_keys=True)
+            df_ocorrencia = buscar_burndate_diario_modis(geom_muni_str, d_ini, d_fim)
+        else:
+            df_ocorrencia = buscar_historico_focos_diario(
+                "Por Município", row['abbrev_state'], bioma_dd, row['name_muni'], d_ini, d_fim, dias_bloco=14
+            )
         df_m = _engenharia_features_risco(df_clima)
-        df_m = df_m.merge(df_focos, on="data", how="left")
+        df_m = df_m.merge(df_ocorrencia, on="data", how="left")
         df_m["n_focos"] = df_m["n_focos"].fillna(0)
         df_m["target_foco"] = (df_m["n_focos"] > 0).astype(int)
         df_m["municipio"] = row['name_muni']
-        frames.append(df_m)
+        return df_m
+
+    # Um município é independente do outro — busca em paralelo. Com MODIS,
+    # cada chamada ao Earth Engine é mais pesada, então usamos menos workers.
+    frames = []
+    linhas_municipios = [row for _, row in gdf_treino.iterrows()]
+    max_workers_muni = 3 if fonte_dados == "MODIS" else 5
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers_muni) as executor:
+        for df_m in executor.map(_montar_dados_municipio, linhas_municipios):
+            if df_m is not None:
+                frames.append(df_m)
 
     if not frames:
-        return {"erro": "Não foi possível obter dados climáticos para os municípios amostrados. Tente novamente."}
+        return {"erro": "Não foi possível obter dados para os municípios amostrados. Tente novamente."}
 
     df = pd.concat(frames, ignore_index=True).dropna(subset=FEATURES_RISCO)
     if len(df) < 100 or df["target_foco"].nunique() < 2:
-        return {"erro": "Histórico insuficiente ou sem variação de focos para treinar um modelo confiável nesta região/período."}
+        fonte_txt = "área queimada (MODIS)" if fonte_dados == "MODIS" else "focos (INPE)"
+        return {"erro": f"Histórico insuficiente ou sem variação de {fonte_txt} para treinar um modelo confiável nesta região/período."}
 
     # Split TEMPORAL pooled: mesmo corte de data para todos os municípios
     # (treina no passado de todos eles, testa no período mais recente de todos eles)
@@ -601,12 +711,13 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
         X_test = scaler.transform(teste[FEATURES_RISCO])
         auc = roc_auc_score(teste["target_foco"], modelo.predict_proba(X_test)[:, 1])
 
-    # Climatologia mensal: taxa histórica média de dias-com-foco por mês,
+    # Climatologia mensal: taxa histórica média de dias-com-ocorrência por mês,
     # calculada com TODOS os dias observados (usada para a estimativa "próximo mês")
     climatologia_mensal = df.groupby("mes")["target_foco"].mean().to_dict()
 
     return {
         "modelo": modelo, "scaler": scaler, "auc": auc,
+        "fonte_dados": fonte_dados,
         "climatologia_mensal": climatologia_mensal,
         "municipios_treino": sorted(df["municipio"].unique().tolist()),
         "n_municipios_treino": df["municipio"].nunique(),
@@ -618,7 +729,7 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
     }
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False, persist="disk")
 def buscar_condicoes_atuais(lat, lon):
     """Busca só os últimos ~35 dias de clima (leve, rápido) para calcular o
     risco ATUAL de um ponto específico — usado para colorir cada município no mapa."""
@@ -2476,10 +2587,13 @@ ser gerados por essa floresta perdida.
 
             with st.expander("ℹ️ Como esse modelo funciona (leia antes de treinar)", expanded=False):
                 st.markdown(
+                    "- Você escolhe treinar o modelo com **Focos de Calor (INPE)** ou **Área Queimada "
+                    "(MODIS)** — o alvo que o modelo aprende a prever muda conforme essa escolha (foco "
+                    "pontual de calor vs. pixel de área efetivamente queimada).\n"
                     "- O modelo é treinado com uma **amostra de municípios** da região selecionada "
                     "(bioma ou estado inteiro — não é mais um único ponto central).\n"
                     "- Para **cada** município da amostra, o modelo usa **todos os dias** do período "
-                    "de histórico escolhido (clima diário + se houve ou não foco de calor naquele dia) "
+                    "de histórico escolhido (clima diário + se houve ou não ocorrência naquele dia) "
                     "— não é uma amostra de dias, é o histórico diário completo.\n"
                     "- Depois de treinado, o mesmo modelo é aplicado às condições climáticas **atuais** "
                     "de cada município da região (podendo ser um conjunto maior que o usado no treino) "
@@ -2491,11 +2605,30 @@ ser gerados por essa floresta perdida.
                 )
 
             try:
+                fonte_sugerida = "MODIS" if "MODIS" in fonte_escolhida else "INPE"
+                fonte_risco = st.radio(
+                    "Treinar o modelo com:",
+                    ["🔥 Focos de Calor (INPE)", "🗺️ Área Queimada (MODIS)"],
+                    index=0 if fonte_sugerida == "INPE" else 1,
+                    key="fonte_dados_risco",
+                    horizontal=True,
+                    help="Focos (INPE) = detecções pontuais de calor, mais rápido de treinar. "
+                         "Área Queimada (MODIS) = baseado em pixels queimados detectados por satélite, "
+                         "mais coerente com a fonte escolhida na barra lateral, porém mais lento."
+                )
+                fonte_dados_risco = "MODIS" if "MODIS" in fonte_risco else "INPE"
+                if fonte_dados_risco == "MODIS":
+                    st.caption(
+                        "⏱️ Treinar com Área Queimada (MODIS) é mais lento — cada município consulta "
+                        "o Earth Engine mês a mês (em vez de uma busca simples do INPE). Considere usar "
+                        "menos municípios e menos anos de histórico."
+                    )
+
                 col_p1, col_p2, col_p3 = st.columns(3)
                 with col_p1:
                     anos_hist = st.select_slider(
                         "Histórico para treinar o modelo:",
-                        options=[1, 2, 3], value=2,
+                        options=[1, 2, 3], value=1 if fonte_dados_risco == "MODIS" else 2,
                         format_func=lambda x: f"{x} ano(s)",
                         key="anos_hist_risco"
                     )
@@ -2512,7 +2645,8 @@ ser gerados por essa floresta perdida.
                     else:
                         n_amostra_treino = st.select_slider(
                             "Municípios usados no treino:",
-                            options=[5, 8, 12, 15, 20], value=8,
+                            options=[3, 5, 8, 12, 15, 20],
+                            value=5 if fonte_dados_risco == "MODIS" else 8,
                             key="n_treino_risco",
                             help="Mais municípios = modelo mais representativo do bioma/estado, "
                                  "porém mais lento para treinar."
@@ -2529,7 +2663,9 @@ ser gerados por essa floresta perdida.
                     "Municípios exibidos no mapa (região inteira):",
                     options=[15, 30, 50, 80], value=30,
                     key="max_mapa_risco",
-                    help="Quantos municípios da região terão o risco calculado e coloridos no mapa."
+                    help="Quantos municípios da região terão o risco calculado e coloridos no mapa. "
+                         "(O mapa sempre usa clima real recente, independente da fonte escolhida acima "
+                         "— a fonte só muda o que o modelo aprendeu a reconhecer como risco.)"
                 )
 
                 if st.button("🧠 Treinar Modelo e Gerar Mapa de Risco", use_container_width=True):
@@ -2538,7 +2674,8 @@ ser gerados por essa floresta perdida.
                     status.write(f"🔎 Selecionando municípios de '{val_sel}' para treino...")
                     resultado = treinar_modelo_risco_regional(
                         tipo_analise, estado_dd, bioma_dd, municipio_dd,
-                        anos_historico=anos_hist, n_amostra_treino=n_amostra_treino
+                        anos_historico=anos_hist, n_amostra_treino=n_amostra_treino,
+                        fonte_dados=fonte_dados_risco
                     )
 
                     if "erro" in resultado:
@@ -2547,6 +2684,7 @@ ser gerados por essa floresta perdida.
                     else:
                         status.write(
                             f"✅ Modelo treinado com **{resultado['n_municipios_treino']} município(s)** "
+                            f"usando **{'Área Queimada (MODIS)' if resultado['fonte_dados'] == 'MODIS' else 'Focos de Calor (INPE)'}** "
                             f"({resultado['n_linhas_total']} dias no total, todos os dias do período). "
                             f"AUC-ROC no teste: **{resultado['auc']:.2f}**" if resultado["auc"] else
                             f"✅ Modelo treinado com {resultado['n_municipios_treino']} município(s)."
@@ -2572,10 +2710,24 @@ ser gerados por essa floresta perdida.
                         clim_alvo = clima_mensal.get(mes_alvo, resultado["taxa_base"])
                         fator_sazonal = clim_alvo / max(clim_atual, 1e-6)
 
+                        linhas_municipios_mapa = [row for _, row in gdf_mapa.iterrows()]
+
+                        # Busca as condições atuais de todos os municípios em paralelo
+                        # (até 15 de cada vez) — a previsão do modelo em si é instantânea,
+                        # o gargalo é só a chamada de rede.
+                        condicoes = {}
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                            futuros = {
+                                executor.submit(buscar_condicoes_atuais, r["lat"], r["lon"]): r["name_muni"]
+                                for r in linhas_municipios_mapa
+                            }
+                            for futuro in concurrent.futures.as_completed(futuros):
+                                condicoes[futuros[futuro]] = futuro.result()
+
                         linhas_resultado = []
                         cond_por_municipio = {}
-                        for _, row in gdf_mapa.iterrows():
-                            cond = buscar_condicoes_atuais(row["lat"], row["lon"])
+                        for row in linhas_municipios_mapa:
+                            cond = condicoes.get(row["name_muni"])
                             if cond is None:
                                 continue
                             X = scaler.transform(cond[FEATURES_RISCO])
