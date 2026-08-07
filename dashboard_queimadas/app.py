@@ -281,7 +281,7 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
     
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-    session.mount('https://', HTTPAdapter(max_retries=retries))
+    session.mount('https://', HTTPAdapter(max_retries=retries, pool_maxsize=20))
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -381,17 +381,29 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
 # fica em cache por 24h (st.cache_data) para não retreinar a cada clique.
 # =====================================================================
 
-FEATURES_RISCO = [
+FEATURES_CLIMA = [
     "T2M", "RH2M", "PRECTOTCORR", "WS10M", "dias_secos_consecutivos",
     "temp_media_3d", "umidade_media_3d", "chuva_acumulada_3d",
     "temp_media_7d", "umidade_media_7d", "chuva_acumulada_7d",
     "mes_sin", "mes_cos",
 ]
 
+# Feature adicional de "efeito fixo por município": a taxa histórica de dias-com-
+# ocorrência daquele município específico, calculada só com o período de TREINO
+# (sem vazamento de dados). Captura risco basal que não depende do clima do dia
+# (ex: uso do solo, fronteira agrícola, proximidade de estradas) — dois municípios
+# com o mesmo clima podem ter risco de base muito diferente por essas razões.
+FEATURES_RISCO = FEATURES_CLIMA + ["taxa_hist_municipio"]
+
 
 @st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def buscar_clima_nasa_power(lat, lon, d_ini, d_fim):
-    """Clima diário (temp, umidade, chuva, vento) via NASA POWER — API pública, sem chave."""
+    """
+    Clima diário (temp, umidade, chuva, vento) via NASA POWER — API pública, sem chave.
+    NUNCA levanta exceção: se a chamada falhar (rede instável, timeout, erro do servidor),
+    retorna um DataFrame vazio. Isso é proposital — uma falha isolada em 1 município não
+    pode derrubar o treino/mapa inteiro, que depende de várias chamadas independentes.
+    """
     url = "https://power.larc.nasa.gov/api/temporal/daily/point"
     params = {
         "parameters": "T2M,RH2M,PRECTOTCORR,WS10M",
@@ -402,10 +414,18 @@ def buscar_clima_nasa_power(lat, lon, d_ini, d_fim):
         "end": d_fim.replace("-", ""),
         "format": "JSON",
     }
-    r = requests.get(url, params=params, timeout=60, verify=False)
-    r.raise_for_status()
-    payload = r.json()["properties"]["parameter"]
-    df = pd.DataFrame(payload)
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    session.mount("https://", HTTPAdapter(max_retries=retries, pool_maxsize=20))
+
+    try:
+        r = session.get(url, params=params, timeout=60, verify=False)
+        r.raise_for_status()
+        payload = r.json()["properties"]["parameter"]
+        df = pd.DataFrame(payload)
+    except Exception:
+        return pd.DataFrame(columns=["data", "T2M", "RH2M", "PRECTOTCORR", "WS10M"])
+
     df.index = pd.to_datetime(df.index, format="%Y%m%d")
     df = df.rename_axis("data").reset_index()
     df[["T2M", "RH2M", "PRECTOTCORR", "WS10M"]] = df[
@@ -425,7 +445,7 @@ def buscar_historico_focos_diario(tipo, val_estado, val_bioma, val_muni, d_ini, 
     url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-    session.mount('https://', HTTPAdapter(max_retries=retries))
+    session.mount('https://', HTTPAdapter(max_retries=retries, pool_maxsize=20))
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
     dic_estados = {
@@ -522,6 +542,16 @@ def _engenharia_features_risco(df_clima):
     return df_clima
 
 
+@st.cache_data(ttl=2592000, show_spinner=False, persist="disk")
+def _carregar_todos_municipios_brasil():
+    """
+    Carrega os ~5.570 municípios do Brasil inteiro UMA VEZ (cache de 30 dias —
+    fronteiras municipais praticamente não mudam). Compartilhado entre todos os
+    biomas, em vez de recarregar o Brasil inteiro toda vez que o bioma muda.
+    """
+    return read_municipality(code_muni="all", year=2020)
+
+
 @st.cache_data(ttl=604800, show_spinner=False, persist="disk")
 def obter_municipios_regiao(tipo_analise, estado_dd, bioma_dd, municipio_dd, max_municipios=50, seed=42):
     """
@@ -541,7 +571,7 @@ def obter_municipios_regiao(tipo_analise, estado_dd, bioma_dd, municipio_dd, max
     else:  # Por Bioma
         gdf_bioma = read_biomes(year=2019)
         gdf_bioma = gdf_bioma[gdf_bioma['name_biome'] == bioma_dd]
-        gdf_todos = read_municipality(code_muni="all", year=2020)
+        gdf_todos = _carregar_todos_municipios_brasil()
         gdf_bioma = gdf_bioma.to_crs(gdf_todos.crs)
         gdf = gpd.sjoin(gdf_todos, gdf_bioma[['geometry']], predicate='intersects', how='inner')
         gdf = gdf.drop(columns=['index_right'], errors='ignore').drop_duplicates(subset=['code_muni'])
@@ -550,15 +580,18 @@ def obter_municipios_regiao(tipo_analise, estado_dd, bioma_dd, municipio_dd, max
         return gdf
 
     gdf = gdf.to_crs("EPSG:4326")
-    gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.01, preserve_topology=True)
-    pontos = gdf.geometry.representative_point()
-    gdf['lat'] = pontos.y
-    gdf['lon'] = pontos.x
 
+    # Amostra ANTES de simplificar geometria e calcular representative_point —
+    # evita gastar tempo processando geometria de municípios que serão descartados.
     total_disponivel = len(gdf)
     amostrado = total_disponivel > max_municipios
     if amostrado:
         gdf = gdf.sample(n=max_municipios, random_state=seed)
+
+    gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.01, preserve_topology=True)
+    pontos = gdf.geometry.representative_point()
+    gdf['lat'] = pontos.y
+    gdf['lon'] = pontos.x
 
     gdf['total_disponivel'] = total_disponivel
     gdf['amostrado_flag'] = amostrado
@@ -660,25 +693,32 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
     d_ini = (hoje - timedelta(days=365 * anos_historico)).strftime("%Y-%m-%d")
 
     def _montar_dados_municipio(row):
-        df_clima = buscar_clima_nasa_power(row['lat'], row['lon'], d_ini, d_fim)
-        if df_clima.empty or df_clima["T2M"].isna().all():
+        # Qualquer falha aqui (rede, dado malformado, etc.) descarta só ESTE
+        # município — nunca deve derrubar o treino inteiro por causa de 1 falha.
+        try:
+            df_clima = buscar_clima_nasa_power(row['lat'], row['lon'], d_ini, d_fim)
+            if df_clima.empty or df_clima["T2M"].isna().all():
+                return None
+            if fonte_dados == "MODIS":
+                geom_muni_str = json.dumps(row['geometry'].__geo_interface__, sort_keys=True)
+                df_ocorrencia = buscar_burndate_diario_modis(geom_muni_str, d_ini, d_fim)
+            else:
+                df_ocorrencia = buscar_historico_focos_diario(
+                    "Por Município", row['abbrev_state'], bioma_dd, row['name_muni'], d_ini, d_fim, dias_bloco=14
+                )
+            df_m = _engenharia_features_risco(df_clima)
+            df_m = df_m.merge(df_ocorrencia, on="data", how="left")
+            df_m["n_focos"] = df_m["n_focos"].fillna(0)
+            df_m["target_foco"] = (df_m["n_focos"] > 0).astype(int)
+            df_m["municipio"] = row['name_muni']
+            return df_m
+        except Exception:
             return None
-        if fonte_dados == "MODIS":
-            geom_muni_str = json.dumps(row['geometry'].__geo_interface__, sort_keys=True)
-            df_ocorrencia = buscar_burndate_diario_modis(geom_muni_str, d_ini, d_fim)
-        else:
-            df_ocorrencia = buscar_historico_focos_diario(
-                "Por Município", row['abbrev_state'], bioma_dd, row['name_muni'], d_ini, d_fim, dias_bloco=14
-            )
-        df_m = _engenharia_features_risco(df_clima)
-        df_m = df_m.merge(df_ocorrencia, on="data", how="left")
-        df_m["n_focos"] = df_m["n_focos"].fillna(0)
-        df_m["target_foco"] = (df_m["n_focos"] > 0).astype(int)
-        df_m["municipio"] = row['name_muni']
-        return df_m
 
     # Um município é independente do outro — busca em paralelo. Com MODIS,
     # cada chamada ao Earth Engine é mais pesada, então usamos menos workers.
+    # _montar_dados_municipio nunca levanta exceção (retorna None em falha),
+    # então uma falha isolada não derruba o ThreadPoolExecutor inteiro.
     frames = []
     linhas_municipios = [row for _, row in gdf_treino.iterrows()]
     max_workers_muni = 3 if fonte_dados == "MODIS" else 5
@@ -687,10 +727,12 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
             if df_m is not None:
                 frames.append(df_m)
 
+    n_municipios_falha = len(linhas_municipios) - len(frames)
+
     if not frames:
         return {"erro": "Não foi possível obter dados para os municípios amostrados. Tente novamente."}
 
-    df = pd.concat(frames, ignore_index=True).dropna(subset=FEATURES_RISCO)
+    df = pd.concat(frames, ignore_index=True).dropna(subset=FEATURES_CLIMA)
     if len(df) < 100 or df["target_foco"].nunique() < 2:
         fonte_txt = "área queimada (MODIS)" if fonte_dados == "MODIS" else "focos (INPE)"
         return {"erro": f"Histórico insuficiente ou sem variação de {fonte_txt} para treinar um modelo confiável nesta região/período."}
@@ -699,7 +741,17 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
     # (treina no passado de todos eles, testa no período mais recente de todos eles)
     datas_unicas = sorted(df["data"].unique())
     corte_data = datas_unicas[int(len(datas_unicas) * 0.8)]
-    treino, teste = df[df["data"] < corte_data], df[df["data"] >= corte_data]
+    treino, teste = df[df["data"] < corte_data].copy(), df[df["data"] >= corte_data].copy()
+
+    # Efeito fixo por município: taxa histórica de dias-com-ocorrência DAQUELE
+    # município específico, calculada SÓ com o período de treino (para não vazar
+    # informação do teste). Aplicada como valor constante por município tanto no
+    # treino quanto no teste — captura risco de base (uso do solo, etc.) que o
+    # clima sozinho não explica.
+    taxa_por_municipio = treino.groupby("municipio")["target_foco"].mean().to_dict()
+    taxa_geral_fallback = float(treino["target_foco"].mean())
+    treino["taxa_hist_municipio"] = treino["municipio"].map(taxa_por_municipio)
+    teste["taxa_hist_municipio"] = teste["municipio"].map(taxa_por_municipio).fillna(taxa_geral_fallback)
 
     scaler = StandardScaler()
     X_train = scaler.fit_transform(treino[FEATURES_RISCO])
@@ -719,12 +771,15 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
         "modelo": modelo, "scaler": scaler, "auc": auc,
         "fonte_dados": fonte_dados,
         "climatologia_mensal": climatologia_mensal,
+        "taxa_por_municipio": taxa_por_municipio,
+        "taxa_geral_fallback": taxa_geral_fallback,
         "municipios_treino": sorted(df["municipio"].unique().tolist()),
         "n_municipios_treino": df["municipio"].nunique(),
         "n_dias_treino": len(treino), "n_dias_teste": len(teste),
         "n_linhas_total": len(df),
         "taxa_base": df["target_foco"].mean(),
         "amostrado_treino": bool(gdf_treino["amostrado_flag"].iloc[0]),
+        "n_municipios_falha": n_municipios_falha,
         "total_disponivel": int(gdf_treino["total_disponivel"].iloc[0]),
     }
 
@@ -732,17 +787,32 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
 @st.cache_data(ttl=21600, show_spinner=False, persist="disk")
 def buscar_condicoes_atuais(lat, lon):
     """Busca só os últimos ~35 dias de clima (leve, rápido) para calcular o
-    risco ATUAL de um ponto específico — usado para colorir cada município no mapa."""
-    hoje = datetime.now()
-    d_fim = (hoje - timedelta(days=2)).strftime("%Y-%m-%d")
-    d_ini = (hoje - timedelta(days=35)).strftime("%Y-%m-%d")
-    df_clima = buscar_clima_nasa_power(lat, lon, d_ini, d_fim)
-    if df_clima.empty or df_clima["T2M"].isna().all():
+    risco ATUAL de um ponto específico — usado para colorir cada município no mapa.
+    Nunca levanta exceção: falha isolada em 1 município não pode derrubar o mapa inteiro."""
+    try:
+        hoje = datetime.now()
+        d_fim = (hoje - timedelta(days=2)).strftime("%Y-%m-%d")
+        d_ini = (hoje - timedelta(days=35)).strftime("%Y-%m-%d")
+        df_clima = buscar_clima_nasa_power(lat, lon, d_ini, d_fim)
+        if df_clima.empty or df_clima["T2M"].isna().all():
+            return None
+        df_feat = _engenharia_features_risco(df_clima).dropna(subset=FEATURES_CLIMA)
+        if df_feat.empty:
+            return None
+        return df_feat.iloc[[-1]]
+    except Exception:
         return None
-    df_feat = _engenharia_features_risco(df_clima).dropna(subset=FEATURES_RISCO)
-    if df_feat.empty:
-        return None
-    return df_feat.iloc[[-1]]
+
+
+def _logit(p, eps=1e-4):
+    """Converte probabilidade para log-odds. Evita explosão numérica perto de 0 ou 1."""
+    p = min(max(p, eps), 1 - eps)
+    return np.log(p / (1 - p))
+
+
+def _sigmoid(x):
+    """Inverso do logit: converte log-odds de volta para probabilidade (0-1)."""
+    return 1 / (1 + np.exp(-x))
 
 
 def classificar_risco(prob):
@@ -2595,13 +2665,18 @@ ser gerados por essa floresta perdida.
                     "- Para **cada** município da amostra, o modelo usa **todos os dias** do período "
                     "de histórico escolhido (clima diário + se houve ou não ocorrência naquele dia) "
                     "— não é uma amostra de dias, é o histórico diário completo.\n"
+                    "- Além do clima, o modelo usa a **taxa histórica de cada município** (calculada só "
+                    "com o período de treino) como uma feature extra — assim, dois municípios com o "
+                    "mesmo clima podem receber risco diferente se um deles historicamente pega fogo "
+                    "muito mais que o outro (uso do solo, fronteira agrícola, etc.).\n"
                     "- Depois de treinado, o mesmo modelo é aplicado às condições climáticas **atuais** "
                     "de cada município da região (podendo ser um conjunto maior que o usado no treino) "
                     "para colorir o mapa.\n"
                     "- **Amanhã** usa o clima real mais recente disponível. **Próximo mês** é uma "
-                    "**estimativa sazonal** (compara o risco atual com o padrão histórico do mês "
-                    "seguinte) — não existe fonte gratuita de previsão climática de 30 dias, então isso "
-                    "não é uma previsão dia-a-dia, e sim uma tendência baseada em climatologia."
+                    "**estimativa sazonal** (desloca o risco atual pela diferença histórica entre o mês "
+                    "atual e o mês seguinte, em espaço log-odds — para não saturar bruscamente em 100%) "
+                    "— não existe fonte gratuita de previsão climática de 30 dias, então isso não é uma "
+                    "previsão dia-a-dia, e sim uma tendência baseada em climatologia."
                 )
 
             try:
@@ -2682,17 +2757,26 @@ ser gerados por essa floresta perdida.
                         status.update(label="Falha no treino", state="error")
                         st.warning(f"⚠️ {resultado['erro']}")
                     else:
-                        status.write(
+                        fonte_txt = "Área Queimada (MODIS)" if resultado["fonte_dados"] == "MODIS" else "Focos de Calor (INPE)"
+                        msg_treino = (
                             f"✅ Modelo treinado com **{resultado['n_municipios_treino']} município(s)** "
-                            f"usando **{'Área Queimada (MODIS)' if resultado['fonte_dados'] == 'MODIS' else 'Focos de Calor (INPE)'}** "
-                            f"({resultado['n_linhas_total']} dias no total, todos os dias do período). "
-                            f"AUC-ROC no teste: **{resultado['auc']:.2f}**" if resultado["auc"] else
-                            f"✅ Modelo treinado com {resultado['n_municipios_treino']} município(s)."
+                            f"usando **{fonte_txt}** ({resultado['n_linhas_total']} dias no total, "
+                            f"todos os dias do período)."
                         )
+                        if resultado["auc"] is not None:
+                            msg_treino += f" AUC-ROC no teste: **{resultado['auc']:.2f}**"
+                        status.write(msg_treino)
+
                         if resultado["amostrado_treino"]:
                             status.write(
                                 f"ℹ️ A região tem {resultado['total_disponivel']} municípios — "
                                 f"uma amostra foi usada para o treino ser mais rápido."
+                            )
+                        if resultado["n_municipios_falha"] > 0:
+                            status.write(
+                                f"⚠️ {resultado['n_municipios_falha']} município(s) da amostra não "
+                                f"retornaram dados e foram descartados do treino (isso é normal em "
+                                f"instabilidades pontuais de rede — não impede o treino de continuar)."
                             )
 
                         status.write("🗺️ Buscando lista de municípios para o mapa...")
@@ -2708,7 +2792,11 @@ ser gerados por essa floresta perdida.
                         clima_mensal = resultado["climatologia_mensal"]
                         clim_atual = clima_mensal.get(mes_atual, resultado["taxa_base"])
                         clim_alvo = clima_mensal.get(mes_alvo, resultado["taxa_base"])
-                        fator_sazonal = clim_alvo / max(clim_atual, 1e-6)
+                        # Deslocamento sazonal em ESPAÇO LOGIT (log-odds), não multiplicativo direto.
+                        # Isso evita que o ajuste "exploda" para 100% quando a taxa histórica do mês
+                        # atual é muito baixa e a do mês-alvo é muito mais alta — o deslocamento em
+                        # log-odds satura suavemente perto dos extremos, igual o próprio modelo logístico.
+                        deslocamento_sazonal = _logit(clim_alvo) - _logit(clim_atual)
 
                         linhas_municipios_mapa = [row for _, row in gdf_mapa.iterrows()]
 
@@ -2722,18 +2810,36 @@ ser gerados por essa floresta perdida.
                                 for r in linhas_municipios_mapa
                             }
                             for futuro in concurrent.futures.as_completed(futuros):
-                                condicoes[futuros[futuro]] = futuro.result()
+                                nome_muni = futuros[futuro]
+                                try:
+                                    condicoes[nome_muni] = futuro.result()
+                                except Exception:
+                                    condicoes[nome_muni] = None  # falha isolada não derruba o mapa
+
+                        n_falhas_mapa = sum(1 for v in condicoes.values() if v is None)
+                        if n_falhas_mapa > 0:
+                            status.write(
+                                f"⚠️ {n_falhas_mapa} de {len(linhas_municipios_mapa)} município(s) "
+                                f"não retornaram dados climáticos e ficarão de fora do mapa."
+                            )
 
                         linhas_resultado = []
                         cond_por_municipio = {}
+                        taxa_por_municipio = resultado["taxa_por_municipio"]
+                        taxa_fallback = resultado["taxa_geral_fallback"]
                         for row in linhas_municipios_mapa:
                             cond = condicoes.get(row["name_muni"])
                             if cond is None:
                                 continue
+                            cond = cond.copy()
+                            # Município que participou do treino usa sua própria taxa histórica
+                            # conhecida; município novo (só apareceu no mapa) usa a média geral
+                            # da amostra de treino como aproximação razoável.
+                            cond["taxa_hist_municipio"] = taxa_por_municipio.get(row["name_muni"], taxa_fallback)
                             X = scaler.transform(cond[FEATURES_RISCO])
                             prob_amanha = float(modelo.predict_proba(X)[0, 1])
                             if horizonte == "Próximo mês":
-                                prob_final = float(np.clip(prob_amanha * fator_sazonal, 0, 1))
+                                prob_final = float(_sigmoid(_logit(prob_amanha) + deslocamento_sazonal))
                             else:
                                 prob_final = prob_amanha
                             nivel, emoji, cor_hex = classificar_risco(prob_final)
@@ -2901,9 +3007,14 @@ ser gerados por essa floresta perdida.
                                 )
                                 st.write(f"- Taxa histórica média de dias com foco: **{resultado['taxa_base']:.1%}**")
                                 if horizonte == "Próximo mês":
+                                    sinal_desloc = "+" if deslocamento_sazonal >= 0 else ""
                                     st.write(
-                                        f"- Fator sazonal aplicado (mês {mes_atual} → mês {mes_alvo}): "
-                                        f"**{fator_sazonal:.2f}x**"
+                                        f"- Climatologia do mês atual (mês {mes_atual}): **{clim_atual:.1%}** "
+                                        f"→ do mês-alvo (mês {mes_alvo}): **{clim_alvo:.1%}**"
+                                    )
+                                    st.write(
+                                        f"- Deslocamento sazonal aplicado (em log-odds): "
+                                        f"**{sinal_desloc}{deslocamento_sazonal:.2f}**"
                                     )
                                 st.caption(
                                     "Split temporal: o modelo treina no passado e é testado no período mais "
