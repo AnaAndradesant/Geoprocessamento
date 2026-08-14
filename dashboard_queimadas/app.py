@@ -737,6 +737,17 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
         fonte_txt = "área queimada (MODIS)" if fonte_dados == "MODIS" else "focos (INPE)"
         return {"erro": f"Histórico insuficiente ou sem variação de {fonte_txt} para treinar um modelo confiável nesta região/período."}
 
+    # Baseline ingênuo (sem ML, sem clima) pra comparação: "risco alto se o
+    # município teve pelo menos 1 dia com ocorrência nos 7 dias ANTERIORES a
+    # este" — pura persistência recente. shift(1) garante que não olha o
+    # próprio dia (mesma regra de não-vazamento usada no resto do pipeline).
+    df = df.sort_values(["municipio", "data"]).reset_index(drop=True)
+    df["baseline_focos_7d"] = (
+        df.groupby("municipio")["target_foco"]
+          .transform(lambda s: s.shift(1).rolling(7, min_periods=1).sum())
+    )
+    df["pred_baseline"] = (df["baseline_focos_7d"].fillna(0) > 0).astype(int)
+
     # Split TEMPORAL pooled: mesmo corte de data para todos os municípios
     # (treina no passado de todos eles, testa no período mais recente de todos eles)
     datas_unicas = sorted(df["data"].unique())
@@ -759,9 +770,20 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
     modelo.fit(X_train, treino["target_foco"])
 
     auc = None
+    avaliacao_teste = None
     if teste["target_foco"].nunique() == 2 and len(teste) > 0:
         X_test = scaler.transform(teste[FEATURES_RISCO])
-        auc = roc_auc_score(teste["target_foco"], modelo.predict_proba(X_test)[:, 1])
+        y_prob = modelo.predict_proba(X_test)[:, 1]
+        y_true = teste["target_foco"].to_numpy()
+        auc = roc_auc_score(y_true, y_prob)
+        # Guarda tudo que o painel de transparência do modelo precisa: rótulo
+        # verdadeiro, probabilidade prevista pelo modelo e previsão do baseline
+        # ingênuo — tudo do MESMO conjunto de teste (nunca visto no treino).
+        avaliacao_teste = {
+            "y_true": y_true,
+            "y_prob": y_prob,
+            "y_pred_baseline": teste["pred_baseline"].to_numpy(),
+        }
 
     # Climatologia mensal: taxa histórica média de dias-com-ocorrência por mês,
     # calculada com TODOS os dias observados (usada para a estimativa "próximo mês")
@@ -769,6 +791,7 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
 
     return {
         "modelo": modelo, "scaler": scaler, "auc": auc,
+        "avaliacao_teste": avaliacao_teste,
         "fonte_dados": fonte_dados,
         "climatologia_mensal": climatologia_mensal,
         "taxa_por_municipio": taxa_por_municipio,
@@ -2998,6 +3021,141 @@ ser gerados por essa floresta perdida.
                                 yaxis_title=""
                             )
                             st.plotly_chart(fig_contrib, use_container_width=True)
+
+                            # ---- Painel de Transparência do Modelo ----
+                            st.markdown("---")
+                            st.markdown("### 🔬 Transparência do Modelo")
+                            st.caption(
+                                "Todas as métricas abaixo são calculadas SÓ no conjunto de teste "
+                                "(período mais recente, nunca visto no treino) — igual seria em produção."
+                            )
+                            aval = resultado.get("avaliacao_teste")
+                            if aval is None:
+                                st.info(
+                                    "Não há dados de teste suficientes (ou só uma classe presente) "
+                                    "para gerar as métricas de avaliação nesta região/período."
+                                )
+                            else:
+                                from sklearn.metrics import (
+                                    confusion_matrix, precision_score, recall_score,
+                                    f1_score, accuracy_score
+                                )
+
+                                y_true = aval["y_true"]
+                                y_prob = aval["y_prob"]
+                                y_pred = (y_prob >= 0.5).astype(int)
+                                y_pred_base = aval["y_pred_baseline"]
+
+                                tab_metricas, tab_matriz, tab_calib, tab_baseline = st.tabs(
+                                    ["📈 Métricas", "🧩 Matriz de Confusão", "🎯 Calibração", "⚖️ Vs. Baseline"]
+                                )
+
+                                # --- Métricas resumo ---
+                                with tab_metricas:
+                                    prec = precision_score(y_true, y_pred, zero_division=0)
+                                    rec = recall_score(y_true, y_pred, zero_division=0)
+                                    f1 = f1_score(y_true, y_pred, zero_division=0)
+                                    acc = accuracy_score(y_true, y_pred)
+                                    cme1, cme2, cme3, cme4, cme5 = st.columns(5)
+                                    cme1.metric("AUC-ROC", f"{resultado['auc']:.2f}" if resultado["auc"] else "—")
+                                    cme2.metric("Acurácia", f"{acc:.0%}")
+                                    cme3.metric("Precisão", f"{prec:.0%}")
+                                    cme4.metric("Recall", f"{rec:.0%}")
+                                    cme5.metric("F1-score", f"{f1:.0%}")
+                                    st.caption(
+                                        "Corte de decisão em 50% de probabilidade. **Precisão** = dos dias que "
+                                        "o modelo marcou como risco, quantos realmente tiveram ocorrência. "
+                                        "**Recall** = das ocorrências reais, quantas o modelo conseguiu antecipar. "
+                                        f"Avaliado em **{len(y_true)}** dias de teste."
+                                    )
+
+                                # --- Matriz de confusão ---
+                                with tab_matriz:
+                                    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+                                    fig_cm = px.imshow(
+                                        cm, text_auto=True,
+                                        x=["Previu: Sem risco", "Previu: Risco"],
+                                        y=["Real: Sem ocorrência", "Real: Com ocorrência"],
+                                        color_continuous_scale="Reds",
+                                    )
+                                    fig_cm.update_layout(template="plotly_dark", height=380, coloraxis_showscale=False)
+                                    st.plotly_chart(fig_cm, use_container_width=True)
+                                    st.caption(
+                                        "Diagonal principal = acertos. Fora da diagonal = erros do modelo "
+                                        "(falso positivo: alarme sem ocorrência real / falso negativo: "
+                                        "ocorrência que o modelo não previu)."
+                                    )
+
+                                # --- Curva de calibração ---
+                                with tab_calib:
+                                    try:
+                                        from sklearn.calibration import calibration_curve
+                                        n_bins = 5 if len(y_true) < 200 else 10
+                                        frac_pos, prob_media = calibration_curve(y_true, y_prob, n_bins=n_bins, strategy="quantile")
+                                        fig_calib = go.Figure()
+                                        fig_calib.add_trace(go.Scatter(
+                                            x=[0, 1], y=[0, 1], mode="lines", name="Calibração perfeita",
+                                            line=dict(dash="dash", color="#7f8c8d")
+                                        ))
+                                        fig_calib.add_trace(go.Scatter(
+                                            x=prob_media, y=frac_pos, mode="lines+markers", name="Modelo",
+                                            line=dict(color="#e74c3c", width=3), marker=dict(size=9)
+                                        ))
+                                        fig_calib.update_layout(
+                                            template="plotly_dark", height=380,
+                                            xaxis_title="Probabilidade prevista (média por faixa)",
+                                            yaxis_title="Frequência real de ocorrência",
+                                            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                                        )
+                                        st.plotly_chart(fig_calib, use_container_width=True)
+                                        st.caption(
+                                            "Quanto mais perto da linha tracejada, mais confiável é a "
+                                            "probabilidade — ou seja, quando o modelo diz '70% de risco', "
+                                            "isso realmente acontece em ~70% desses dias."
+                                        )
+                                    except Exception:
+                                        st.info("Dados de teste insuficientes para calcular a curva de calibração.")
+
+                                # --- Comparação com baseline ingênuo ---
+                                with tab_baseline:
+                                    prec_b = precision_score(y_true, y_pred_base, zero_division=0)
+                                    rec_b = recall_score(y_true, y_pred_base, zero_division=0)
+                                    f1_b = f1_score(y_true, y_pred_base, zero_division=0)
+                                    acc_b = accuracy_score(y_true, y_pred_base)
+                                    df_comp = pd.DataFrame({
+                                        "Métrica": ["Acurácia", "Precisão", "Recall", "F1-score"],
+                                        "Modelo (clima + ML)": [acc, prec, rec, f1],
+                                        "Baseline ingênuo (focos nos últimos 7 dias)": [acc_b, prec_b, rec_b, f1_b],
+                                    })
+                                    fig_comp = go.Figure()
+                                    fig_comp.add_bar(name="Modelo (clima + ML)", x=df_comp["Métrica"],
+                                                      y=df_comp["Modelo (clima + ML)"], marker_color="#e74c3c")
+                                    fig_comp.add_bar(name="Baseline ingênuo", x=df_comp["Métrica"],
+                                                      y=df_comp["Baseline ingênuo (focos nos últimos 7 dias)"],
+                                                      marker_color="#7f8c8d")
+                                    fig_comp.update_layout(
+                                        barmode="group", template="plotly_dark", height=360,
+                                        yaxis_tickformat=".0%",
+                                        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                                    )
+                                    st.plotly_chart(fig_comp, use_container_width=True)
+                                    st.caption(
+                                        "**Baseline ingênuo:** marca risco alto se o município teve pelo menos "
+                                        "1 dia com ocorrência nos 7 dias anteriores — sem clima, sem ML, só "
+                                        "persistência recente. É a régua mínima que o modelo precisa superar "
+                                        "pra justificar a complexidade extra."
+                                    )
+                                    ganho_f1 = f1 - f1_b
+                                    if ganho_f1 > 0:
+                                        st.success(
+                                            f"✅ O modelo supera o baseline em F1-score por **+{ganho_f1:.0%}** "
+                                            "— o clima e o histórico por município agregam valor real."
+                                        )
+                                    else:
+                                        st.warning(
+                                            f"⚠️ O modelo não superou o baseline ingênuo nesta região/período "
+                                            f"(F1 {ganho_f1:.0%}). Considere mais dados de treino ou revisar features."
+                                        )
 
                             with st.expander("📊 Detalhes do treinamento do modelo"):
                                 st.write(f"- Municípios usados no treino: **{', '.join(resultado['municipios_treino'])}**")
