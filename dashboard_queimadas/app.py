@@ -258,12 +258,43 @@ def carregar_fronteira(tipo, estado, bioma, municipio):
 
 @st.cache_data(show_spinner=False, persist="disk")
 def carregar_areas_protegidas(tipo_area):
+    # A partir de versões recentes do geobr, read_indigenous_land() e
+    # read_conservation_units() passaram a exigir um argumento de data/ano
+    # (formato YYYYMM) — chamar sem argumento gera TypeError. Como o geobr
+    # só mantém alguns "snapshots" disponíveis e essa lista muda com o tempo,
+    # tentamos em cascata do mais recente pro mais antigo até um funcionar.
     if tipo_area == "Terras Indígenas":
-        gdf_areas = read_indigenous_land()
+        candidatos = [202501, 202409, 202312, 202112, 202001, 201907]
+        ultimo_erro = None
+        gdf_areas = None
+        for data_ref in candidatos:
+            try:
+                gdf_areas = read_indigenous_land(year=data_ref)
+                break
+            except Exception as e:
+                ultimo_erro = e
+        if gdf_areas is None:
+            raise RuntimeError(
+                f"Não foi possível baixar Terras Indígenas do geobr "
+                f"(tentei as datas {candidatos}). Último erro: {ultimo_erro}"
+            )
         if 'terrai_nom' in gdf_areas.columns:
             gdf_areas = gdf_areas.rename(columns={'terrai_nom': 'nome_area'})
     else:
-        gdf_areas = read_conservation_units()
+        candidatos = [202503, 202402, 202112, 202001, 201909]
+        ultimo_erro = None
+        gdf_areas = None
+        for data_ref in candidatos:
+            try:
+                gdf_areas = read_conservation_units(date=data_ref)
+                break
+            except Exception as e:
+                ultimo_erro = e
+        if gdf_areas is None:
+            raise RuntimeError(
+                f"Não foi possível baixar Unidades de Conservação do geobr "
+                f"(tentei as datas {candidatos}). Último erro: {ultimo_erro}"
+            )
         if 'name_conservation_unit' in gdf_areas.columns:
             gdf_areas = gdf_areas.rename(columns={'name_conservation_unit': 'nome_area'})
     gdf_areas['geometry'] = gdf_areas['geometry'].make_valid()
@@ -1271,7 +1302,16 @@ if st.session_state.gerar_dashboard:
 
                 if area_protegida != "Nenhuma":
                     st.write(f"🌳 Carregando limites de {area_protegida}...")
-                    gdf_areas = carregar_areas_protegidas(area_protegida)
+                    try:
+                        gdf_areas = carregar_areas_protegidas(area_protegida)
+                    except Exception as e:
+                        st.warning(
+                            f"⚠️ Não foi possível carregar os limites de {area_protegida} "
+                            f"agora ({e}). Mostrando os focos sem o recorte espacial."
+                        )
+                        gdf_areas = None
+
+                if area_protegida != "Nenhuma" and gdf_areas is not None:
                     gdf_areas = gdf_areas.to_crs(gdf.crs)
 
                     # Todas as áreas protegidas que TOCAM a região selecionada —
@@ -1331,23 +1371,24 @@ if st.session_state.gerar_dashboard:
                         .rename('area_km2')
                     )
 
-                    if area_protegida != "Nenhuma" and total_valor > 0:
-                        st.write(f"🌳 Isolando km² afetados em {area_protegida}...")
+                    if area_protegida != "Nenhuma":
+                        st.write(f"🌳 Carregando limites de {area_protegida}...")
                         gdf_areas_br = carregar_areas_protegidas(tipo_area=area_protegida)
                         gdf_areas = gpd.sjoin(
                             gdf_areas_br, limite, predicate='intersects'
                         ).drop(columns=['index_right'])
 
                         # Desenha TODAS as áreas protegidas que tocam a região desde
-                        # já — mesmo que acabem com 0 km² queimados dentro, elas
-                        # continuam aparecendo no mapa como contexto.
+                        # já — mesmo que acabem com 0 km² queimados dentro, ou que
+                        # não haja NENHUMA queima na região inteira nesse mês/ano,
+                        # elas continuam aparecendo no mapa como contexto.
                         areas_afetadas = (
                             gdf_areas[['nome_area', 'geometry']]
                             .drop_duplicates(subset='nome_area')
                             .reset_index(drop=True)
                         )
 
-                        if not gdf_areas.empty:
+                        if not gdf_areas.empty and total_valor > 0:
                             features_ee = [
                                 ee.Feature(
                                     ee.Geometry(row['geometry'].__geo_interface__),
