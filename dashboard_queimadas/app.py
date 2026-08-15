@@ -1269,10 +1269,23 @@ if st.session_state.gerar_dashboard:
                 df_rec = pd.DataFrame(gdf.drop(columns="geometry"))
                 total_valor = len(df_rec)
 
-                if area_protegida != "Nenhuma" and not df_rec.empty:
-                    st.write(f"🌳 Isolando focos em {area_protegida}...")
+                if area_protegida != "Nenhuma":
+                    st.write(f"🌳 Carregando limites de {area_protegida}...")
                     gdf_areas = carregar_areas_protegidas(area_protegida)
                     gdf_areas = gdf_areas.to_crs(gdf.crs)
+
+                    # Todas as áreas protegidas que TOCAM a região selecionada —
+                    # usadas pra desenhar o limite no mapa, mesmo que não tenham
+                    # nenhum foco dentro. Antes, o limite só aparecia quando
+                    # havia foco, então uma área "limpa" nunca era desenhada.
+                    gdf_areas_regiao = gpd.sjoin(gdf_areas, limite, predicate='intersects')
+                    if 'index_right' in gdf_areas_regiao.columns:
+                        gdf_areas_regiao = gdf_areas_regiao.drop(columns=['index_right'])
+                    areas_afetadas = (
+                        gdf_areas_regiao[['nome_area', 'geometry']]
+                        .drop_duplicates(subset='nome_area')
+                        .reset_index(drop=True)
+                    )
 
                     if 'index_right' in gdf.columns:
                         gdf = gdf.drop(columns=['index_right'])
@@ -1280,9 +1293,6 @@ if st.session_state.gerar_dashboard:
                     gdf_focos_risco = gpd.sjoin(gdf, gdf_areas, predicate='within')
 
                     if not gdf_focos_risco.empty:
-                        areas_afetadas = gdf_areas[
-                            gdf_areas['nome_area'].isin(gdf_focos_risco['nome_area'])
-                        ]
                         focos_em_areas = pd.DataFrame(gdf_focos_risco.drop(columns="geometry"))
                         df_ranking_areas = (
                             focos_em_areas['nome_area']
@@ -1293,6 +1303,9 @@ if st.session_state.gerar_dashboard:
                         df_rec = focos_em_areas
                         total_valor = len(df_rec)
                     else:
+                        # Sem focos dentro das áreas protegidas — zera os PONTOS,
+                        # mas mantém 'areas_afetadas' com os limites já carregados
+                        # acima, pra continuar desenhando as áreas no mapa.
                         df_rec = pd.DataFrame()
                         total_valor = 0
 
@@ -1325,6 +1338,15 @@ if st.session_state.gerar_dashboard:
                             gdf_areas_br, limite, predicate='intersects'
                         ).drop(columns=['index_right'])
 
+                        # Desenha TODAS as áreas protegidas que tocam a região desde
+                        # já — mesmo que acabem com 0 km² queimados dentro, elas
+                        # continuam aparecendo no mapa como contexto.
+                        areas_afetadas = (
+                            gdf_areas[['nome_area', 'geometry']]
+                            .drop_duplicates(subset='nome_area')
+                            .reset_index(drop=True)
+                        )
+
                         if not gdf_areas.empty:
                             features_ee = [
                                 ee.Feature(
@@ -1349,14 +1371,17 @@ if st.session_state.gerar_dashboard:
                                 by='Valor', ascending=False
                             )
                             if not df_ranking_areas.empty:
-                                areas_afetadas = gdf_areas[
+                                # Recorta o raster só nas áreas com queima de fato,
+                                # mas mantém 'areas_afetadas' com TODAS as áreas da
+                                # região (definido acima) pro desenho do limite.
+                                areas_com_queima = gdf_areas[
                                     gdf_areas['nome_area'].isin(
                                         df_ranking_areas['Área Protegida']
                                     )
                                 ]
                                 total_valor = round(df_ranking_areas['Valor'].sum(), 2)
                                 ee_geom_afetadas = ee.Geometry(
-                                    areas_afetadas.geometry.union_all().__geo_interface__
+                                    areas_com_queima.geometry.union_all().__geo_interface__
                                 )
                                 area_queimada_img = area_queimada_img.clip(ee_geom_afetadas)
                                 img_area_km2 = (
@@ -1377,6 +1402,13 @@ if st.session_state.gerar_dashboard:
     # --- RENDERIZAÇÃO ---
     # =============================================================
 
+    # Mostra o card + mapa completo quando: há registros (total_valor > 0) OU
+    # quando há áreas protegidas na região mesmo sem foco/queima dentro delas
+    # (nesse caso o mapa ainda desenha os limites, só sem card de contagem).
+    tem_areas_sem_ocorrencia = (
+        total_valor == 0 and area_protegida != "Nenhuma" and not areas_afetadas.empty
+    )
+
     if dados_indisponiveis:
         mes_nome = {
             1:'Jan',2:'Fev',3:'Mar',4:'Abr',5:'Mai',6:'Jun',
@@ -1388,10 +1420,17 @@ if st.session_state.gerar_dashboard:
             f"(Geralmente há atraso de 1 a 2 meses). Por favor, tente um mês anterior."
         )
 
-    elif total_valor == 0:
+    elif total_valor == 0 and not tem_areas_sem_ocorrencia:
         st.error("⚠️ Nenhum registro detectado nos limites selecionados.")
 
     else:
+        if tem_areas_sem_ocorrencia:
+            st.warning(
+                f"🌳 Nenhum {'foco' if 'INPE' in fonte_escolhida else 'km² queimado'} "
+                f"encontrado dentro de {area_protegida} nesta região/período — mas há "
+                f"{areas_afetadas['nome_area'].nunique()} área(s) desse tipo na região "
+                "e os limites delas estão desenhados no mapa abaixo."
+            )
         # --- CARD PRINCIPAL ---
         texto_titulo = (
             f"Total Confirmado: {total_valor:,} focos"
@@ -1650,7 +1689,12 @@ if st.session_state.gerar_dashboard:
         # ABA 2 — GRÁFICOS & ANOMALIA
         # ----------------------------------------------------------
         with aba_graficos:
-            if "INPE" in fonte_escolhida:
+            if "INPE" in fonte_escolhida and df_rec.empty:
+                st.info(
+                    "🌳 Nenhum foco dentro da área protegida selecionada nesta região/período "
+                    "— sem dados pra série temporal ou ranking de municípios."
+                )
+            elif "INPE" in fonte_escolhida:
                 st.subheader("📈 Evolução Temporal dos Focos")
                 data_col = next(c for c in df_rec.columns if 'data' in c)
                 df_rec[data_col] = pd.to_datetime(df_rec[data_col])
