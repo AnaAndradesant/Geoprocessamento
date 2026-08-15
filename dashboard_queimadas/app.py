@@ -1313,6 +1313,10 @@ if st.session_state.gerar_dashboard:
 
                 if area_protegida != "Nenhuma" and gdf_areas is not None:
                     gdf_areas = gdf_areas.to_crs(gdf.crs)
+                    st.caption(
+                        f"🔎 Debug: {len(gdf_areas)} polígono(s) de {area_protegida} "
+                        f"carregados no Brasil todo (CRS: {gdf_areas.crs})."
+                    )
 
                     # Todas as áreas protegidas que TOCAM a região selecionada —
                     # usadas pra desenhar o limite no mapa, mesmo que não tenham
@@ -1325,6 +1329,10 @@ if st.session_state.gerar_dashboard:
                         gdf_areas_regiao[['nome_area', 'geometry']]
                         .drop_duplicates(subset='nome_area')
                         .reset_index(drop=True)
+                    )
+                    st.caption(
+                        f"🔎 Debug: {len(areas_afetadas)} área(s) intersectam a "
+                        f"região selecionada (limite CRS: {limite.crs})."
                     )
 
                     if 'index_right' in gdf.columns:
@@ -1374,9 +1382,17 @@ if st.session_state.gerar_dashboard:
                     if area_protegida != "Nenhuma":
                         st.write(f"🌳 Carregando limites de {area_protegida}...")
                         gdf_areas_br = carregar_areas_protegidas(tipo_area=area_protegida)
+                        st.caption(
+                            f"🔎 Debug: {len(gdf_areas_br)} polígono(s) de {area_protegida} "
+                            f"carregados no Brasil todo (CRS: {gdf_areas_br.crs})."
+                        )
                         gdf_areas = gpd.sjoin(
                             gdf_areas_br, limite, predicate='intersects'
                         ).drop(columns=['index_right'])
+                        st.caption(
+                            f"🔎 Debug: {gdf_areas['nome_area'].nunique() if not gdf_areas.empty else 0} "
+                            f"área(s) intersectam a região selecionada (limite CRS: {limite.crs})."
+                        )
 
                         # Desenha TODAS as áreas protegidas que tocam a região desde
                         # já — mesmo que acabem com 0 km² queimados dentro, ou que
