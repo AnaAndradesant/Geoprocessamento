@@ -17,6 +17,18 @@ import concurrent.futures
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import TimeSeriesSplit, GroupKFold
+from sklearn.metrics import f1_score
+
+# LightGBM é o modelo principal; se não estiver instalado (ex: ainda não foi
+# adicionado ao requirements.txt), cai para HistGradientBoostingClassifier
+# (já vem no sklearn, zero dependência nova) sem quebrar o app.
+try:
+    from lightgbm import LGBMClassifier
+    _LGBM_DISPONIVEL = True
+except ImportError:
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    _LGBM_DISPONIVEL = False
 
 
 
@@ -426,6 +438,118 @@ FEATURES_CLIMA = [
 # com o mesmo clima podem ter risco de base muito diferente por essas razões.
 FEATURES_RISCO = FEATURES_CLIMA + ["taxa_hist_municipio"]
 
+# =====================================================================
+# 🎯 VALIDAÇÃO CRUZADA ROBUSTA — temporal (walk-forward) + espacial
+# =====================================================================
+# Por que duas estratégias?
+#  - Temporal (TimeSeriesSplit): o modelo generaliza pro FUTURO?
+#    (treina no passado, testa no que vem depois — várias vezes, não só uma)
+#  - Espacial (GroupKFold por município): o modelo generaliza pra um
+#    MUNICÍPIO NUNCA VISTO no treino? (importante porque focos são
+#    espacialmente correlacionados — um único split temporal não capta isso)
+# Em cada fold, taxa_hist_municipio é recalculada só com o treino do fold
+# (mesma regra de não-vazamento já usada no resto do pipeline).
+
+def _criar_modelo_boosting():
+    """Fábrica do modelo de boosting (LightGBM se disponível, senão fallback
+    do sklearn). Uma função (não uma instância) porque cada fold de CV
+    precisa de um modelo novo, sem estado do fold anterior."""
+    if _LGBM_DISPONIVEL:
+        return LGBMClassifier(
+            n_estimators=300, learning_rate=0.05, max_depth=5,
+            num_leaves=31, class_weight="balanced",
+            random_state=42, verbosity=-1
+        )
+    return HistGradientBoostingClassifier(
+        max_depth=5, learning_rate=0.05, max_iter=300, random_state=42
+    )
+
+
+def _sample_weight_balanceado(y):
+    """Pesos por amostra equivalentes a class_weight='balanced', para
+    HistGradientBoostingClassifier (que não aceita esse parâmetro direto)."""
+    y = np.asarray(y)
+    n = len(y)
+    n_pos, n_neg = y.sum(), n - y.sum()
+    peso_pos = n / (2 * n_pos) if n_pos > 0 else 1.0
+    peso_neg = n / (2 * n_neg) if n_neg > 0 else 1.0
+    return np.where(y == 1, peso_pos, peso_neg)
+
+
+def _ajustar_modelo(modelo, X_treino, y_treino):
+    """Ajusta o modelo tratando a diferença de API entre LogisticRegression
+    (aceita class_weight no construtor), LightGBM (idem) e o fallback
+    HistGradientBoostingClassifier (precisa de sample_weight explícito)."""
+    if isinstance(modelo, LogisticRegression) or _LGBM_DISPONIVEL:
+        modelo.fit(X_treino, y_treino)
+    else:
+        modelo.fit(X_treino, y_treino, sample_weight=_sample_weight_balanceado(y_treino))
+    return modelo
+
+
+def _treinar_e_avaliar_fold(treino, teste, features, fabrica_modelo):
+    """Treina e avalia UM fold: recalcula taxa_hist_municipio só com o
+    treino do fold, ajusta o modelo, retorna (AUC, F1) no teste do fold."""
+    treino, teste = treino.copy(), teste.copy()
+    taxa_fold = treino.groupby("municipio")["target_foco"].mean().to_dict()
+    fallback_fold = float(treino["target_foco"].mean())
+    treino["taxa_hist_municipio"] = treino["municipio"].map(taxa_fold)
+    teste["taxa_hist_municipio"] = teste["municipio"].map(taxa_fold).fillna(fallback_fold)
+
+    scaler_fold = StandardScaler()
+    X_treino = scaler_fold.fit_transform(treino[features])
+    X_teste = scaler_fold.transform(teste[features])
+
+    modelo_fold = _ajustar_modelo(fabrica_modelo(), X_treino, treino["target_foco"])
+    y_prob = modelo_fold.predict_proba(X_teste)[:, 1]
+    y_true = teste["target_foco"].to_numpy()
+    auc = roc_auc_score(y_true, y_prob)
+    f1 = f1_score(y_true, (y_prob >= 0.5).astype(int), zero_division=0)
+    return auc, f1
+
+
+def _avaliar_cv(df, features, fabrica_modelo, n_splits_temporal=5):
+    """Roda as duas estratégias de CV e devolve média ± desvio-padrão de
+    AUC e F1 para cada uma. Retorna None num item se não houver dados
+    suficientes para montar aquela estratégia (ex: só 1 município disponível
+    torna a CV espacial inviável)."""
+    df = df.sort_values("data").reset_index(drop=True)
+    datas_unicas = df["data"].unique()
+    out = {"temporal": {"auc": [], "f1": []}, "espacial": {"auc": [], "f1": []}}
+
+    n_splits_temporal = min(n_splits_temporal, len(datas_unicas) - 1)
+    if n_splits_temporal >= 2:
+        for idx_tr, idx_te in TimeSeriesSplit(n_splits=n_splits_temporal).split(datas_unicas):
+            tr = df[df["data"].isin(datas_unicas[idx_tr])]
+            te = df[df["data"].isin(datas_unicas[idx_te])]
+            if tr["target_foco"].nunique() < 2 or te["target_foco"].nunique() < 2:
+                continue
+            auc, f1 = _treinar_e_avaliar_fold(tr, te, features, fabrica_modelo)
+            out["temporal"]["auc"].append(auc)
+            out["temporal"]["f1"].append(f1)
+
+    municipios = df["municipio"].unique()
+    n_splits_espacial = min(5, len(municipios))
+    if n_splits_espacial >= 2:
+        for idx_tr, idx_te in GroupKFold(n_splits=n_splits_espacial).split(df, groups=df["municipio"]):
+            tr, te = df.iloc[idx_tr], df.iloc[idx_te]
+            if tr["target_foco"].nunique() < 2 or te["target_foco"].nunique() < 2:
+                continue
+            auc, f1 = _treinar_e_avaliar_fold(tr, te, features, fabrica_modelo)
+            out["espacial"]["auc"].append(auc)
+            out["espacial"]["f1"].append(f1)
+
+    def _resumo(lista):
+        if not lista:
+            return None
+        arr = np.array(lista)
+        return {"media": float(arr.mean()), "desvio": float(arr.std()), "n_folds": len(arr)}
+
+    return {
+        "temporal_auc": _resumo(out["temporal"]["auc"]), "temporal_f1": _resumo(out["temporal"]["f1"]),
+        "espacial_auc": _resumo(out["espacial"]["auc"]), "espacial_f1": _resumo(out["espacial"]["f1"]),
+    }
+
 
 @st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def buscar_clima_nasa_power(lat, lon, d_ini, d_fim):
@@ -704,11 +828,11 @@ def buscar_burndate_diario_modis(geom_json_str, d_ini, d_fim):
 def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_dd,
                                    anos_historico=2, n_amostra_treino=8, fonte_dados="INPE"):
     """
-    Treina UM modelo (Regressão Logística) usando dados agrupados de vários
-    municípios da região selecionada (não mais um único ponto central).
-    Isso torna o modelo representativo do bioma/estado inteiro, e não só do
-    centroide. Usa TODOS OS DIAS do período de histórico para cada município
-    amostrado (clima + presença/ausência de ocorrência), não uma amostra de dias.
+    Treina modelo(s) usando dados agrupados de vários municípios da região
+    selecionada (não mais um único ponto central). Compara Regressão Logística
+    (baseline interpretável) com um modelo de boosting, validados com duas
+    estratégias de validação cruzada (temporal e espacial), e treina os
+    modelos finais com TODOS os dados para uso na inferência do mapa.
 
     fonte_dados:
       - "INPE"  -> alvo = houve foco de calor (detecção pontual) naquele dia
@@ -768,6 +892,13 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
         fonte_txt = "área queimada (MODIS)" if fonte_dados == "MODIS" else "focos (INPE)"
         return {"erro": f"Histórico insuficiente ou sem variação de {fonte_txt} para treinar um modelo confiável nesta região/período."}
 
+    # ================== VALIDAÇÃO CRUZADA (temporal + espacial) ==================
+    # Compara Regressão Logística (baseline interpretável) com o modelo de
+    # boosting, nas duas estratégias, ANTES de treinar o modelo final —
+    # é a performance honesta que vai pro relatório/defesa.
+    cv_lr = _avaliar_cv(df, FEATURES_RISCO, lambda: LogisticRegression(class_weight="balanced", max_iter=1000))
+    cv_boost = _avaliar_cv(df, FEATURES_RISCO, _criar_modelo_boosting)
+
     # Baseline ingênuo (sem ML, sem clima) pra comparação: "risco alto se o
     # município teve pelo menos 1 dia com ocorrência nos 7 dias ANTERIORES a
     # este" — pura persistência recente. shift(1) garante que não olha o
@@ -779,41 +910,46 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
     )
     df["pred_baseline"] = (df["baseline_focos_7d"].fillna(0) > 0).astype(int)
 
-    # Split TEMPORAL pooled: mesmo corte de data para todos os municípios
-    # (treina no passado de todos eles, testa no período mais recente de todos eles)
-    datas_unicas = sorted(df["data"].unique())
-    corte_data = datas_unicas[int(len(datas_unicas) * 0.8)]
-    treino, teste = df[df["data"] < corte_data].copy(), df[df["data"] >= corte_data].copy()
-
-    # Efeito fixo por município: taxa histórica de dias-com-ocorrência DAQUELE
-    # município específico, calculada SÓ com o período de treino (para não vazar
-    # informação do teste). Aplicada como valor constante por município tanto no
-    # treino quanto no teste — captura risco de base (uso do solo, etc.) que o
-    # clima sozinho não explica.
-    taxa_por_municipio = treino.groupby("municipio")["target_foco"].mean().to_dict()
-    taxa_geral_fallback = float(treino["target_foco"].mean())
-    treino["taxa_hist_municipio"] = treino["municipio"].map(taxa_por_municipio)
-    teste["taxa_hist_municipio"] = teste["municipio"].map(taxa_por_municipio).fillna(taxa_geral_fallback)
+    # ================== MODELOS FINAIS (treinados com TODOS os dados) ==================
+    # Usados de fato na inferência do mapa. A CV acima é só o relatório de
+    # performance esperada -- nunca é avaliada no mesmo dado do treino final.
+    taxa_por_municipio = df.groupby("municipio")["target_foco"].mean().to_dict()
+    taxa_geral_fallback = float(df["target_foco"].mean())
+    df["taxa_hist_municipio"] = df["municipio"].map(taxa_por_municipio)
 
     scaler = StandardScaler()
-    X_train = scaler.fit_transform(treino[FEATURES_RISCO])
-    modelo = LogisticRegression(class_weight="balanced", max_iter=1000)
-    modelo.fit(X_train, treino["target_foco"])
+    X_full = scaler.fit_transform(df[FEATURES_RISCO])
 
-    auc = None
+    modelo_lr = LogisticRegression(class_weight="balanced", max_iter=1000)
+    modelo_lr.fit(X_full, df["target_foco"])
+
+    modelo_boost = _ajustar_modelo(_criar_modelo_boosting(), X_full, df["target_foco"])
+
+    # Hold-out temporal simples (últimos 20% dos dias) só para os painéis
+    # visuais existentes (matriz de confusão, calibração) -- eles precisam
+    # de UM conjunto de teste fixo, não faz sentido plotar "matriz de
+    # confusão média de 5 folds". O número-headline de performance é a CV acima.
+    datas_ord = sorted(df["data"].unique())
+    corte_data = datas_ord[int(len(datas_ord) * 0.8)]
+    treino_h = df[df["data"] < corte_data].copy()
+    teste_h = df[df["data"] >= corte_data].copy()
     avaliacao_teste = None
-    if teste["target_foco"].nunique() == 2 and len(teste) > 0:
-        X_test = scaler.transform(teste[FEATURES_RISCO])
-        y_prob = modelo.predict_proba(X_test)[:, 1]
-        y_true = teste["target_foco"].to_numpy()
-        auc = roc_auc_score(y_true, y_prob)
-        # Guarda tudo que o painel de transparência do modelo precisa: rótulo
-        # verdadeiro, probabilidade prevista pelo modelo e previsão do baseline
-        # ingênuo — tudo do MESMO conjunto de teste (nunca visto no treino).
+    if not treino_h.empty and teste_h["target_foco"].nunique() == 2:
+        taxa_h = treino_h.groupby("municipio")["target_foco"].mean().to_dict()
+        fb_h = float(treino_h["target_foco"].mean())
+        treino_h["taxa_hist_municipio"] = treino_h["municipio"].map(taxa_h)
+        teste_h["taxa_hist_municipio"] = teste_h["municipio"].map(taxa_h).fillna(fb_h)
+        teste_h["pred_baseline"] = df.loc[teste_h.index, "pred_baseline"]
+
+        scaler_h = StandardScaler()
+        X_tr_h = scaler_h.fit_transform(treino_h[FEATURES_RISCO])
+        X_te_h = scaler_h.transform(teste_h[FEATURES_RISCO])
+        modelo_h = _ajustar_modelo(_criar_modelo_boosting(), X_tr_h, treino_h["target_foco"])
+        y_prob_h = modelo_h.predict_proba(X_te_h)[:, 1]
         avaliacao_teste = {
-            "y_true": y_true,
-            "y_prob": y_prob,
-            "y_pred_baseline": teste["pred_baseline"].to_numpy(),
+            "y_true": teste_h["target_foco"].to_numpy(),
+            "y_prob": y_prob_h,
+            "y_pred_baseline": teste_h["pred_baseline"].to_numpy(),
         }
 
     # Climatologia mensal: taxa histórica média de dias-com-ocorrência por mês,
@@ -821,7 +957,10 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
     climatologia_mensal = df.groupby("mes")["target_foco"].mean().to_dict()
 
     return {
-        "modelo": modelo, "scaler": scaler, "auc": auc,
+        "modelo": modelo_boost, "modelo_lr": modelo_lr, "scaler": scaler,
+        "algoritmo": "LightGBM" if _LGBM_DISPONIVEL else "HistGradientBoosting (fallback sklearn)",
+        "cv_lr": cv_lr, "cv_boost": cv_boost,
+        "auc": cv_boost["temporal_auc"]["media"] if cv_boost["temporal_auc"] else None,
         "avaliacao_teste": avaliacao_teste,
         "fonte_dados": fonte_dados,
         "climatologia_mensal": climatologia_mensal,
@@ -829,7 +968,7 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
         "taxa_geral_fallback": taxa_geral_fallback,
         "municipios_treino": sorted(df["municipio"].unique().tolist()),
         "n_municipios_treino": df["municipio"].nunique(),
-        "n_dias_treino": len(treino), "n_dias_teste": len(teste),
+        "n_dias_treino": len(treino_h), "n_dias_teste": len(teste_h),
         "n_linhas_total": len(df),
         "taxa_base": df["target_foco"].mean(),
         "amostrado_treino": bool(gdf_treino["amostrado_flag"].iloc[0]),
@@ -1363,7 +1502,7 @@ if st.session_state.gerar_dashboard:
         else:
             st.write("☁️ Analisando satélite MODIS no GEE...")
             try:
-                # Usa funcao cacheada -- segunda consulta ao mesmo periodo e instantanea
+                # Usa funcao cacheada -- segunda consulta ao mesmo periodo é instantanea
                 area_queimada_img, total_valor = buscar_total_modis(
                     geom_json_str, ano_modis, mes_modis
                 )
@@ -2793,9 +2932,13 @@ ser gerados por essa floresta perdida.
                     "com o período de treino) como uma feature extra — assim, dois municípios com o "
                     "mesmo clima podem receber risco diferente se um deles historicamente pega fogo "
                     "muito mais que o outro (uso do solo, fronteira agrícola, etc.).\n"
-                    "- Depois de treinado, o mesmo modelo é aplicado às condições climáticas **atuais** "
-                    "de cada município da região (podendo ser um conjunto maior que o usado no treino) "
-                    "para colorir o mapa.\n"
+                    "- A performance é validada com **duas** estratégias de validação cruzada: "
+                    "temporal (walk-forward, o modelo generaliza pro futuro?) e espacial "
+                    "(GroupKFold por município, o modelo generaliza pra um município nunca visto?), "
+                    "comparando Regressão Logística com um modelo de boosting.\n"
+                    "- Depois de validado, o modelo de boosting é treinado com **todos** os dados e "
+                    "aplicado às condições climáticas **atuais** de cada município da região "
+                    "(podendo ser um conjunto maior que o usado no treino) para colorir o mapa.\n"
                     "- **Amanhã** usa o clima real mais recente disponível. **Próximo mês** é uma "
                     "**estimativa sazonal** (desloca o risco atual pela diferença histórica entre o mês "
                     "atual e o mês seguinte, em espaço log-odds — para não saturar bruscamente em 100%) "
@@ -2884,11 +3027,11 @@ ser gerados por essa floresta perdida.
                         fonte_txt = "Área Queimada (MODIS)" if resultado["fonte_dados"] == "MODIS" else "Focos de Calor (INPE)"
                         msg_treino = (
                             f"✅ Modelo treinado com **{resultado['n_municipios_treino']} município(s)** "
-                            f"usando **{fonte_txt}** ({resultado['n_linhas_total']} dias no total, "
-                            f"todos os dias do período)."
+                            f"usando **{fonte_txt}** · algoritmo: **{resultado['algoritmo']}** "
+                            f"({resultado['n_linhas_total']} dias no total, todos os dias do período)."
                         )
                         if resultado["auc"] is not None:
-                            msg_treino += f" AUC-ROC no teste: **{resultado['auc']:.2f}**"
+                            msg_treino += f" · AUC-ROC (walk-forward, média entre folds): **{resultado['auc']:.2f}**"
                         status.write(msg_treino)
 
                         if resultado["amostrado_treino"]:
@@ -2903,6 +3046,23 @@ ser gerados por essa floresta perdida.
                                 f"instabilidades pontuais de rede — não impede o treino de continuar)."
                             )
 
+                        def _linha_cv(nome_modelo, cv):
+                            def _fmt(m):
+                                return f"{m['media']:.2f} ± {m['desvio']:.2f} ({m['n_folds']} folds)" if m else "— (dados insuficientes)"
+                            return {
+                                "Modelo": nome_modelo,
+                                "AUC — Temporal (walk-forward)": _fmt(cv["temporal_auc"]),
+                                "AUC — Espacial (município novo)": _fmt(cv["espacial_auc"]),
+                                "F1 — Temporal": _fmt(cv["temporal_f1"]),
+                                "F1 — Espacial": _fmt(cv["espacial_f1"]),
+                            }
+
+                        status.write("📊 Comparando Regressão Logística vs. Boosting (validação cruzada)...")
+                        df_cv_comp = pd.DataFrame([
+                            _linha_cv("Regressão Logística", resultado["cv_lr"]),
+                            _linha_cv(resultado["algoritmo"], resultado["cv_boost"]),
+                        ])
+
                         status.write("🗺️ Buscando lista de municípios para o mapa...")
                         gdf_mapa = obter_municipios_regiao(
                             tipo_analise, estado_dd, bioma_dd, municipio_dd, max_municipios=max_mapa
@@ -2910,6 +3070,7 @@ ser gerados por essa floresta perdida.
 
                         status.write(f"🌡️ Calculando risco atual em {len(gdf_mapa)} município(s)...")
                         modelo, scaler = resultado["modelo"], resultado["scaler"]
+                        modelo_lr = resultado["modelo_lr"]
                         hoje = datetime.now()
                         mes_atual = hoje.month
                         mes_alvo = (mes_atual % 12) + 1
@@ -2985,6 +3146,20 @@ ser gerados por essa floresta perdida.
                             st.markdown("---")
                             titulo_horiz = "Amanhã" if horizonte == "Amanhã" else f"Próximo mês (estimativa sazonal)"
                             st.markdown(f"### Risco por município — {titulo_horiz}")
+
+                            st.markdown("### 🧪 Validação do modelo — antes de confiar no mapa")
+                            st.caption(
+                                "Temporal = o modelo generaliza pro futuro (treina no passado, testa no "
+                                "que vem depois, em vários cortes). Espacial = o modelo generaliza pra um "
+                                "município nunca visto no treino — a métrica mais rígida das duas."
+                            )
+                            st.dataframe(df_cv_comp, hide_index=True, use_container_width=True)
+                            if resultado["cv_boost"]["espacial_auc"] is None:
+                                st.info(
+                                    "ℹ️ A validação espacial precisa de pelo menos 2 municípios no treino "
+                                    "para funcionar — não foi possível calculá-la para esta seleção "
+                                    "(ex: análise 'Por Município')."
+                                )
 
                             contagem = df_res["nivel"].value_counts()
                             col_m1, col_m2, col_m3, col_m4 = st.columns(4)
@@ -3103,12 +3278,24 @@ ser gerados por essa floresta perdida.
                             # ---- Explicabilidade do município mais crítico ----
                             municipio_top = df_res.sort_values("probabilidade", ascending=False).iloc[0]["name_muni"]
                             cond_top, X_top = cond_por_municipio[municipio_top]
-                            contrib = pd.DataFrame({
-                                "feature": FEATURES_RISCO,
-                                "contribuicao": (modelo.coef_[0] * X_top[0]),
-                            }).sort_values("contribuicao", key=abs, ascending=False)
+                            if hasattr(modelo, "feature_importances_"):
+                                contrib = pd.DataFrame({
+                                    "feature": FEATURES_RISCO,
+                                    "contribuicao": modelo.feature_importances_,
+                                }).sort_values("contribuicao", ascending=False)
+                                nota_contrib = (
+                                    "Importância **global** do modelo (não é mais a contribuição individual "
+                                    "desse município específico — isso volta com SHAP, próximo passo)."
+                                )
+                            else:
+                                contrib = pd.DataFrame({
+                                    "feature": FEATURES_RISCO,
+                                    "contribuicao": (modelo_lr.coef_[0] * X_top[0]),
+                                }).sort_values("contribuicao", key=abs, ascending=False)
+                                nota_contrib = "Contribuição da Regressão Logística para este município específico."
 
                             st.markdown(f"**🔍 Por que {municipio_top} está com o maior risco:**")
+                            st.caption(nota_contrib)
                             fig_contrib = px.bar(
                                 contrib, x="contribuicao", y="feature",
                                 orientation="h", color="contribuicao",
@@ -3285,7 +3472,8 @@ ser gerados por essa floresta perdida.
                                 "'Próximo mês' é uma estimativa sazonal baseada em climatologia histórica, "
                                 "não uma previsão climática real (não há fonte gratuita de previsão de 30 "
                                 "dias). Para uso operacional, recomenda-se incorporar NDVI, uso do solo e "
-                                "comparar com modelos mais robustos (Random Forest, XGBoost)."
+                                "comparar com modelos mais robustos adicionais e SHAP para explicabilidade "
+                                "por instância."
                             )
                 else:
                     st.info(
