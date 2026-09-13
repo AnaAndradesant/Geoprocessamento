@@ -19,6 +19,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit, GroupKFold
 from sklearn.metrics import f1_score
+from sklearn.ensemble import RandomForestClassifier
 
 # LightGBM é o modelo principal; se não estiver instalado (ex: ainda não foi
 # adicionado ao requirements.txt), cai para HistGradientBoostingClassifier
@@ -436,7 +437,15 @@ FEATURES_CLIMA = [
 # (sem vazamento de dados). Captura risco basal que não depende do clima do dia
 # (ex: uso do solo, fronteira agrícola, proximidade de estradas) — dois municípios
 # com o mesmo clima podem ter risco de base muito diferente por essas razões.
-FEATURES_RISCO = FEATURES_CLIMA + ["taxa_hist_municipio"]
+
+# NDVI do MÊS ANTERIOR (Sentinel-2): proxy do estresse hídrico acumulado da
+# vegetação. Usamos o mês ANTERIOR, não o mês corrente, de propósito: o NDVI do
+# próprio mês do evento já pode refletir a cicatriz da queimada (vegetação
+# queimada = NDVI baixo), o que seria vazamento de dado (a "causa" já conteria
+# um pedaço do "efeito"). O mês anterior é puramente pré-evento.
+FEATURES_NDVI = ["ndvi_mes_anterior"]
+
+FEATURES_RISCO = FEATURES_CLIMA + FEATURES_NDVI + ["taxa_hist_municipio"]
 
 # =====================================================================
 # 🎯 VALIDAÇÃO CRUZADA ROBUSTA — temporal (walk-forward) + espacial
@@ -465,6 +474,16 @@ def _criar_modelo_boosting():
     )
 
 
+def _criar_modelo_rf():
+    """Fábrica do Random Forest -- terceiro candidato na comparação de modelos.
+    Profundidade e folha mínima limitadas de propósito (dataset é relativamente
+    pequeno por região) para reduzir overfitting."""
+    return RandomForestClassifier(
+        n_estimators=300, max_depth=8, min_samples_leaf=5,
+        class_weight="balanced", random_state=42, n_jobs=-1
+    )
+
+
 def _sample_weight_balanceado(y):
     """Pesos por amostra equivalentes a class_weight='balanced', para
     HistGradientBoostingClassifier (que não aceita esse parâmetro direto)."""
@@ -477,13 +496,16 @@ def _sample_weight_balanceado(y):
 
 
 def _ajustar_modelo(modelo, X_treino, y_treino):
-    """Ajusta o modelo tratando a diferença de API entre LogisticRegression
-    (aceita class_weight no construtor), LightGBM (idem) e o fallback
-    HistGradientBoostingClassifier (precisa de sample_weight explícito)."""
-    if isinstance(modelo, LogisticRegression) or _LGBM_DISPONIVEL:
-        modelo.fit(X_treino, y_treino)
-    else:
+    """Ajusta o modelo tratando a diferença de API: LogisticRegression,
+    RandomForest e LightGBM aceitam class_weight direto no construtor; só o
+    fallback HistGradientBoostingClassifier (usado quando lightgbm não está
+    instalado) precisa de sample_weight manual. O 'and' abaixo faz short-circuit,
+    então isinstance só roda quando _LGBM_DISPONIVEL é False -- por isso é seguro
+    mesmo quando HistGradientBoostingClassifier não chegou a ser importado."""
+    if (not _LGBM_DISPONIVEL) and isinstance(modelo, HistGradientBoostingClassifier):
         modelo.fit(X_treino, y_treino, sample_weight=_sample_weight_balanceado(y_treino))
+    else:
+        modelo.fit(X_treino, y_treino)
     return modelo
 
 
@@ -689,10 +711,11 @@ def _engenharia_features_risco(df_clima):
         df_clima[f"chuva_acumulada_{janela}d"] = df_clima["PRECTOTCORR"].rolling(janela, min_periods=1).sum()
 
     df_clima["mes"] = df_clima["data"].dt.month
+    df_clima["ano"] = df_clima["data"].dt.year
     df_clima["mes_sin"] = np.sin(2 * np.pi * df_clima["mes"] / 12)
     df_clima["mes_cos"] = np.cos(2 * np.pi * df_clima["mes"] / 12)
 
-    cols_shift = [c for c in df_clima.columns if c not in ("data", "mes", "mes_sin", "mes_cos")]
+    cols_shift = [c for c in df_clima.columns if c not in ("data", "mes", "ano", "mes_sin", "mes_cos")]
     df_clima[cols_shift] = df_clima[cols_shift].shift(1)
     return df_clima
 
@@ -824,6 +847,93 @@ def buscar_burndate_diario_modis(geom_json_str, d_ini, d_fim):
     return df
 
 
+# =====================================================================
+# 🌿 NDVI (Sentinel-2) — proxy de estresse hídrico da vegetação
+# =====================================================================
+
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
+def buscar_ndvi_mensal_municipio(geom_json_str, d_ini, d_fim):
+    """
+    Série MENSAL de NDVI médio (Sentinel-2, banda NDVI = (B8-B4)/(B8+B4)) para
+    o polígono do município -- composição mensal (mediana), reduz ruído de
+    nuvens e datas isoladas. Usado como proxy de estresse hídrico acumulado
+    da vegetação (complementa o clima diário, que não capta acúmulo de longo
+    prazo). Nunca levanta exceção: falha isolada em 1 mês não derruba o treino.
+    """
+    poly = ee.Geometry(json.loads(geom_json_str))
+    dt_ini = datetime.strptime(d_ini, "%Y-%m-%d")
+    dt_fim = datetime.strptime(d_fim, "%Y-%m-%d")
+
+    meses = []
+    cursor = dt_ini.replace(day=1)
+    while cursor <= dt_fim:
+        prox_mes = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
+        meses.append((cursor, prox_mes))
+        cursor = prox_mes
+
+    def _buscar_mes(bloco_mes):
+        mes_ini, mes_fim = bloco_mes
+        try:
+            col = (
+                ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+                .filterBounds(poly)
+                .filterDate(mes_ini.strftime("%Y-%m-%d"), mes_fim.strftime("%Y-%m-%d"))
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+            )
+            img = col.median()
+            ndvi = img.normalizedDifference(['B8', 'B4']).rename('ndvi')
+            stats = ndvi.reduceRegion(
+                reducer=ee.Reducer.mean(), geometry=poly, scale=100,
+                maxPixels=1e13, bestEffort=True, tileScale=4
+            ).getInfo()
+            val = stats.get('ndvi')
+            if val is None:
+                return None
+            return {"ano": mes_ini.year, "mes": mes_ini.month, "ndvi": float(val)}
+        except Exception:
+            return None
+
+    registros = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        for r in executor.map(_buscar_mes, meses):
+            if r is not None:
+                registros.append(r)
+
+    if not registros:
+        return pd.DataFrame(columns=["ano", "mes", "ndvi"])
+    return pd.DataFrame(registros)
+
+
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
+def buscar_ndvi_recente(lat, lon, d_ini, d_fim, raio_m=3000):
+    """
+    NDVI médio recente (Sentinel-2) num raio ao redor de um ponto -- usado na
+    INFERÊNCIA (mapa de risco atual), onde só temos lat/lon, não o polígono
+    completo do município. É uma aproximação: o treino usa a composição do
+    polígono municipal inteiro, aqui usamos um buffer de raio_m ao redor do
+    centro. Documentar essa diferença é importante -- é uma simplificação,
+    não um erro escondido. Nunca levanta exceção: retorna None em falha.
+    """
+    try:
+        ponto = ee.Geometry.Point([lon, lat]).buffer(raio_m)
+        col = (
+            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+            .filterBounds(ponto)
+            .filterDate(d_ini, d_fim)
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+        )
+        img = col.median()
+        ndvi = img.normalizedDifference(['B8', 'B4']).rename('ndvi')
+        stats = ndvi.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=ponto, scale=20,
+            maxPixels=1e9, bestEffort=True
+        ).getInfo()
+        val = stats.get('ndvi')
+        return float(val) if val is not None else None
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_dd,
                                    anos_historico=2, n_amostra_treino=8, fonte_dados="INPE"):
@@ -854,8 +964,8 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
             df_clima = buscar_clima_nasa_power(row['lat'], row['lon'], d_ini, d_fim)
             if df_clima.empty or df_clima["T2M"].isna().all():
                 return None
+            geom_muni_str = json.dumps(row['geometry'].__geo_interface__, sort_keys=True)
             if fonte_dados == "MODIS":
-                geom_muni_str = json.dumps(row['geometry'].__geo_interface__, sort_keys=True)
                 df_ocorrencia = buscar_burndate_diario_modis(geom_muni_str, d_ini, d_fim)
             else:
                 df_ocorrencia = buscar_historico_focos_diario(
@@ -866,6 +976,19 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
             df_m["n_focos"] = df_m["n_focos"].fillna(0)
             df_m["target_foco"] = (df_m["n_focos"] > 0).astype(int)
             df_m["municipio"] = row['name_muni']
+
+            # --- NDVI do mês anterior (Sentinel-2) ---
+            # Falha aqui não derruba o município inteiro: só fica sem a feature
+            # de NDVI naquele mês (vira NaN e é descartado no dropna mais à frente).
+            df_ndvi = buscar_ndvi_mensal_municipio(geom_muni_str, d_ini, d_fim)
+            if not df_ndvi.empty:
+                df_ndvi = df_ndvi.sort_values(["ano", "mes"]).reset_index(drop=True)
+                df_ndvi["ndvi_mes_anterior"] = df_ndvi["ndvi"].shift(1)
+                df_m = df_m.merge(
+                    df_ndvi[["ano", "mes", "ndvi_mes_anterior"]], on=["ano", "mes"], how="left"
+                )
+            else:
+                df_m["ndvi_mes_anterior"] = np.nan
             return df_m
         except Exception:
             return None
@@ -887,17 +1010,29 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
     if not frames:
         return {"erro": "Não foi possível obter dados para os municípios amostrados. Tente novamente."}
 
-    df = pd.concat(frames, ignore_index=True).dropna(subset=FEATURES_CLIMA)
+    df = pd.concat(frames, ignore_index=True).dropna(subset=FEATURES_CLIMA + FEATURES_NDVI)
     if len(df) < 100 or df["target_foco"].nunique() < 2:
         fonte_txt = "área queimada (MODIS)" if fonte_dados == "MODIS" else "focos (INPE)"
         return {"erro": f"Histórico insuficiente ou sem variação de {fonte_txt} para treinar um modelo confiável nesta região/período."}
 
     # ================== VALIDAÇÃO CRUZADA (temporal + espacial) ==================
-    # Compara Regressão Logística (baseline interpretável) com o modelo de
-    # boosting, nas duas estratégias, ANTES de treinar o modelo final —
-    # é a performance honesta que vai pro relatório/defesa.
-    cv_lr = _avaliar_cv(df, FEATURES_RISCO, lambda: LogisticRegression(class_weight="balanced", max_iter=1000))
-    cv_boost = _avaliar_cv(df, FEATURES_RISCO, _criar_modelo_boosting)
+    # Compara TRÊS candidatos -- Regressão Logística (baseline interpretável),
+    # Random Forest e Boosting -- nas duas estratégias de CV, ANTES de treinar
+    # o modelo final. É a performance honesta que vai pro relatório/defesa.
+    nome_boost = "LightGBM" if _LGBM_DISPONIVEL else "HistGradientBoosting (fallback sklearn)"
+    fabricas_candidatas = {
+        "Regressão Logística": lambda: LogisticRegression(class_weight="balanced", max_iter=1000),
+        "Random Forest": _criar_modelo_rf,
+        nome_boost: _criar_modelo_boosting,
+    }
+    cv_resultados = {nome: _avaliar_cv(df, FEATURES_RISCO, fabrica) for nome, fabrica in fabricas_candidatas.items()}
+
+    # Seleção automática do modelo "vencedor": maior AUC médio na validação
+    # TEMPORAL (é a que mais importa pro uso real -- prever o futuro). Fica
+    # documentado no retorno (`criterio_selecao`) para citar no texto do TCC.
+    def _score(cv):
+        return cv["temporal_auc"]["media"] if cv["temporal_auc"] else -1
+    melhor_nome = max(cv_resultados, key=lambda nome: _score(cv_resultados[nome]))
 
     # Baseline ingênuo (sem ML, sem clima) pra comparação: "risco alto se o
     # município teve pelo menos 1 dia com ocorrência nos 7 dias ANTERIORES a
@@ -911,11 +1046,14 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
     df["pred_baseline"] = (df["baseline_focos_7d"].fillna(0) > 0).astype(int)
 
     # ================== MODELOS FINAIS (treinados com TODOS os dados) ==================
-    # Usados de fato na inferência do mapa. A CV acima é só o relatório de
-    # performance esperada -- nunca é avaliada no mesmo dado do treino final.
+    # O modelo VENCEDOR é usado de fato na inferência do mapa. A LR também é
+    # sempre treinada à parte (referência interpretável + fallback de
+    # explicabilidade). A CV acima é só o relatório de performance esperada --
+    # nunca é avaliada no mesmo dado do treino final.
     taxa_por_municipio = df.groupby("municipio")["target_foco"].mean().to_dict()
     taxa_geral_fallback = float(df["target_foco"].mean())
     df["taxa_hist_municipio"] = df["municipio"].map(taxa_por_municipio)
+    ndvi_medio_treino = float(df["ndvi_mes_anterior"].mean())
 
     scaler = StandardScaler()
     X_full = scaler.fit_transform(df[FEATURES_RISCO])
@@ -923,7 +1061,10 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
     modelo_lr = LogisticRegression(class_weight="balanced", max_iter=1000)
     modelo_lr.fit(X_full, df["target_foco"])
 
-    modelo_boost = _ajustar_modelo(_criar_modelo_boosting(), X_full, df["target_foco"])
+    if melhor_nome == "Regressão Logística":
+        modelo_vencedor = modelo_lr
+    else:
+        modelo_vencedor = _ajustar_modelo(fabricas_candidatas[melhor_nome](), X_full, df["target_foco"])
 
     # Hold-out temporal simples (últimos 20% dos dias) só para os painéis
     # visuais existentes (matriz de confusão, calibração) -- eles precisam
@@ -944,7 +1085,7 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
         scaler_h = StandardScaler()
         X_tr_h = scaler_h.fit_transform(treino_h[FEATURES_RISCO])
         X_te_h = scaler_h.transform(teste_h[FEATURES_RISCO])
-        modelo_h = _ajustar_modelo(_criar_modelo_boosting(), X_tr_h, treino_h["target_foco"])
+        modelo_h = _ajustar_modelo(fabricas_candidatas[melhor_nome](), X_tr_h, treino_h["target_foco"])
         y_prob_h = modelo_h.predict_proba(X_te_h)[:, 1]
         avaliacao_teste = {
             "y_true": teste_h["target_foco"].to_numpy(),
@@ -957,15 +1098,17 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
     climatologia_mensal = df.groupby("mes")["target_foco"].mean().to_dict()
 
     return {
-        "modelo": modelo_boost, "modelo_lr": modelo_lr, "scaler": scaler,
-        "algoritmo": "LightGBM" if _LGBM_DISPONIVEL else "HistGradientBoosting (fallback sklearn)",
-        "cv_lr": cv_lr, "cv_boost": cv_boost,
-        "auc": cv_boost["temporal_auc"]["media"] if cv_boost["temporal_auc"] else None,
+        "modelo": modelo_vencedor, "modelo_lr": modelo_lr, "scaler": scaler,
+        "algoritmo": melhor_nome,
+        "criterio_selecao": "Maior AUC médio na validação cruzada temporal (walk-forward)",
+        "cv_resultados": cv_resultados,
+        "auc": _score(cv_resultados[melhor_nome]) if _score(cv_resultados[melhor_nome]) > -1 else None,
         "avaliacao_teste": avaliacao_teste,
         "fonte_dados": fonte_dados,
         "climatologia_mensal": climatologia_mensal,
         "taxa_por_municipio": taxa_por_municipio,
         "taxa_geral_fallback": taxa_geral_fallback,
+        "ndvi_medio_treino": ndvi_medio_treino,
         "municipios_treino": sorted(df["municipio"].unique().tolist()),
         "n_municipios_treino": df["municipio"].nunique(),
         "n_dias_treino": len(treino_h), "n_dias_teste": len(teste_h),
@@ -992,7 +1135,17 @@ def buscar_condicoes_atuais(lat, lon):
         df_feat = _engenharia_features_risco(df_clima).dropna(subset=FEATURES_CLIMA)
         if df_feat.empty:
             return None
-        return df_feat.iloc[[-1]]
+        linha = df_feat.iloc[[-1]].copy()
+
+        # NDVI recente, como proxy do "mês anterior" usado no treino. Janela de
+        # 60 dias (não 30) porque Sentinel-2 revisita a cada ~5 dias e nuvens
+        # reduzem bastante as cenas aproveitáveis -- 30 dias às vezes fica vazio.
+        # É uma simplificação frente ao treino (que usa o polígono municipal
+        # inteiro, não um buffer de ponto) -- documentado no código de propósito.
+        d_ini_ndvi = (hoje - timedelta(days=60)).strftime("%Y-%m-%d")
+        ndvi_val = buscar_ndvi_recente(lat, lon, d_ini_ndvi, d_fim)
+        linha["ndvi_mes_anterior"] = ndvi_val if ndvi_val is not None else np.nan
+        return linha
     except Exception:
         return None
 
@@ -2929,14 +3082,16 @@ ser gerados por essa floresta perdida.
                     "de histórico escolhido (clima diário + se houve ou não ocorrência naquele dia) "
                     "— não é uma amostra de dias, é o histórico diário completo.\n"
                     "- Além do clima, o modelo usa a **taxa histórica de cada município** (calculada só "
-                    "com o período de treino) como uma feature extra — assim, dois municípios com o "
+                    "com o período de treino) e o **NDVI do mês anterior** (Sentinel-2, indicador de "
+                    "estresse hídrico da vegetação) como features extras — assim, dois municípios com o "
                     "mesmo clima podem receber risco diferente se um deles historicamente pega fogo "
-                    "muito mais que o outro (uso do solo, fronteira agrícola, etc.).\n"
+                    "muito mais que o outro, ou se a vegetação já estava mais seca antes do evento.\n"
                     "- A performance é validada com **duas** estratégias de validação cruzada: "
                     "temporal (walk-forward, o modelo generaliza pro futuro?) e espacial "
                     "(GroupKFold por município, o modelo generaliza pra um município nunca visto?), "
-                    "comparando Regressão Logística com um modelo de boosting.\n"
-                    "- Depois de validado, o modelo de boosting é treinado com **todos** os dados e "
+                    "comparando **três** candidatos: Regressão Logística, Random Forest e Boosting.\n"
+                    "- O algoritmo **vencedor** é escolhido automaticamente (maior AUC médio na "
+                    "validação temporal) e é ele que é treinado com **todos** os dados e "
                     "aplicado às condições climáticas **atuais** de cada município da região "
                     "(podendo ser um conjunto maior que o usado no treino) para colorir o mapa.\n"
                     "- **Amanhã** usa o clima real mais recente disponível. **Próximo mês** é uma "
@@ -2944,6 +3099,31 @@ ser gerados por essa floresta perdida.
                     "atual e o mês seguinte, em espaço log-odds — para não saturar bruscamente em 100%) "
                     "— não existe fonte gratuita de previsão climática de 30 dias, então isso não é uma "
                     "previsão dia-a-dia, e sim uma tendência baseada em climatologia."
+                )
+
+            with st.expander("📖 Glossário rápido (pra quem não é da área)", expanded=False):
+                st.markdown(
+                    "**AUC-ROC** — nota de 0 a 1 pra dizer se o modelo separa bem dia-de-risco de "
+                    "dia-sem-risco. 0,50 = mesma coisa que jogar moeda (não aprendeu nada). "
+                    "1,00 = separa perfeitamente. Na prática, acima de 0,70 já é considerado útil; "
+                    "acima de 0,85 é forte.\n\n"
+                    "**F1-score** — nota de 0 a 1 que equilibra duas coisas: 'quando o modelo diz "
+                    "risco, ele acerta?' (precisão) e 'de todas as vezes que teve risco de verdade, "
+                    "quantas o modelo pegou?' (recall). Serve pra não confiar só na AUC, que pode "
+                    "esconder um modelo bom em teoria mas ruim na prática.\n\n"
+                    "**Validação temporal** — testar o modelo em dias que ele nunca viu, sempre "
+                    "no FUTURO em relação ao que ele aprendeu. Simula o uso real: hoje eu só sei "
+                    "o passado.\n\n"
+                    "**Validação espacial** — testar o modelo num MUNICÍPIO que ele nunca viu "
+                    "no treino. Mais rígida que a temporal: mostra se o modelo aprendeu um padrão "
+                    "de verdade (clima → risco) ou só decorou o comportamento de alguns lugares.\n\n"
+                    "**NDVI** — um número entre -1 e 1 calculado a partir de imagem de satélite que "
+                    "indica o quão 'verde e saudável' está a vegetação. Vegetação seca/estressada "
+                    "tem NDVI mais baixo e queima mais fácil.\n\n"
+                    "**Baseline ingênuo** — o modelo mais simples possível, sem nenhuma "
+                    "inteligência: 'se pegou fogo nos últimos 7 dias, marco risco alto'. Serve de "
+                    "régua mínima — se o modelo de Machine Learning não superar isso, ele não "
+                    "está agregando valor de verdade."
                 )
 
             try:
@@ -2977,13 +3157,10 @@ ser gerados por essa floresta perdida.
                 with col_p2:
                     if tipo_analise == "Por Município":
                         n_amostra_treino = 1
-                        st.select_slider(
-                            "Municípios usados no treino:",
-                            options=[1], value=1,
-                            key="n_treino_risco_muni",
-                            disabled=True,
-                            help="Análise 'Por Município' treina só com o município selecionado."
-                        )
+                        # st.select_slider com uma ÚNICA opção quebra o componente JS do
+                        # Streamlit (RangeError: min(0) >= max(0)) -- por isso aqui é só
+                        # um texto informativo, não um slider.
+                        st.caption("Municípios usados no treino: **1** (o selecionado)")
                     else:
                         n_amostra_treino = st.select_slider(
                             "Municípios usados no treino:",
@@ -3033,6 +3210,10 @@ ser gerados por essa floresta perdida.
                         if resultado["auc"] is not None:
                             msg_treino += f" · AUC-ROC (walk-forward, média entre folds): **{resultado['auc']:.2f}**"
                         status.write(msg_treino)
+                        status.write(
+                            f"🏆 Algoritmo escolhido automaticamente: **{resultado['algoritmo']}** "
+                            f"({resultado['criterio_selecao']})."
+                        )
 
                         if resultado["amostrado_treino"]:
                             status.write(
@@ -3057,10 +3238,10 @@ ser gerados por essa floresta perdida.
                                 "F1 — Espacial": _fmt(cv["espacial_f1"]),
                             }
 
-                        status.write("📊 Comparando Regressão Logística vs. Boosting (validação cruzada)...")
+                        status.write("📊 Comparando Regressão Logística, Random Forest e Boosting (validação cruzada)...")
                         df_cv_comp = pd.DataFrame([
-                            _linha_cv("Regressão Logística", resultado["cv_lr"]),
-                            _linha_cv(resultado["algoritmo"], resultado["cv_boost"]),
+                            _linha_cv(nome + ("  ⭐" if nome == resultado["algoritmo"] else ""), cv)
+                            for nome, cv in resultado["cv_resultados"].items()
                         ])
 
                         status.write("🗺️ Buscando lista de municípios para o mapa...")
@@ -3121,6 +3302,11 @@ ser gerados por essa floresta perdida.
                             # conhecida; município novo (só apareceu no mapa) usa a média geral
                             # da amostra de treino como aproximação razoável.
                             cond["taxa_hist_municipio"] = taxa_por_municipio.get(row["name_muni"], taxa_fallback)
+                            # NDVI pode não vir (nuvens cobrindo a região na janela de 60 dias) --
+                            # cai pro NDVI médio observado no treino em vez de deixar o modelo
+                            # receber NaN (que quebraria a predição).
+                            if pd.isna(cond["ndvi_mes_anterior"]).any():
+                                cond["ndvi_mes_anterior"] = resultado["ndvi_medio_treino"]
                             X = scaler.transform(cond[FEATURES_RISCO])
                             prob_amanha = float(modelo.predict_proba(X)[0, 1])
                             if horizonte == "Próximo mês":
@@ -3154,7 +3340,25 @@ ser gerados por essa floresta perdida.
                                 "município nunca visto no treino — a métrica mais rígida das duas."
                             )
                             st.dataframe(df_cv_comp, hide_index=True, use_container_width=True)
-                            if resultado["cv_boost"]["espacial_auc"] is None:
+                            st.caption(f"⭐ = algoritmo escolhido para o mapa ({resultado['criterio_selecao']}).")
+
+                            # Leitura automática em linguagem simples do AUC do vencedor --
+                            # pra quem não quer decifrar a tabela número por número.
+                            auc_vencedor = resultado["auc"]
+                            if auc_vencedor is not None:
+                                if auc_vencedor >= 0.85:
+                                    veredicto_auc = "🟢 **Forte.** O modelo separa bem dias de risco alto e baixo."
+                                elif auc_vencedor >= 0.70:
+                                    veredicto_auc = "🟡 **Razoável.** O modelo ajuda, mas com espaço claro pra melhorar."
+                                elif auc_vencedor >= 0.55:
+                                    veredicto_auc = "🟠 **Fraco.** Pouco melhor que chute — use o mapa com cautela."
+                                else:
+                                    veredicto_auc = "🔴 **Não confiável.** Praticamente igual a jogar moeda (0,50)."
+                                st.caption(
+                                    f"**Em resumo:** AUC de {auc_vencedor:.2f} na validação temporal → {veredicto_auc}"
+                                )
+
+                            if resultado["cv_resultados"][resultado["algoritmo"]]["espacial_auc"] is None:
                                 st.info(
                                     "ℹ️ A validação espacial precisa de pelo menos 2 municípios no treino "
                                     "para funcionar — não foi possível calculá-la para esta seleção "
