@@ -1656,6 +1656,30 @@ def buscar_total_modis(geom_json_str, ano, mes):
     return img, area
 
 
+def _burndate_seguro(colecao):
+    """
+    Reduz uma ImageCollection de BurnDate a uma única imagem, tratando o caso
+    de COLEÇÃO VAZIA.
+
+    Por que existe: `.max()` sobre uma coleção vazia devolve uma imagem com
+    ZERO bandas. Qualquer operação seguinte que compare bandas -- como
+    `.gt(0)` -- falha com "Image.gt: If one image has no bands, the other must
+    also have no bands. Got 0 and 1". Isso acontece de forma rotineira nos
+    meses do ano corrente cujos dados MODIS ainda não foram publicados
+    (há atraso típico de 1 a 2 meses).
+
+    Retornar uma constante 0 com a banda nomeada faz o cálculo seguir
+    normalmente e resultar em 0 km² para aquele mês, que é a resposta correta.
+    """
+    return ee.Image(
+        ee.Algorithms.If(
+            colecao.size().gt(0),
+            colecao.max(),
+            ee.Image.constant(0).rename('BurnDate')
+        )
+    )
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_anomalia_modis(geom_json_str, ano_ref):
     ee_geom = ee.Geometry(json.loads(geom_json_str))
@@ -1690,23 +1714,25 @@ def calcular_anomalia_modis(geom_json_str, ano_ref):
     def calc_mes_feature(mes):
         mes_n = ee.Number(mes)
         ini_ref = ee.Date.fromYMD(ano_ref, mes_n, 1)
-        img_ref = (
+        col_ref = (
             ee.ImageCollection('MODIS/061/MCD64A1')
             .filterDate(ini_ref, ini_ref.advance(1, 'month'))
             .filterBounds(geom_simplificada)
-            .select('BurnDate').max().clip(geom_simplificada)
+            .select('BurnDate')
         )
+        img_ref = _burndate_seguro(col_ref).clip(geom_simplificada)
         area_ref = ee.Number(get_area_km2(img_ref))
 
         def area_ano_hist(ano):
             ano_n = ee.Number(ano)
             ini_h = ee.Date.fromYMD(ano_n, mes_n, 1)
-            img_h = (
+            col_h = (
                 ee.ImageCollection('MODIS/061/MCD64A1')
                 .filterDate(ini_h, ini_h.advance(1, 'month'))
                 .filterBounds(geom_simplificada)
-                .select('BurnDate').max().clip(geom_simplificada)
+                .select('BurnDate')
             )
+            img_h = _burndate_seguro(col_h).clip(geom_simplificada)
             return get_area_km2(img_h)
 
         areas_hist = anos_ee.map(area_ano_hist)
@@ -2524,11 +2550,14 @@ if st.session_state.gerar_dashboard:
                             def calc_mes(m):
                                 m_num = ee.Number(m)
                                 ini = ee.Date.fromYMD(ano_modis, m_num, 1)
-                                img_mes = (
+                                col_mes = (
                                     ee.ImageCollection('MODIS/061/MCD64A1')
                                     .filterDate(ini, ini.advance(1, 'month'))
-                                    .select('BurnDate').max().clip(geom_temporal)
+                                    .select('BurnDate')
                                 )
+                                # _burndate_seguro trata o mês sem dado publicado
+                                # (coleção vazia -> imagem com 0 bandas -> .gt(0) falha)
+                                img_mes = _burndate_seguro(col_mes).clip(geom_temporal)
                                 val = (ee.Image.pixelArea().divide(1000000)
                                     .updateMask(img_mes.gt(0))
                                     .reduceRegion(reducer=ee.Reducer.sum(),
@@ -3172,10 +3201,15 @@ if st.session_state.gerar_dashboard:
                     "Selecione outro mês ou ano."
                 )
             else:
-                # Leitura dos parâmetros do session_state (definidos no expander abaixo)
-                bioma_calc = st.session_state.get("bioma_impacto",
-                    bioma_detectado if bioma_detectado in VALORES_ECOSSIS
-                    else list(VALORES_ECOSSIS.keys())[0])
+                # Leitura dos parâmetros do session_state (definidos no expander abaixo).
+                # A chave do bioma inclui a região analisada (val_sel) de propósito:
+                # sem isso, o valor escolhido numa análise anterior (ex: Pantanal)
+                # ficaria preso no session_state e sobrescreveria o bioma detectado
+                # da região atual (ex: Amazônia), gerando cálculo com o parâmetro errado.
+                _key_bioma = f"bioma_impacto_{val_sel}"
+                bioma_padrao = (bioma_detectado if bioma_detectado in VALORES_ECOSSIS
+                                else list(VALORES_ECOSSIS.keys())[0])
+                bioma_calc = st.session_state.get(_key_bioma, bioma_padrao)
                 cenario    = st.session_state.get("cenario_impacto", "moderado")
                 cambio_usd = st.session_state.get("cambio_impacto", CAMBIO_FIXO)
 
@@ -3304,12 +3338,16 @@ ser gerados por essa floresta perdida.
                 )
 
                 with st.expander("⚙️ Ajustar parâmetros do cálculo"):
+                    st.caption(
+                        f"Bioma detectado automaticamente para esta análise: **{bioma_padrao}**. "
+                        "Você pode sobrescrever abaixo — a escolha vale só para esta região."
+                    )
                     pc1, pc2, pc3 = st.columns(3)
                     with pc1:
                         st.selectbox(
                             "Bioma:", list(VALORES_ECOSSIS.keys()),
                             index=list(VALORES_ECOSSIS.keys()).index(bioma_calc),
-                            key="bioma_impacto"
+                            key=_key_bioma
                         )
                     with pc2:
                         st.selectbox(
