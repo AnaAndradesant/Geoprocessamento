@@ -509,14 +509,17 @@ def _ajustar_modelo(modelo, X_treino, y_treino):
     return modelo
 
 
-def _treinar_e_avaliar_fold(treino, teste, features, fabrica_modelo):
+def _treinar_e_avaliar_fold(treino, teste, features, fabrica_modelo, col_grupo="municipio"):
     """Treina e avalia UM fold: recalcula taxa_hist_municipio só com o
-    treino do fold, ajusta o modelo, retorna (AUC, F1) no teste do fold."""
+    treino do fold, ajusta o modelo, retorna (AUC, F1) no teste do fold.
+
+    col_grupo define a unidade espacial: "municipio" no modo painel,
+    "celula" (grade ~25km) no modo caso-controle."""
     treino, teste = treino.copy(), teste.copy()
-    taxa_fold = treino.groupby("municipio")["target_foco"].mean().to_dict()
+    taxa_fold = treino.groupby(col_grupo)["target_foco"].mean().to_dict()
     fallback_fold = float(treino["target_foco"].mean())
-    treino["taxa_hist_municipio"] = treino["municipio"].map(taxa_fold)
-    teste["taxa_hist_municipio"] = teste["municipio"].map(taxa_fold).fillna(fallback_fold)
+    treino["taxa_hist_municipio"] = treino[col_grupo].map(taxa_fold)
+    teste["taxa_hist_municipio"] = teste[col_grupo].map(taxa_fold).fillna(fallback_fold)
 
     scaler_fold = StandardScaler()
     X_treino = scaler_fold.fit_transform(treino[features])
@@ -530,11 +533,15 @@ def _treinar_e_avaliar_fold(treino, teste, features, fabrica_modelo):
     return auc, f1
 
 
-def _avaliar_cv(df, features, fabrica_modelo, n_splits_temporal=5):
+def _avaliar_cv(df, features, fabrica_modelo, n_splits_temporal=5, col_grupo="municipio"):
     """Roda as duas estratégias de CV e devolve média ± desvio-padrão de
     AUC e F1 para cada uma. Retorna None num item se não houver dados
-    suficientes para montar aquela estratégia (ex: só 1 município disponível
-    torna a CV espacial inviável)."""
+    suficientes para montar aquela estratégia (ex: só 1 grupo disponível
+    torna a CV espacial inviável).
+
+    col_grupo: "municipio" (modo painel) ou "celula" (modo caso-controle,
+    blocking espacial por grade de ~25km -- evita que focos vizinhos, que são
+    espacialmente correlacionados, fiquem divididos entre treino e teste)."""
     df = df.sort_values("data").reset_index(drop=True)
     datas_unicas = df["data"].unique()
     out = {"temporal": {"auc": [], "f1": []}, "espacial": {"auc": [], "f1": []}}
@@ -546,18 +553,18 @@ def _avaliar_cv(df, features, fabrica_modelo, n_splits_temporal=5):
             te = df[df["data"].isin(datas_unicas[idx_te])]
             if tr["target_foco"].nunique() < 2 or te["target_foco"].nunique() < 2:
                 continue
-            auc, f1 = _treinar_e_avaliar_fold(tr, te, features, fabrica_modelo)
+            auc, f1 = _treinar_e_avaliar_fold(tr, te, features, fabrica_modelo, col_grupo)
             out["temporal"]["auc"].append(auc)
             out["temporal"]["f1"].append(f1)
 
-    municipios = df["municipio"].unique()
-    n_splits_espacial = min(5, len(municipios))
+    grupos = df[col_grupo].unique()
+    n_splits_espacial = min(5, len(grupos))
     if n_splits_espacial >= 2:
-        for idx_tr, idx_te in GroupKFold(n_splits=n_splits_espacial).split(df, groups=df["municipio"]):
+        for idx_tr, idx_te in GroupKFold(n_splits=n_splits_espacial).split(df, groups=df[col_grupo]):
             tr, te = df.iloc[idx_tr], df.iloc[idx_te]
             if tr["target_foco"].nunique() < 2 or te["target_foco"].nunique() < 2:
                 continue
-            auc, f1 = _treinar_e_avaliar_fold(tr, te, features, fabrica_modelo)
+            auc, f1 = _treinar_e_avaliar_fold(tr, te, features, fabrica_modelo, col_grupo)
             out["espacial"]["auc"].append(auc)
             out["espacial"]["f1"].append(f1)
 
@@ -934,20 +941,327 @@ def buscar_ndvi_recente(lat, lon, d_ini, d_fim, raio_m=3000):
         return None
 
 
+def _validar_treinar_e_empacotar(df, col_grupo, fonte_dados, modo_amostragem,
+                                  diagnostico_amostragem, amostrado_treino,
+                                  total_disponivel, n_municipios_falha):
+    """
+    MOTOR COMPARTILHADO de validação, seleção e treino final.
+
+    Recebe o dataset já montado (venha ele do modo painel ou do modo
+    caso-controle) e faz sempre a mesma coisa: valida três candidatos nas
+    duas estratégias de CV, escolhe o vencedor pelo AUC temporal, treina o
+    final com todos os dados e empacota o resultado.
+
+    Manter isso numa função só garante que os dois modos de amostragem sejam
+    avaliados sob EXATAMENTE o mesmo protocolo -- o que é o que torna a
+    comparação entre eles defensável metodologicamente.
+
+    col_grupo: "municipio" (painel) ou "celula" (caso-controle) -- é a chave
+    de agrupamento da validação espacial e do cálculo da taxa histórica.
+    """
+    # ================== VALIDAÇÃO CRUZADA (temporal + espacial) ==================
+    nome_boost = "LightGBM" if _LGBM_DISPONIVEL else "HistGradientBoosting (fallback sklearn)"
+    fabricas_candidatas = {
+        "Regressão Logística": lambda: LogisticRegression(class_weight="balanced", max_iter=1000),
+        "Random Forest": _criar_modelo_rf,
+        nome_boost: _criar_modelo_boosting,
+    }
+    cv_resultados = {
+        nome: _avaliar_cv(df, FEATURES_RISCO, fabrica, col_grupo=col_grupo)
+        for nome, fabrica in fabricas_candidatas.items()
+    }
+
+    def _score(cv):
+        return cv["temporal_auc"]["media"] if cv["temporal_auc"] else -1
+    melhor_nome = max(cv_resultados, key=lambda nome: _score(cv_resultados[nome]))
+
+    # Baseline ingênuo: persistência recente (houve ocorrência nos 7 dias
+    # anteriores neste mesmo grupo espacial?). Sem clima, sem ML -- é a régua
+    # mínima que o modelo precisa superar pra justificar sua complexidade.
+    df = df.sort_values([col_grupo, "data"]).reset_index(drop=True)
+    df["baseline_focos_7d"] = (
+        df.groupby(col_grupo)["target_foco"]
+          .transform(lambda s: s.shift(1).rolling(7, min_periods=1).sum())
+    )
+    df["pred_baseline"] = (df["baseline_focos_7d"].fillna(0) > 0).astype(int)
+
+    # ================== MODELOS FINAIS (treinados com TODOS os dados) ==================
+    taxa_por_municipio = df.groupby(col_grupo)["target_foco"].mean().to_dict()
+    taxa_geral_fallback = float(df["target_foco"].mean())
+    df["taxa_hist_municipio"] = df[col_grupo].map(taxa_por_municipio)
+    ndvi_medio_treino = float(df["ndvi_mes_anterior"].mean())
+
+    scaler = StandardScaler()
+    X_full = scaler.fit_transform(df[FEATURES_RISCO])
+
+    modelo_lr = LogisticRegression(class_weight="balanced", max_iter=1000)
+    modelo_lr.fit(X_full, df["target_foco"])
+
+    if melhor_nome == "Regressão Logística":
+        modelo_vencedor = modelo_lr
+    else:
+        modelo_vencedor = _ajustar_modelo(fabricas_candidatas[melhor_nome](), X_full, df["target_foco"])
+
+    # Hold-out temporal simples, só para os painéis visuais (matriz de confusão,
+    # calibração) que precisam de UM conjunto de teste fixo. O número-headline
+    # de performance continua sendo a CV acima.
+    datas_ord = sorted(df["data"].unique())
+    corte_data = datas_ord[int(len(datas_ord) * 0.8)]
+    treino_h = df[df["data"] < corte_data].copy()
+    teste_h = df[df["data"] >= corte_data].copy()
+    avaliacao_teste = None
+    if not treino_h.empty and teste_h["target_foco"].nunique() == 2:
+        taxa_h = treino_h.groupby(col_grupo)["target_foco"].mean().to_dict()
+        fb_h = float(treino_h["target_foco"].mean())
+        treino_h["taxa_hist_municipio"] = treino_h[col_grupo].map(taxa_h)
+        teste_h["taxa_hist_municipio"] = teste_h[col_grupo].map(taxa_h).fillna(fb_h)
+        teste_h["pred_baseline"] = df.loc[teste_h.index, "pred_baseline"]
+
+        scaler_h = StandardScaler()
+        X_tr_h = scaler_h.fit_transform(treino_h[FEATURES_RISCO])
+        X_te_h = scaler_h.transform(teste_h[FEATURES_RISCO])
+        modelo_h = _ajustar_modelo(fabricas_candidatas[melhor_nome](), X_tr_h, treino_h["target_foco"])
+        y_prob_h = modelo_h.predict_proba(X_te_h)[:, 1]
+        avaliacao_teste = {
+            "y_true": teste_h["target_foco"].to_numpy(),
+            "y_prob": y_prob_h,
+            "y_pred_baseline": teste_h["pred_baseline"].to_numpy(),
+        }
+
+    climatologia_mensal = df.groupby("mes")["target_foco"].mean().to_dict()
+
+    if modo_amostragem == "caso_controle":
+        rotulo_modo = "Caso-controle pareado por local (focos como amostra)"
+    else:
+        rotulo_modo = "Painel município-dia (amostra de municípios)"
+
+    return {
+        "modelo": modelo_vencedor, "modelo_lr": modelo_lr, "scaler": scaler,
+        "algoritmo": melhor_nome,
+        "criterio_selecao": "Maior AUC médio na validação cruzada temporal (walk-forward)",
+        "cv_resultados": cv_resultados,
+        "auc": _score(cv_resultados[melhor_nome]) if _score(cv_resultados[melhor_nome]) > -1 else None,
+        "avaliacao_teste": avaliacao_teste,
+        "fonte_dados": fonte_dados,
+        "modo_amostragem": modo_amostragem,
+        "rotulo_modo": rotulo_modo,
+        "col_grupo": col_grupo,
+        "diagnostico_amostragem": diagnostico_amostragem,
+        "climatologia_mensal": climatologia_mensal,
+        "taxa_por_municipio": taxa_por_municipio,
+        "taxa_geral_fallback": taxa_geral_fallback,
+        "ndvi_medio_treino": ndvi_medio_treino,
+        "municipios_treino": sorted(df[col_grupo].astype(str).unique().tolist()),
+        "n_municipios_treino": df[col_grupo].nunique(),
+        "n_dias_treino": len(treino_h), "n_dias_teste": len(teste_h),
+        "n_linhas_total": len(df),
+        "taxa_base": df["target_foco"].mean(),
+        "amostrado_treino": amostrado_treino,
+        "n_municipios_falha": n_municipios_falha,
+        "total_disponivel": total_disponivel,
+    }
+
+
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
+def montar_amostras_caso_controle(tipo_analise, estado_dd, bioma_dd, municipio_dd,
+                                   anos_historico=2, max_focos=400, dias_defasagem_controle=45,
+                                   confirmar_com_imagem=False, seed=42):
+    """
+    Monta o dataset de treino no modo CASO-CONTROLE pareado por local.
+
+    Fluxo:
+      1. Busca focos reais (com lat/lon) na região/período.
+      2. Amostra até max_focos deles (teto de custo -- cada foco vira 2 linhas
+         e várias chamadas de API).
+      3. OPCIONAL: confirma cada foco via dNBR (Sentinel-2), descartando os
+         que não deixaram cicatriz de queimada visível -- controle de qualidade
+         contra falso-positivo do sensor térmico.
+      4. Para cada foco confirmado: gera o CASO (aquele local, aquela data,
+         target=1) e o CONTROLE (mesmo local, N dias antes, target=0).
+      5. Busca clima por CÉLULA DE GRADE (não por foco) -- focos vizinhos
+         compartilham a consulta, o que torna viável usar centenas de pontos.
+
+    Retorna: (df, diagnostico) -- df com uma linha por amostra, e um dict com
+    contagens para exibir transparência ao usuário.
+    """
+    hoje = datetime.now()
+    d_fim = (hoje - timedelta(days=2)).strftime("%Y-%m-%d")
+    d_ini = (hoje - timedelta(days=365 * anos_historico)).strftime("%Y-%m-%d")
+
+    df_focos = buscar_focos_com_coords(
+        tipo_analise, estado_dd, bioma_dd, municipio_dd, d_ini, d_fim, dias_bloco=14
+    )
+    if df_focos.empty:
+        return pd.DataFrame(), {"erro": "Nenhum foco encontrado na região/período para montar amostras."}
+
+    diagnostico = {"focos_brutos": len(df_focos)}
+
+    # Deduplica focos muito próximos NA MESMA DATA (o mesmo incêndio costuma
+    # gerar vários pixels de detecção -- contá-los como amostras independentes
+    # inflaria artificialmente o peso daquele evento no treino).
+    df_focos["celula"] = df_focos.apply(
+        lambda r: _celula_grade(r["lat"], r["lon"], 0.05), axis=1
+    )
+    df_focos = df_focos.drop_duplicates(subset=["celula", "data"]).reset_index(drop=True)
+    diagnostico["focos_apos_dedup"] = len(df_focos)
+
+    if len(df_focos) > max_focos:
+        df_focos = df_focos.sample(n=max_focos, random_state=seed).reset_index(drop=True)
+    diagnostico["focos_amostrados"] = len(df_focos)
+
+    # --- Etapa opcional: confirmação por imagem (dNBR) ---
+    diagnostico["confirmacao_ativada"] = confirmar_com_imagem
+    if confirmar_com_imagem:
+        pontos = [(r["lat"], r["lon"], r["data"].strftime("%Y-%m-%d"))
+                  for _, r in df_focos.iterrows()]
+        verificacoes = confirmar_focos_por_dnbr(pontos)
+        df_ver = pd.DataFrame(verificacoes)
+        df_ver["data"] = pd.to_datetime(df_ver["data"])
+        df_focos = df_focos.merge(df_ver[["lat", "lon", "data", "dnbr", "confirmado"]],
+                                   on=["lat", "lon", "data"], how="left")
+        diagnostico["confirmados"] = int((df_focos["confirmado"] == True).sum())
+        diagnostico["rejeitados"] = int((df_focos["confirmado"] == False).sum())
+        diagnostico["indeterminados"] = int(df_focos["confirmado"].isna().sum())
+        # Mantém confirmados E indeterminados (sem imagem utilizável por nuvem,
+        # o que é comum -- descartá-los enviesaria a amostra contra regiões
+        # historicamente nubladas). Só o REJEITADO explicitamente sai.
+        df_focos = df_focos[df_focos["confirmado"] != False].reset_index(drop=True)
+        if df_focos.empty:
+            return pd.DataFrame(), {"erro": "Todos os focos foram rejeitados na confirmação por imagem.",
+                                     **diagnostico}
+
+    # --- Monta pares caso/controle ---
+    linhas = []
+    for _, r in df_focos.iterrows():
+        cel = _celula_grade(r["lat"], r["lon"])
+        data_caso = r["data"]
+        data_controle = data_caso - timedelta(days=dias_defasagem_controle)
+        if data_controle < pd.Timestamp(d_ini):
+            continue  # controle cairia fora do período com dado disponível
+        linhas.append({"lat": r["lat"], "lon": r["lon"], "celula_lat": cel[0],
+                       "celula_lon": cel[1], "data": data_caso, "target_foco": 1,
+                       "municipio": r.get("municipio", "?")})
+        linhas.append({"lat": r["lat"], "lon": r["lon"], "celula_lat": cel[0],
+                       "celula_lon": cel[1], "data": data_controle, "target_foco": 0,
+                       "municipio": r.get("municipio", "?")})
+
+    if not linhas:
+        return pd.DataFrame(), {"erro": "Não foi possível montar pares caso/controle no período.",
+                                 **diagnostico}
+
+    df_amostras = pd.DataFrame(linhas)
+    df_amostras["celula"] = (df_amostras["celula_lat"].astype(str) + "_"
+                             + df_amostras["celula_lon"].astype(str))
+
+    # --- Clima por CÉLULA (não por ponto) -- é o que torna isso viável ---
+    celulas = df_amostras[["celula", "celula_lat", "celula_lon"]].drop_duplicates()
+    diagnostico["n_celulas"] = len(celulas)
+
+    def _clima_celula(row):
+        try:
+            df_clima = buscar_clima_nasa_power(row["celula_lat"], row["celula_lon"], d_ini, d_fim)
+            if df_clima.empty or df_clima["T2M"].isna().all():
+                return None
+            df_feat = _engenharia_features_risco(df_clima)
+            df_feat["celula"] = row["celula"]
+            return df_feat
+        except Exception:
+            return None
+
+    frames_clima = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        for df_c in executor.map(_clima_celula, [r for _, r in celulas.iterrows()]):
+            if df_c is not None:
+                frames_clima.append(df_c)
+
+    if not frames_clima:
+        return pd.DataFrame(), {"erro": "Não foi possível obter clima para as células amostradas.",
+                                 **diagnostico}
+
+    df_clima_todas = pd.concat(frames_clima, ignore_index=True)
+    df = df_amostras.merge(df_clima_todas, on=["celula", "data"], how="inner")
+
+    # NDVI por célula (buffer no centro da célula), mesmo racional do modo painel:
+    # mês ANTERIOR ao evento, nunca o mês do próprio evento.
+    def _ndvi_celula(row):
+        try:
+            ref = datetime(int(row["ano"]), int(row["mes"]), 1)
+            ini = (ref - timedelta(days=40)).strftime("%Y-%m-%d")
+            fim = ref.strftime("%Y-%m-%d")
+            val = buscar_ndvi_recente(row["celula_lat"], row["celula_lon"], ini, fim, raio_m=5000)
+            return val
+        except Exception:
+            return None
+
+    chaves_ndvi = df[["celula", "celula_lat", "celula_lon", "ano", "mes"]].drop_duplicates()
+    valores_ndvi = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        for v in executor.map(_ndvi_celula, [r for _, r in chaves_ndvi.iterrows()]):
+            valores_ndvi.append(v)
+    chaves_ndvi = chaves_ndvi.copy()
+    chaves_ndvi["ndvi_mes_anterior"] = valores_ndvi
+    df = df.merge(chaves_ndvi, on=["celula", "celula_lat", "celula_lon", "ano", "mes"], how="left")
+
+    # NDVI ausente (nuvem) cai para a mediana observada, em vez de descartar a
+    # amostra -- descartar enviesaria contra regiões nubladas.
+    if df["ndvi_mes_anterior"].notna().any():
+        df["ndvi_mes_anterior"] = df["ndvi_mes_anterior"].fillna(df["ndvi_mes_anterior"].median())
+    else:
+        df["ndvi_mes_anterior"] = 0.5
+
+    df = df.dropna(subset=FEATURES_CLIMA).reset_index(drop=True)
+    diagnostico["n_amostras_final"] = len(df)
+    diagnostico["n_positivos"] = int(df["target_foco"].sum())
+    diagnostico["n_negativos"] = int((df["target_foco"] == 0).sum())
+    return df, diagnostico
+
+
 @st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_dd,
-                                   anos_historico=2, n_amostra_treino=8, fonte_dados="INPE"):
+                                   anos_historico=2, n_amostra_treino=8, fonte_dados="INPE",
+                                   modo_amostragem="painel", max_focos=400,
+                                   confirmar_com_imagem=False):
     """
-    Treina modelo(s) usando dados agrupados de vários municípios da região
-    selecionada (não mais um único ponto central). Compara Regressão Logística
-    (baseline interpretável) com um modelo de boosting, validados com duas
-    estratégias de validação cruzada (temporal e espacial), e treina os
-    modelos finais com TODOS os dados para uso na inferência do mapa.
+    Treina, valida e seleciona o modelo de risco. Suporta DOIS modos de
+    amostragem, que mudam o que é uma "linha" do dataset de treino:
 
-    fonte_dados:
+      - modo_amostragem="painel": unidade = MUNICÍPIO-DIA. Usa uma amostra de
+        municípios da região e todos os dias do período para cada um. Série
+        temporal densa, mas cobertura espacial limitada (3-20 municípios num
+        bioma que pode ter centenas).
+
+      - modo_amostragem="caso_controle": unidade = FOCO-DIA. Cada foco real
+        vira um caso positivo; o mesmo local, N dias antes, vira o controle
+        negativo. Cobertura espacial muito maior (os focos já estão espalhados
+        por onde o fogo de fato ocorre), e a pergunta que o modelo aprende
+        passa a ser "neste local vulnerável, o que diferencia um dia de risco
+        de um dia comum?". Aqui o agrupamento da validação espacial é a
+        CÉLULA DE GRADE (~25km), não o município.
+
+    fonte_dados (só se aplica ao modo painel):
       - "INPE"  -> alvo = houve foco de calor (detecção pontual) naquele dia
       - "MODIS" -> alvo = houve pixel de área queimada detectado naquele dia
     """
+    # ============ MODO CASO-CONTROLE ============
+    if modo_amostragem == "caso_controle":
+        df, diagnostico = montar_amostras_caso_controle(
+            tipo_analise, estado_dd, bioma_dd, municipio_dd,
+            anos_historico=anos_historico, max_focos=max_focos,
+            confirmar_com_imagem=confirmar_com_imagem
+        )
+        if df.empty or "erro" in diagnostico:
+            return {"erro": diagnostico.get("erro", "Não foi possível montar as amostras caso-controle.")}
+        if len(df) < 50 or df["target_foco"].nunique() < 2:
+            return {"erro": "Amostras insuficientes ou sem variação para treinar nesta região/período."}
+        return _validar_treinar_e_empacotar(
+            df, col_grupo="celula", fonte_dados=fonte_dados,
+            modo_amostragem="caso_controle", diagnostico_amostragem=diagnostico,
+            amostrado_treino=diagnostico.get("focos_apos_dedup", 0) > diagnostico.get("focos_amostrados", 0),
+            total_disponivel=diagnostico.get("focos_apos_dedup", 0),
+            n_municipios_falha=0,
+        )
+
+    # ============ MODO PAINEL (original) ============
     gdf_treino = obter_municipios_regiao(tipo_analise, estado_dd, bioma_dd, municipio_dd,
                                           max_municipios=n_amostra_treino)
     if gdf_treino.empty:
@@ -1015,109 +1329,210 @@ def treinar_modelo_risco_regional(tipo_analise, estado_dd, bioma_dd, municipio_d
         fonte_txt = "área queimada (MODIS)" if fonte_dados == "MODIS" else "focos (INPE)"
         return {"erro": f"Histórico insuficiente ou sem variação de {fonte_txt} para treinar um modelo confiável nesta região/período."}
 
-    # ================== VALIDAÇÃO CRUZADA (temporal + espacial) ==================
-    # Compara TRÊS candidatos -- Regressão Logística (baseline interpretável),
-    # Random Forest e Boosting -- nas duas estratégias de CV, ANTES de treinar
-    # o modelo final. É a performance honesta que vai pro relatório/defesa.
-    nome_boost = "LightGBM" if _LGBM_DISPONIVEL else "HistGradientBoosting (fallback sklearn)"
-    fabricas_candidatas = {
-        "Regressão Logística": lambda: LogisticRegression(class_weight="balanced", max_iter=1000),
-        "Random Forest": _criar_modelo_rf,
-        nome_boost: _criar_modelo_boosting,
-    }
-    cv_resultados = {nome: _avaliar_cv(df, FEATURES_RISCO, fabrica) for nome, fabrica in fabricas_candidatas.items()}
-
-    # Seleção automática do modelo "vencedor": maior AUC médio na validação
-    # TEMPORAL (é a que mais importa pro uso real -- prever o futuro). Fica
-    # documentado no retorno (`criterio_selecao`) para citar no texto do TCC.
-    def _score(cv):
-        return cv["temporal_auc"]["media"] if cv["temporal_auc"] else -1
-    melhor_nome = max(cv_resultados, key=lambda nome: _score(cv_resultados[nome]))
-
-    # Baseline ingênuo (sem ML, sem clima) pra comparação: "risco alto se o
-    # município teve pelo menos 1 dia com ocorrência nos 7 dias ANTERIORES a
-    # este" — pura persistência recente. shift(1) garante que não olha o
-    # próprio dia (mesma regra de não-vazamento usada no resto do pipeline).
-    df = df.sort_values(["municipio", "data"]).reset_index(drop=True)
-    df["baseline_focos_7d"] = (
-        df.groupby("municipio")["target_foco"]
-          .transform(lambda s: s.shift(1).rolling(7, min_periods=1).sum())
+    return _validar_treinar_e_empacotar(
+        df, col_grupo="municipio", fonte_dados=fonte_dados,
+        modo_amostragem="painel", diagnostico_amostragem=None,
+        amostrado_treino=bool(gdf_treino["amostrado_flag"].iloc[0]),
+        total_disponivel=int(gdf_treino["total_disponivel"].iloc[0]),
+        n_municipios_falha=n_municipios_falha,
     )
-    df["pred_baseline"] = (df["baseline_focos_7d"].fillna(0) > 0).astype(int)
 
-    # ================== MODELOS FINAIS (treinados com TODOS os dados) ==================
-    # O modelo VENCEDOR é usado de fato na inferência do mapa. A LR também é
-    # sempre treinada à parte (referência interpretável + fallback de
-    # explicabilidade). A CV acima é só o relatório de performance esperada --
-    # nunca é avaliada no mesmo dado do treino final.
-    taxa_por_municipio = df.groupby("municipio")["target_foco"].mean().to_dict()
-    taxa_geral_fallback = float(df["target_foco"].mean())
-    df["taxa_hist_municipio"] = df["municipio"].map(taxa_por_municipio)
-    ndvi_medio_treino = float(df["ndvi_mes_anterior"].mean())
 
-    scaler = StandardScaler()
-    X_full = scaler.fit_transform(df[FEATURES_RISCO])
+@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
+def confirmar_focos_por_dnbr(pontos_datas, raio_m=750, limiar_dnbr=100):
+    """
+    CONTROLE DE QUALIDADE das amostras positivas.
 
-    modelo_lr = LogisticRegression(class_weight="balanced", max_iter=1000)
-    modelo_lr.fit(X_full, df["target_foco"])
+    Focos de calor têm falso-positivo conhecido (queima industrial/flare de gás,
+    reflexo solar em corpo d'água, nuvem mal filtrada, telhado metálico quente).
+    Usar esses pontos como "houve queimada" polui o treino.
 
-    if melhor_nome == "Regressão Logística":
-        modelo_vencedor = modelo_lr
-    else:
-        modelo_vencedor = _ajustar_modelo(fabricas_candidatas[melhor_nome](), X_full, df["target_foco"])
+    Esta função aplica a MESMA lógica do dNBR da aba de Severidade, só que num
+    buffer pequeno ao redor de CADA foco individual: compara o NBR da vegetação
+    antes e depois da data do foco. Se houve cicatriz real de queimada, o dNBR
+    sobe; se foi só ruído térmico sem dano à vegetação, o dNBR fica perto de zero.
 
-    # Hold-out temporal simples (últimos 20% dos dias) só para os painéis
-    # visuais existentes (matriz de confusão, calibração) -- eles precisam
-    # de UM conjunto de teste fixo, não faz sentido plotar "matriz de
-    # confusão média de 5 folds". O número-headline de performance é a CV acima.
-    datas_ord = sorted(df["data"].unique())
-    corte_data = datas_ord[int(len(datas_ord) * 0.8)]
-    treino_h = df[df["data"] < corte_data].copy()
-    teste_h = df[df["data"] >= corte_data].copy()
-    avaliacao_teste = None
-    if not treino_h.empty and teste_h["target_foco"].nunique() == 2:
-        taxa_h = treino_h.groupby("municipio")["target_foco"].mean().to_dict()
-        fb_h = float(treino_h["target_foco"].mean())
-        treino_h["taxa_hist_municipio"] = treino_h["municipio"].map(taxa_h)
-        teste_h["taxa_hist_municipio"] = teste_h["municipio"].map(taxa_h).fillna(fb_h)
-        teste_h["pred_baseline"] = df.loc[teste_h.index, "pred_baseline"]
+    pontos_datas: lista de tuplas (lat, lon, data_str 'YYYY-MM-DD')
+    limiar_dnbr : dNBR mínimo (×1000) para considerar confirmado. 100 é o
+                  limiar USGS entre "não afetado" e "baixa severidade".
 
-        scaler_h = StandardScaler()
-        X_tr_h = scaler_h.fit_transform(treino_h[FEATURES_RISCO])
-        X_te_h = scaler_h.transform(teste_h[FEATURES_RISCO])
-        modelo_h = _ajustar_modelo(fabricas_candidatas[melhor_nome](), X_tr_h, treino_h["target_foco"])
-        y_prob_h = modelo_h.predict_proba(X_te_h)[:, 1]
-        avaliacao_teste = {
-            "y_true": teste_h["target_foco"].to_numpy(),
-            "y_prob": y_prob_h,
-            "y_pred_baseline": teste_h["pred_baseline"].to_numpy(),
-        }
+    Retorna: lista de dicts com lat/lon/data/dnbr/confirmado (mesma ordem da entrada).
+    NUNCA levanta exceção -- um foco que falhou na verificação volta com
+    confirmado=None (indeterminado), e cabe a quem chama decidir o que fazer.
+    """
+    def _verificar(item):
+        lat, lon, data_str = item
+        try:
+            dt = datetime.strptime(data_str, "%Y-%m-%d")
+            ponto = ee.Geometry.Point([lon, lat]).buffer(raio_m)
 
-    # Climatologia mensal: taxa histórica média de dias-com-ocorrência por mês,
-    # calculada com TODOS os dias observados (usada para a estimativa "próximo mês")
-    climatologia_mensal = df.groupby("mes")["target_foco"].mean().to_dict()
+            # Janelas: 45 dias antes do foco (pré) e 45 dias depois (pós).
+            # Janelas largas porque Sentinel-2 revisita a cada ~5 dias e nuvem
+            # descarta muitas cenas -- janela estreita volta vazia com frequência.
+            pre_ini = (dt - timedelta(days=45)).strftime("%Y-%m-%d")
+            pre_fim = dt.strftime("%Y-%m-%d")
+            pos_ini = dt.strftime("%Y-%m-%d")
+            pos_fim = (dt + timedelta(days=45)).strftime("%Y-%m-%d")
 
-    return {
-        "modelo": modelo_vencedor, "modelo_lr": modelo_lr, "scaler": scaler,
-        "algoritmo": melhor_nome,
-        "criterio_selecao": "Maior AUC médio na validação cruzada temporal (walk-forward)",
-        "cv_resultados": cv_resultados,
-        "auc": _score(cv_resultados[melhor_nome]) if _score(cv_resultados[melhor_nome]) > -1 else None,
-        "avaliacao_teste": avaliacao_teste,
-        "fonte_dados": fonte_dados,
-        "climatologia_mensal": climatologia_mensal,
-        "taxa_por_municipio": taxa_por_municipio,
-        "taxa_geral_fallback": taxa_geral_fallback,
-        "ndvi_medio_treino": ndvi_medio_treino,
-        "municipios_treino": sorted(df["municipio"].unique().tolist()),
-        "n_municipios_treino": df["municipio"].nunique(),
-        "n_dias_treino": len(treino_h), "n_dias_teste": len(teste_h),
-        "n_linhas_total": len(df),
-        "taxa_base": df["target_foco"].mean(),
-        "amostrado_treino": bool(gdf_treino["amostrado_flag"].iloc[0]),
-        "n_municipios_falha": n_municipios_falha,
-        "total_disponivel": int(gdf_treino["total_disponivel"].iloc[0]),
+            s2 = (
+                ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+                .filterBounds(ponto)
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 50))
+            )
+
+            def _nbr(col):
+                return col.median().normalizedDifference(['B8', 'B12']).rename('nbr')
+
+            nbr_pre = _nbr(s2.filterDate(pre_ini, pre_fim))
+            nbr_pos = _nbr(s2.filterDate(pos_ini, pos_fim))
+            dnbr = nbr_pre.subtract(nbr_pos).multiply(1000)
+
+            stats = dnbr.reduceRegion(
+                reducer=ee.Reducer.mean(), geometry=ponto, scale=20,
+                maxPixels=1e9, bestEffort=True
+            ).getInfo()
+            val = stats.get('nbr')
+            if val is None:
+                return {"lat": lat, "lon": lon, "data": data_str,
+                        "dnbr": None, "confirmado": None}
+            return {"lat": lat, "lon": lon, "data": data_str,
+                    "dnbr": float(val), "confirmado": bool(float(val) >= limiar_dnbr)}
+        except Exception:
+            return {"lat": lat, "lon": lon, "data": data_str,
+                    "dnbr": None, "confirmado": None}
+
+    resultados = []
+    # GEE é sensível a excesso de chamadas simultâneas -- 6 workers é o mesmo
+    # teto usado nas outras funções que batem no Earth Engine neste app.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        for r in executor.map(_verificar, pontos_datas):
+            resultados.append(r)
+    return resultados
+
+
+# =====================================================================
+# 🎯 AMOSTRAGEM CASO-CONTROLE PAREADA POR LOCAL
+# =====================================================================
+# Limitação do modo "painel por município": treina com uma amostra pequena de
+# municípios (3-20) num bioma que pode ter centenas. Cobertura espacial baixa.
+#
+# Aqui a unidade de amostra deixa de ser o município-dia e passa a ser o
+# FOCO-dia. Cada foco real vira um caso POSITIVO; o MESMO local, numa data
+# anterior sem ocorrência, vira o CONTROLE (negativo). A pergunta que o
+# modelo aprende muda de "onde pega fogo?" para "neste local que já é
+# vulnerável, o que diferencia um dia de risco de um dia comum?".
+#
+# Vantagem sobre background aleatório: o controle é o próprio local, então
+# não há risco de o modelo aprender só "tem vegetação vs. não tem" (um ponto
+# aleatório poderia cair em rio ou área urbana).
+# Limitação a declarar: cobre bem locais COM histórico de fogo; município que
+# nunca teve foco no período não entra no treino (cai no fallback da taxa geral).
+
+@st.cache_data(ttl=3600, show_spinner=False, persist="disk")
+def buscar_focos_com_coords(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, dias_bloco=7):
+    """
+    Como buscar_historico_focos_diario, mas traz lat/lon ALÉM da data -- é o
+    que a amostragem caso-controle precisa (cada foco é um ponto no espaço,
+    não só uma contagem diária).
+    """
+    url = "https://terrabrasilis.dpi.inpe.br/queimadas/geoserver/bdqueimadas/ows"
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    session.mount('https://', HTTPAdapter(max_retries=retries, pool_maxsize=20))
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    dic_estados = {
+        "AC": "ACRE", "AL": "ALAGOAS", "AP": "AMAP%", "AM": "AMAZONAS",
+        "BA": "BAHIA", "CE": "CEAR%", "DF": "DISTRITO FEDERAL",
+        "ES": "ESP%RITO SANTO", "GO": "GOI%S", "MA": "MARANH%O",
+        "MT": "MATO GROSSO", "MS": "MATO GROSSO DO SUL", "MG": "MINAS GERAIS",
+        "PA": "PAR%", "PB": "PARA%BA", "PR": "PARAN%", "PE": "PERNAMBUCO",
+        "PI": "PIAU%", "RJ": "RIO DE JANEIRO", "RN": "RIO GRANDE DO NORTE",
+        "RS": "RIO GRANDE DO SUL", "RO": "ROND%NIA", "RR": "RORAIMA",
+        "SC": "SANTA CATARINA", "SP": "S%O PAULO", "SE": "SERGIPE",
+        "TO": "TOCANTINS"
     }
+
+    if tipo == "Por Estado":
+        filtro_base = f"estado ILIKE '{dic_estados.get(val_estado, val_estado)}'"
+    elif tipo == "Por Bioma":
+        tradutor = {"Amazônia": "Amaz%nia", "Mata Atlântica": "Mata Atl%ntica"}
+        filtro_base = f"bioma ILIKE '{tradutor.get(val_bioma, val_bioma)}'"
+    else:
+        muni_curinga = re.sub(r'[aeiouáéíóúãõâêîôûAEIOUÁÉÍÓÚÃÕÂÊÎÔÛ]', '%', val_muni).replace(' ', '%')
+        filtro_base = f"estado ILIKE '{dic_estados.get(val_estado, val_estado)}' AND municipio ILIKE '{muni_curinga}%'"
+
+    dt_ini = datetime.strptime(d_ini, "%Y-%m-%d")
+    dt_fim = datetime.strptime(d_fim, "%Y-%m-%d")
+
+    blocos = []
+    cursor = dt_ini
+    while cursor <= dt_fim:
+        bloco_fim = min(cursor + timedelta(days=dias_bloco), dt_fim)
+        blocos.append((cursor, bloco_fim))
+        cursor = bloco_fim + timedelta(days=1)
+
+    def _buscar_bloco(bloco):
+        b_ini, b_fim = bloco
+        cql = (
+            f"data_hora_gmt >= '{b_ini.strftime('%Y-%m-%d')}T00:00:00' "
+            f"AND data_hora_gmt <= '{b_fim.strftime('%Y-%m-%d')}T23:59:59' "
+            f"AND {filtro_base}"
+        )
+        try:
+            r = session.get(
+                url,
+                params={
+                    "service": "WFS", "version": "1.0.0", "request": "GetFeature",
+                    "typeName": "bdqueimadas:focos", "outputFormat": "application/json",
+                    "propertyName": "data_hora_gmt,municipio",
+                    "CQL_FILTER": cql, "maxFeatures": 50000
+                },
+                headers=headers, verify=False, timeout=90
+            )
+            if r.status_code == 200:
+                dados = r.json()
+                if dados.get("features"):
+                    return [
+                        {
+                            "lon": f["geometry"]["coordinates"][0],
+                            "lat": f["geometry"]["coordinates"][1],
+                            "data": f["properties"]["data_hora_gmt"][:10],
+                            "municipio": f["properties"].get("municipio", "?"),
+                        }
+                        for f in dados["features"]
+                        if f.get("geometry")
+                    ]
+        except Exception:
+            pass
+        return []
+
+    registros = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for bloco_registros in executor.map(_buscar_bloco, blocos):
+            registros.extend(bloco_registros)
+
+    if not registros:
+        return pd.DataFrame(columns=["lat", "lon", "data", "municipio"])
+    df = pd.DataFrame(registros)
+    df["data"] = pd.to_datetime(df["data"])
+    return df
+
+
+def _celula_grade(lat, lon, tamanho_graus=0.25):
+    """
+    Agrupa coordenadas próximas numa mesma célula de grade (~25km no equador).
+
+    Duas razões:
+    1. CACHE: focos vizinhos compartilham a mesma consulta de clima na NASA POWER,
+       em vez de uma chamada por foco (que seriam milhares).
+    2. VALIDAÇÃO: é a chave de agrupamento do GroupKFold. Focos próximos entre si
+       são espacialmente correlacionados -- se um caísse no treino e o vizinho no
+       teste, haveria vazamento. Agrupando por célula, o bloco inteiro vai junto
+       para treino OU para teste, nunca dividido.
+    """
+    return (round(lat / tamanho_graus) * tamanho_graus,
+            round(lon / tamanho_graus) * tamanho_graus)
 
 
 @st.cache_data(ttl=21600, show_spinner=False, persist="disk")
@@ -3146,6 +3561,53 @@ ser gerados por essa floresta perdida.
                         "menos municípios e menos anos de histórico."
                     )
 
+                st.markdown("---")
+                modo_label = st.radio(
+                    "Como montar as amostras de treino:",
+                    ["🗺️ Caso-controle (focos como amostra) — recomendado",
+                     "🏙️ Painel município-dia (amostra de municípios)"],
+                    key="modo_amostragem_risco",
+                    help="Caso-controle usa cada foco real como amostra positiva e o mesmo local "
+                         "numa data anterior como controle negativo -- cobre muito mais área da "
+                         "região. Painel usa uma amostra de municípios e todos os dias de cada um."
+                )
+                modo_amostragem = "caso_controle" if "Caso-controle" in modo_label else "painel"
+
+                max_focos = 400
+                confirmar_imagem = False
+                if modo_amostragem == "caso_controle":
+                    st.caption(
+                        "📍 Cada foco vira uma amostra **positiva**; o mesmo local, 45 dias antes, "
+                        "vira o **controle negativo**. A validação espacial agrupa por célula de "
+                        "grade (~25 km) em vez de município, para que focos vizinhos nunca fiquem "
+                        "divididos entre treino e teste."
+                    )
+                    col_cc1, col_cc2 = st.columns(2)
+                    with col_cc1:
+                        max_focos = st.select_slider(
+                            "Focos usados como amostra:",
+                            options=[100, 200, 400, 800], value=400,
+                            key="max_focos_risco",
+                            help="Mais focos = melhor cobertura espacial, porém mais lento."
+                        )
+                    with col_cc2:
+                        confirmar_imagem = st.toggle(
+                            "🛰️ Confirmar focos por imagem (dNBR)",
+                            value=False,
+                            key="confirmar_imagem_risco",
+                            help="Verifica, via Sentinel-2, se cada foco deixou cicatriz real de "
+                                 "queimada. Descarta falso-positivo do sensor térmico (flare de gás, "
+                                 "reflexo em água, telhado quente). MUITO mais lento -- uma consulta "
+                                 "ao Earth Engine por foco."
+                        )
+                    if confirmar_imagem:
+                        st.warning(
+                            f"⏱️ A confirmação por imagem faz **uma consulta ao Earth Engine por foco** "
+                            f"(até {max_focos}). Pode levar vários minutos. Considere reduzir o número "
+                            f"de focos na primeira execução."
+                        )
+                st.markdown("---")
+
                 col_p1, col_p2, col_p3 = st.columns(3)
                 with col_p1:
                     anos_hist = st.select_slider(
@@ -3190,11 +3652,19 @@ ser gerados por essa floresta perdida.
                 if st.button("🧠 Treinar Modelo e Gerar Mapa de Risco", use_container_width=True):
                     status = st.status("Treinando modelo regional...", expanded=True)
 
-                    status.write(f"🔎 Selecionando municípios de '{val_sel}' para treino...")
+                    if modo_amostragem == "caso_controle":
+                        status.write(f"🔥 Buscando focos reais em '{val_sel}' para usar como amostra...")
+                        if confirmar_imagem:
+                            status.write("🛰️ Confirmando focos por imagem (dNBR) — isso demora...")
+                    else:
+                        status.write(f"🔎 Selecionando municípios de '{val_sel}' para treino...")
                     resultado = treinar_modelo_risco_regional(
                         tipo_analise, estado_dd, bioma_dd, municipio_dd,
                         anos_historico=anos_hist, n_amostra_treino=n_amostra_treino,
-                        fonte_dados=fonte_dados_risco
+                        fonte_dados=fonte_dados_risco,
+                        modo_amostragem=modo_amostragem,
+                        max_focos=max_focos,
+                        confirmar_com_imagem=confirmar_imagem
                     )
 
                     if "erro" in resultado:
@@ -3202,24 +3672,52 @@ ser gerados por essa floresta perdida.
                         st.warning(f"⚠️ {resultado['erro']}")
                     else:
                         fonte_txt = "Área Queimada (MODIS)" if resultado["fonte_dados"] == "MODIS" else "Focos de Calor (INPE)"
+                        if resultado["modo_amostragem"] == "caso_controle":
+                            unidade = "célula(s) de grade"
+                            detalhe = f"{resultado['n_linhas_total']} amostras (casos + controles)"
+                        else:
+                            unidade = "município(s)"
+                            detalhe = f"{resultado['n_linhas_total']} dias no total"
                         msg_treino = (
-                            f"✅ Modelo treinado com **{resultado['n_municipios_treino']} município(s)** "
+                            f"✅ Modelo treinado com **{resultado['n_municipios_treino']} {unidade}** "
                             f"usando **{fonte_txt}** · algoritmo: **{resultado['algoritmo']}** "
-                            f"({resultado['n_linhas_total']} dias no total, todos os dias do período)."
+                            f"({detalhe})."
                         )
                         if resultado["auc"] is not None:
                             msg_treino += f" · AUC-ROC (walk-forward, média entre folds): **{resultado['auc']:.2f}**"
                         status.write(msg_treino)
+                        status.write(f"📐 Amostragem: **{resultado['rotulo_modo']}**")
                         status.write(
                             f"🏆 Algoritmo escolhido automaticamente: **{resultado['algoritmo']}** "
                             f"({resultado['criterio_selecao']})."
                         )
 
-                        if resultado["amostrado_treino"]:
+                        diag = resultado.get("diagnostico_amostragem")
+                        if diag:
                             status.write(
-                                f"ℹ️ A região tem {resultado['total_disponivel']} municípios — "
-                                f"uma amostra foi usada para o treino ser mais rápido."
+                                f"🔥 Focos brutos: {diag.get('focos_brutos', 0)} → "
+                                f"após deduplicação: {diag.get('focos_apos_dedup', 0)} → "
+                                f"amostrados: {diag.get('focos_amostrados', 0)} "
+                                f"({diag.get('n_celulas', 0)} células de grade)"
                             )
+                            if diag.get("confirmacao_ativada"):
+                                status.write(
+                                    f"🛰️ Confirmação por imagem: **{diag.get('confirmados', 0)} confirmados**, "
+                                    f"**{diag.get('rejeitados', 0)} rejeitados** (sem cicatriz visível), "
+                                    f"{diag.get('indeterminados', 0)} indeterminados (nuvem/sem imagem — mantidos)."
+                                )
+
+                        if resultado["amostrado_treino"]:
+                            if resultado["modo_amostragem"] == "caso_controle":
+                                status.write(
+                                    f"ℹ️ A região tem {resultado['total_disponivel']} focos distintos — "
+                                    f"uma amostra foi usada para o treino ser mais rápido."
+                                )
+                            else:
+                                status.write(
+                                    f"ℹ️ A região tem {resultado['total_disponivel']} municípios — "
+                                    f"uma amostra foi usada para o treino ser mais rápido."
+                                )
                         if resultado["n_municipios_falha"] > 0:
                             status.write(
                                 f"⚠️ {resultado['n_municipios_falha']} município(s) da amostra não "
@@ -3301,7 +3799,15 @@ ser gerados por essa floresta perdida.
                             # Município que participou do treino usa sua própria taxa histórica
                             # conhecida; município novo (só apareceu no mapa) usa a média geral
                             # da amostra de treino como aproximação razoável.
-                            cond["taxa_hist_municipio"] = taxa_por_municipio.get(row["name_muni"], taxa_fallback)
+                            # No modo PAINEL as chaves de taxa_por_municipio são nomes de
+                            # município; no modo CASO-CONTROLE são células de grade. Aqui
+                            # buscamos pela célula correspondente ao centro do município.
+                            if resultado["col_grupo"] == "celula":
+                                _cel = _celula_grade(row["lat"], row["lon"])
+                                _chave = f"{_cel[0]}_{_cel[1]}"
+                            else:
+                                _chave = row["name_muni"]
+                            cond["taxa_hist_municipio"] = taxa_por_municipio.get(_chave, taxa_fallback)
                             # NDVI pode não vir (nuvens cobrindo a região na janela de 60 dias) --
                             # cai pro NDVI médio observado no treino em vez de deixar o modelo
                             # receber NaN (que quebraria a predição).
@@ -3650,7 +4156,13 @@ ser gerados por essa floresta perdida.
                                         )
 
                             with st.expander("📊 Detalhes do treinamento do modelo"):
-                                st.write(f"- Municípios usados no treino: **{', '.join(resultado['municipios_treino'])}**")
+                                if resultado["col_grupo"] == "celula":
+                                    st.write(
+                                        f"- Unidades espaciais no treino: **{resultado['n_municipios_treino']} "
+                                        f"células de grade (~25 km)** distribuídas pela região"
+                                    )
+                                else:
+                                    st.write(f"- Municípios usados no treino: **{', '.join(resultado['municipios_treino'])}**")
                                 st.write(
                                     f"- Dias de treino: **{resultado['n_dias_treino']}** | "
                                     f"Dias de teste (mais recentes): **{resultado['n_dias_teste']}**"
