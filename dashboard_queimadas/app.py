@@ -1092,7 +1092,13 @@ def montar_amostras_caso_controle(tipo_analise, estado_dd, bioma_dd, municipio_d
         tipo_analise, estado_dd, bioma_dd, municipio_dd, d_ini, d_fim, dias_bloco=14
     )
     if df_focos.empty:
-        return pd.DataFrame(), {"erro": "Nenhum foco encontrado na região/período para montar amostras."}
+        return pd.DataFrame(), {"erro": (
+            "Nenhum foco retornado pela consulta ao INPE para esta região/período. "
+            "Possíveis causas: (a) o serviço WFS do INPE está instável ou fora do ar "
+            "no momento; (b) o período selecionado realmente não tem focos registrados "
+            "nesta região. Tente aumentar os anos de histórico, ou use o modo "
+            "'Painel município-dia' como alternativa."
+        )}
 
     diagnostico = {"focos_brutos": len(df_focos)}
 
@@ -1485,7 +1491,11 @@ def buscar_focos_com_coords(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim,
                 params={
                     "service": "WFS", "version": "1.0.0", "request": "GetFeature",
                     "typeName": "bdqueimadas:focos", "outputFormat": "application/json",
-                    "propertyName": "data_hora_gmt,municipio",
+                    # NÃO usar propertyName aqui: restringir as colunas faz o WFS
+                    # devolver as feições SEM a geometria, e esta função existe
+                    # justamente para obter lat/lon. (A função irmã
+                    # buscar_historico_focos_diario pode usar propertyName porque
+                    # só lê propriedades, nunca a geometria.)
                     "CQL_FILTER": cql, "maxFeatures": 50000
                 },
                 headers=headers, verify=False, timeout=90
@@ -1493,16 +1503,21 @@ def buscar_focos_com_coords(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim,
             if r.status_code == 200:
                 dados = r.json()
                 if dados.get("features"):
-                    return [
-                        {
-                            "lon": f["geometry"]["coordinates"][0],
-                            "lat": f["geometry"]["coordinates"][1],
-                            "data": f["properties"]["data_hora_gmt"][:10],
-                            "municipio": f["properties"].get("municipio", "?"),
-                        }
-                        for f in dados["features"]
-                        if f.get("geometry")
-                    ]
+                    registros_bloco = []
+                    for f in dados["features"]:
+                        geom = f.get("geometry") or {}
+                        coords = geom.get("coordinates")
+                        props = f.get("properties") or {}
+                        data_bruta = props.get("data_hora_gmt")
+                        if not coords or not data_bruta:
+                            continue
+                        registros_bloco.append({
+                            "lon": coords[0],
+                            "lat": coords[1],
+                            "data": str(data_bruta)[:10],
+                            "municipio": props.get("municipio", "?"),
+                        })
+                    return registros_bloco
         except Exception:
             pass
         return []
