@@ -1886,6 +1886,78 @@ def buscar_car_imoveis(uf, bbox_wgs84, max_features=5000):
         return gpd.GeoDataFrame(columns=colunas)
 
 
+# =====================================================================
+# 🌳 PRODES (INPE) — DESMATAMENTO ACUMULADO
+# =====================================================================
+# WFS público do TerraBrasilis (mesmo servidor já usado pros focos do INPE —
+# sem os problemas de SSL do geoserver do CAR). Uma camada de desmatamento
+# ACUMULADO por bioma: todos os polígonos de corte raso detectados pelo
+# PRODES desde o ano-base até hoje. O ano-base varia por bioma porque o
+# PRODES monitora cada bioma desde uma data diferente (Amazônia desde 1988,
+# os demais a partir de 2000/2007) — por isso fica registrado por bioma.
+
+PRODES_LAYERS = {
+    "Amazônia":       ("prodes-amazon-nb:accumulated_deforestation_2007_biome", 2007),
+    "Cerrado":        ("prodes-cerrado-nb:accumulated_deforestation_2000", 2000),
+    "Mata Atlântica": ("prodes-mata-atlantica-nb:accumulated_deforestation_2000", 2000),
+    "Caatinga":       ("prodes-caatinga-nb:accumulated_deforestation_2000", 2000),
+    "Pampa":          ("prodes-pampa-nb:accumulated_deforestation_2000", 2000),
+    "Pantanal":       ("prodes-pantanal-nb:accumulated_deforestation_2000", 2000),
+}
+
+# Simplificação: um estado pode cruzar mais de um bioma, mas pra decidir qual
+# camada do PRODES consultar usamos o bioma PREDOMINANTE de cada UF — mesma
+# simplificação já usada na aba de Impacto Econômico, documentada como tal.
+ESTADO_BIOMA_PRODES = {
+    "AM": "Amazônia", "PA": "Amazônia", "AC": "Amazônia",
+    "RO": "Amazônia", "RR": "Amazônia", "AP": "Amazônia",
+    "MT": "Cerrado",  "GO": "Cerrado",  "TO": "Cerrado",
+    "MA": "Cerrado",  "PI": "Caatinga", "BA": "Caatinga",
+    "CE": "Caatinga", "RN": "Caatinga", "PB": "Caatinga",
+    "PE": "Caatinga", "AL": "Caatinga", "SE": "Caatinga",
+    "MS": "Pantanal", "PR": "Mata Atlântica",
+    "SC": "Mata Atlântica", "RS": "Pampa",
+    "SP": "Mata Atlântica", "RJ": "Mata Atlântica",
+    "ES": "Mata Atlântica", "MG": "Mata Atlântica",
+    "DF": "Cerrado",
+}
+
+
+@st.cache_data(ttl=604800, show_spinner=False, persist="disk")
+def buscar_prodes_desmatamento(bioma, bbox_wgs84, max_features=5000):
+    """
+    Busca os polígonos de desmatamento acumulado do PRODES pro bioma, filtrados
+    por bbox (o bioma inteiro tem centenas de milhares de polígonos — nunca
+    baixar sem recorte). Nunca levanta exceção: indisponibilidade do serviço
+    devolve um GeoDataFrame vazio em vez de derrubar a aba.
+    """
+    colunas = ["year", "area_km", "state", "geometry"]
+    if bioma not in PRODES_LAYERS:
+        return gpd.GeoDataFrame(columns=colunas)
+    type_name, _ano_base = PRODES_LAYERS[bioma]
+    url = "https://terrabrasilis.dpi.inpe.br/geoserver/ows"
+    minx, miny, maxx, maxy = bbox_wgs84
+    params = {
+        "service": "WFS", "version": "1.0.0", "request": "GetFeature",
+        "typeName": type_name,
+        "outputFormat": "application/json",
+        "bbox": f"{minx},{miny},{maxx},{maxy},EPSG:4326",
+        "maxFeatures": max_features,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=90, verify=False)
+        if r.status_code != 200:
+            return gpd.GeoDataFrame(columns=colunas)
+        dados = r.json()
+        if not dados.get("features"):
+            return gpd.GeoDataFrame(columns=colunas)
+        gdf = gpd.GeoDataFrame.from_features(dados["features"], crs="EPSG:4326")
+        cols_presentes = [c for c in colunas if c in gdf.columns]
+        return gdf[cols_presentes]
+    except Exception:
+        return gpd.GeoDataFrame(columns=colunas)
+
+
 # =============================================================
 # --- INTERFACE (BARRA LATERAL) ---
 # =============================================================
@@ -2361,12 +2433,13 @@ if st.session_state.gerar_dashboard:
         # =============================================================
         # --- ABAS PRINCIPAIS ---
         # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_car, aba_export, aba_risco = st.tabs([
+        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_car, aba_prodes, aba_export, aba_risco = st.tabs([
             "🗺️ Mapa de Focos",
             "📈 Gráficos & Anomalia",
             "🔬 Severidade (NBR Sentinel-2)",
             "💰 Impacto Econômico",
             "🏡 Propriedades Rurais (CAR)",
+            "🌳 Desmatamento (PRODES)",
             "⬇️ Exportar Dados",
             "🎯 Risco Preditivo (ML)"
         ])
@@ -3695,6 +3768,232 @@ ser gerados por essa floresta perdida.
                         "🔄 Nova Busca no CAR", key=f"btn_car_reset_{val_sel}_{estado_dd}"
                     ):
                         st.session_state[_car_key] = None
+                        st.rerun()
+
+        # ----------------------------------------------------------
+        # ABA — DESMATAMENTO (PRODES)
+        # ----------------------------------------------------------
+        with aba_prodes:
+            st.subheader("🌳 Queimada x Desmatamento Acumulado (PRODES)")
+            st.caption(
+                "Cruza os focos de calor detectados com a área historicamente "
+                "desmatada segundo o PRODES/INPE, pra ver se as queimadas estão "
+                "concentradas em área já desmatada ou avançando sobre vegetação "
+                "nativa ainda de pé."
+            )
+
+            if tipo_analise == "Por Bioma":
+                bioma_alvo_prodes = bioma_dd
+            else:
+                bioma_alvo_prodes = ESTADO_BIOMA_PRODES.get(estado_dd)
+
+            if bioma_alvo_prodes is None or bioma_alvo_prodes not in PRODES_LAYERS:
+                st.info(
+                    "ℹ️ Não foi possível determinar o bioma desta região pra "
+                    "escolher a camada certa do PRODES."
+                )
+            elif "INPE" not in fonte_escolhida:
+                st.info(
+                    "ℹ️ Esta análise usa os focos de calor do INPE (pontos), não a "
+                    "área queimada do MODIS. Troque a fonte de dados para "
+                    "'🔥 Focos de Calor (INPE)' na barra lateral e clique em "
+                    "'Gerar Dashboard' novamente."
+                )
+            elif df_rec.empty:
+                st.info("Nenhum foco de calor nesta região/período para cruzar com o PRODES.")
+            else:
+                _, ano_base_prodes = PRODES_LAYERS[bioma_alvo_prodes]
+                st.caption(
+                    f"Bioma usado: **{bioma_alvo_prodes}** — desmatamento acumulado "
+                    f"desde **{ano_base_prodes}** (ano-base do monitoramento PRODES "
+                    "nesse bioma)."
+                )
+
+                _prodes_key = f"prodes_resultado_{val_sel}_{bioma_alvo_prodes}"
+                if _prodes_key not in st.session_state:
+                    st.session_state[_prodes_key] = None
+
+                if st.session_state[_prodes_key] is None:
+                    st.info(
+                        "⚡ Busca os polígonos de desmatamento acumulado do PRODES "
+                        "dentro dos limites da região selecionada. Pode levar até 1 "
+                        "minuto em regiões maiores."
+                    )
+                    if st.button(
+                        "🔎 Buscar Desmatamento Acumulado (PRODES)",
+                        type="primary", use_container_width=True,
+                        key=f"btn_prodes_{val_sel}_{bioma_alvo_prodes}"
+                    ):
+                        with st.spinner("🌳 Consultando o PRODES/TerraBrasilis..."):
+                            bbox_prodes = tuple(limite.total_bounds)
+                            gdf_prodes_bruto = buscar_prodes_desmatamento(bioma_alvo_prodes, bbox_prodes)
+                            st.session_state[_prodes_key] = gdf_prodes_bruto
+
+                gdf_prodes_bruto = st.session_state[_prodes_key]
+                if gdf_prodes_bruto is not None:
+                    if gdf_prodes_bruto.empty:
+                        st.warning(
+                            "⚠️ Nenhum polígono de desmatamento retornado — o serviço "
+                            "pode estar instável agora, ou a região realmente não tem "
+                            "desmatamento acumulado registrado no recorte consultado."
+                        )
+                    else:
+                        if len(gdf_prodes_bruto) >= 5000:
+                            st.warning(
+                                "⚠️ Atingiu o limite de 5.000 polígonos retornados — "
+                                "pode haver mais desmatamento na região que não foi "
+                                "carregado. Prefira 'Por Município' para uma busca "
+                                "mais completa."
+                            )
+
+                        df_rec_prodes = df_rec.drop(
+                            columns=[c for c in ["index_right", "index_left"] if c in df_rec.columns]
+                        )
+                        gdf_focos_prodes = gpd.GeoDataFrame(
+                            df_rec_prodes,
+                            geometry=gpd.points_from_xy(df_rec_prodes["longitude"], df_rec_prodes["latitude"]),
+                            crs="EPSG:4326"
+                        )
+                        gdf_join_prodes = gpd.sjoin(
+                            gdf_focos_prodes, gdf_prodes_bruto[["geometry"]],
+                            predicate="within", how="left"
+                        )
+                        # Um foco pode cair na borda de dois polígonos vizinhos —
+                        # mantém só a primeira ocorrência pra não contar 2x.
+                        gdf_join_prodes = gdf_join_prodes[~gdf_join_prodes.index.duplicated(keep="first")]
+                        gdf_join_prodes["em_area_desmatada"] = gdf_join_prodes["index_right"].notna()
+
+                        n_total_focos = len(gdf_join_prodes)
+                        n_dentro = int(gdf_join_prodes["em_area_desmatada"].sum())
+                        n_fora = n_total_focos - n_dentro
+                        pct_fora = round(n_fora / n_total_focos * 100, 1) if n_total_focos else 0.0
+
+                        col_pr1, col_pr2, col_pr3 = st.columns(3)
+                        col_pr1.metric("🔥 Total de focos analisados", n_total_focos)
+                        col_pr2.metric("🟫 Em área já desmatada", f"{n_dentro} ({100 - pct_fora:.1f}%)")
+                        col_pr3.metric("🌱 Fora da área desmatada", f"{n_fora} ({pct_fora:.1f}%)")
+
+                        if pct_fora >= 30:
+                            st.error(
+                                f"🚨 **{pct_fora:.1f}%** dos focos detectados estão FORA da "
+                                "área historicamente desmatada pelo PRODES — indício de "
+                                "queimada avançando sobre vegetação nativa ainda de pé, "
+                                "não só reincidência em área já aberta."
+                            )
+                        elif pct_fora > 0:
+                            st.warning(
+                                f"⚠️ **{pct_fora:.1f}%** dos focos estão fora da área "
+                                "historicamente desmatada — vale investigar esses pontos "
+                                "individualmente no mapa abaixo."
+                            )
+                        else:
+                            st.success(
+                                "✅ Todos os focos detectados caíram dentro da área já "
+                                "desmatada segundo o PRODES."
+                            )
+
+                        st.markdown("---")
+                        st.markdown("**🗺️ Mapa: desmatamento acumulado x focos de calor**")
+
+                        centro_prodes = limite.geometry.union_all().centroid
+                        m_prodes = folium.Map(
+                            location=[centro_prodes.y, centro_prodes.x],
+                            zoom_start=10 if tipo_analise == "Por Município" else 7,
+                            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                            attr="Esri", prefer_canvas=True,
+                        )
+                        folium.TileLayer(
+                            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
+                            attr="Esri Ref", overlay=True, control=False,
+                        ).add_to(m_prodes)
+
+                        folium.GeoJson(
+                            limite.__geo_interface__,
+                            name=f"Limite — {val_sel}",
+                            style_function=lambda x: {
+                                'fillColor': '#e67e22', 'fillOpacity': 0.02,
+                                'color': '#e67e22', 'weight': 2.5, 'dashArray': '6 3',
+                            },
+                        ).add_to(m_prodes)
+
+                        if len(gdf_prodes_bruto) <= 1500:
+                            folium.GeoJson(
+                                gdf_prodes_bruto.__geo_interface__,
+                                name="Desmatamento acumulado (PRODES)",
+                                style_function=lambda x: {
+                                    'fillColor': '#8d6e63', 'fillOpacity': 0.5,
+                                    'color': '#5d4037', 'weight': 0.3,
+                                },
+                            ).add_to(m_prodes)
+                        else:
+                            st.caption(
+                                f"ℹ️ {len(gdf_prodes_bruto)} polígonos de desmatamento "
+                                "carregados — o contorno individual de todos não é "
+                                "desenhado no mapa por performance do navegador (a "
+                                "estatística acima já considera todos eles)."
+                            )
+
+                        fg_focos_prodes = folium.FeatureGroup(name="Focos de calor")
+                        for _, row_p in gdf_join_prodes.iterrows():
+                            cor_foco = "#7f8c8d" if row_p["em_area_desmatada"] else "#e74c3c"
+                            folium.CircleMarker(
+                                location=[row_p["latitude"], row_p["longitude"]],
+                                radius=4, color="#1c1c1c", weight=0.5,
+                                fill=True, fill_color=cor_foco, fill_opacity=0.9,
+                                tooltip=(
+                                    "Em área já desmatada" if row_p["em_area_desmatada"]
+                                    else "Fora da área desmatada (vegetação nativa)"
+                                ),
+                            ).add_to(fg_focos_prodes)
+                        fg_focos_prodes.add_to(m_prodes)
+
+                        legenda_prodes = """
+                        <div style="position:fixed; bottom:28px; left:12px; z-index:9999;
+                                    background:rgba(255,255,255,0.95); padding:10px 14px;
+                                    border-radius:8px; font-size:12px; color:#2c3e50;
+                                    line-height:1.9; border:1px solid rgba(0,0,0,0.08);
+                                    box-shadow:0 1px 4px rgba(0,0,0,0.18);">
+                            <b style="font-size:13px;">🌳 Queimada x Desmatamento</b><br>
+                            <span style="color:#8d6e63;">■</span> Desmatamento acumulado (PRODES)<br>
+                            <span style="color:#e74c3c;">●</span> Foco fora da área desmatada<br>
+                            <span style="color:#7f8c8d;">●</span> Foco em área já desmatada<br>
+                            <span style="color:#e67e22;">- - -</span> Região selecionada
+                        </div>"""
+                        m_prodes.get_root().html.add_child(folium.Element(legenda_prodes))
+                        folium.LayerControl(collapsed=False).add_to(m_prodes)
+                        _prodes_map_key = f"mapa_prodes_{val_sel}_{bioma_alvo_prodes}_{n_total_focos}"
+                        st_folium(m_prodes, width=None, height=650, returned_objects=[], key=_prodes_map_key)
+
+                        csv_prodes = gdf_join_prodes.drop(columns="geometry").drop(
+                            columns=[c for c in ["index_right"] if c in gdf_join_prodes.columns]
+                        ).to_csv(index=False).encode("utf-8-sig")
+                        st.download_button(
+                            "📄 Baixar CSV — Focos x Desmatamento Acumulado",
+                            data=csv_prodes,
+                            file_name=f"prodes_focos_{val_sel}_{hoje.strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                        )
+
+                        with st.expander("📚 Sobre os dados e limitações"):
+                            st.markdown(
+                                f"- O PRODES monitora o **{bioma_alvo_prodes}** desde "
+                                f"**{ano_base_prodes}** — desmatamento anterior a essa "
+                                "data não entra no acumulado.\n"
+                                "- Detecção via satélite Landsat (~30m de resolução) — "
+                                "desmatamento muito pequeno ou degradação gradual "
+                                "(sem corte raso) pode não ser capturado.\n"
+                                "- 'Fora da área desmatada' indica só que o PONTO do "
+                                "foco caiu fora de um polígono já mapeado pelo PRODES — "
+                                "não confirma por si só que houve corte de vegetação "
+                                "nativa nesse exato local (o foco pode ser em pastagem, "
+                                "área agrícola não classificada como floresta, etc.)."
+                            )
+
+                    st.markdown("")
+                    if st.button(
+                        "🔄 Nova Busca no PRODES", key=f"btn_prodes_reset_{val_sel}_{bioma_alvo_prodes}"
+                    ):
+                        st.session_state[_prodes_key] = None
                         st.rerun()
 
         # ----------------------------------------------------------
