@@ -3504,9 +3504,16 @@ ser gerados por essa floresta perdida.
                             columns={"municipio": "municipio_car", "area": "area_ha_car"}
                         )
 
+                        # df_rec pode carregar 'index_right' (e às vezes 'index_left')
+                        # de um sjoin anterior (o cruzamento com o limite da região, na
+                        # Aba 1) — o geopandas recusa refazer um sjoin se essas colunas
+                        # de índice já existirem num dos dois lados.
+                        df_rec_car = df_rec.drop(
+                            columns=[c for c in ["index_right", "index_left"] if c in df_rec.columns]
+                        )
                         gdf_focos_pts = gpd.GeoDataFrame(
-                            df_rec,
-                            geometry=gpd.points_from_xy(df_rec["longitude"], df_rec["latitude"]),
+                            df_rec_car,
+                            geometry=gpd.points_from_xy(df_rec_car["longitude"], df_rec_car["latitude"]),
                             crs="EPSG:4326"
                         )
                         gdf_cruzamento = gpd.sjoin(
