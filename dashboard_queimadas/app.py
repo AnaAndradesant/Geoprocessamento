@@ -316,8 +316,10 @@ def carregar_areas_protegidas(tipo_area):
     return gdf_areas[['nome_area', 'geometry']]
 
 import requests
+import ssl
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib3.util.ssl_ import create_urllib3_context
 
 @st.cache_data(ttl=3600, show_spinner=False, persist="disk")
 def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satelites):
@@ -1832,6 +1834,24 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hint=
 # nome/CPF do proprietário, só código do imóvel (hash), município e área —
 # por isso é seguro exibir diretamente no dashboard.
 
+class _SSLLegadoAdapter(HTTPAdapter):
+    """
+    O geoserver do SICAR (geoserver.car.gov.br) recusa o handshake TLS padrão
+    do OpenSSL moderno usado por requests/urllib3 (SSLV3_ALERT_HANDSHAKE_
+    FAILURE), mesmo com verify=False — é a config de cifras do servidor, não
+    um problema de certificado. Baixar o "nível de segurança" das cifras
+    aceitas (SECLEVEL=1) resolve; um navegador comum já negocia isso sozinho,
+    por isso o problema só aparece em código, não ao testar a URL no navegador.
+    """
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = create_urllib3_context()
+        ctx.set_ciphers('DEFAULT@SECLEVEL=1')
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        kwargs['ssl_context'] = ctx
+        return super().init_poolmanager(*args, **kwargs)
+
+
 @st.cache_data(ttl=604800, show_spinner=False, persist="disk")
 def buscar_car_imoveis(uf, bbox_wgs84, max_features=5000):
     """
@@ -1850,8 +1870,10 @@ def buscar_car_imoveis(uf, bbox_wgs84, max_features=5000):
         "bbox": f"{minx},{miny},{maxx},{maxy},EPSG:4326",
         "maxFeatures": max_features,
     }
+    session = requests.Session()
+    session.mount("https://", _SSLLegadoAdapter())
     try:
-        r = requests.get(url, params=params, timeout=60, verify=False)
+        r = session.get(url, params=params, timeout=60, verify=False)
         if r.status_code != 200:
             return gpd.GeoDataFrame(columns=colunas)
         dados = r.json()
