@@ -2379,7 +2379,7 @@ if st.session_state.gerar_dashboard:
             with col_controles1:
                 estilo_mapa = st.radio(
                     "🎨 Estilo de Fundo:",
-                    ["🌑 Mapa Dark", "🛰️ Satélite (Google)", "🗺️ Mapa Padrão"],
+                    ["☀️ Claro (Institucional)", "🌑 Mapa Dark", "🛰️ Satélite (Google)", "🗺️ Mapa Padrão"],
                     horizontal=False
                 )
             focar_area = "Visão Geral"
@@ -2403,6 +2403,11 @@ if st.session_state.gerar_dashboard:
                 zoom_inicio = 10 if tipo_analise == "Por Município" else 6
 
             tiles_config = {
+                "☀️ Claro (Institucional)": {
+                    "url": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+                    "attr": "CartoDB",
+                    "ref_url": None,
+                },
                 "🌑 Mapa Dark": {
                     "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
                     "attr": "Esri",
@@ -2437,14 +2442,15 @@ if st.session_state.gerar_dashboard:
             if focar_area != "Visão Geral":
                 m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
 
-            # Borda da região selecionada
+            # Borda da região selecionada — laranja, no estilo dos painéis do
+            # TerraBrasilis/INPE, mais legível sobre o mapa base claro
             folium.GeoJson(
                 limite.__geo_interface__,
                 name="Região selecionada",
                 style_function=lambda x: {
-                    'fillColor': '#00d4ff',
-                    'fillOpacity': 0.04,
-                    'color': '#00d4ff',
+                    'fillColor': '#e67e22',
+                    'fillOpacity': 0.03,
+                    'color': '#e67e22',
                     'weight': 2.5,
                     'dashArray': '6 3',
                 },
@@ -2487,15 +2493,16 @@ if st.session_state.gerar_dashboard:
                 # Legenda INPE
                 legenda_inpe = """
                 <div style="position:fixed; bottom:28px; left:12px; z-index:9999;
-                            background:rgba(15,15,15,0.82); padding:10px 14px;
-                            border-radius:10px; font-size:12px; color:#ecf0f1;
-                            line-height:1.9; border:1px solid rgba(255,255,255,0.1);">
+                            background:rgba(255,255,255,0.95); padding:10px 14px;
+                            border-radius:8px; font-size:12px; color:#2c3e50;
+                            line-height:1.9; border:1px solid rgba(0,0,0,0.08);
+                            box-shadow:0 1px 4px rgba(0,0,0,0.18);">
                   <b style="font-size:13px; letter-spacing:.5px;">🔥 Intensidade de Focos</b><br>
                   <span style="background:linear-gradient(to right,#ffffb2,#fecc5c,#fd8d3c,#f03b20,#bd0026);
                                display:inline-block;width:130px;height:10px;border-radius:4px;
                                vertical-align:middle;margin-top:4px;"></span><br>
-                  <span style="color:#ffffb2;">Baixa</span>
-                  <span style="float:right;color:#bd0026;">Alta</span>
+                  <span>Baixa</span>
+                  <span style="float:right;">Alta</span>
                 </div>"""
                 m.get_root().html.add_child(folium.Element(legenda_inpe))
 
@@ -2513,15 +2520,16 @@ if st.session_state.gerar_dashboard:
                 # Legenda MODIS
                 legenda_modis = """
                 <div style="position:fixed; bottom:28px; left:12px; z-index:9999;
-                            background:rgba(15,15,15,0.82); padding:10px 14px;
-                            border-radius:10px; font-size:12px; color:#ecf0f1;
-                            line-height:1.9; border:1px solid rgba(255,255,255,0.1);">
+                            background:rgba(255,255,255,0.95); padding:10px 14px;
+                            border-radius:8px; font-size:12px; color:#2c3e50;
+                            line-height:1.9; border:1px solid rgba(0,0,0,0.08);
+                            box-shadow:0 1px 4px rgba(0,0,0,0.18);">
                   <b style="font-size:13px; letter-spacing:.5px;">🗺️ Área Queimada (MODIS)</b><br>
                   <span style="background:linear-gradient(to right,#fff7bc,#fec44f,#fe9929,#ec7014,#cc4c02,#8c2d04);
                                display:inline-block;width:130px;height:10px;border-radius:4px;
                                vertical-align:middle;margin-top:4px;"></span><br>
-                  <span style="color:#fff7bc;">Início do mês</span>
-                  <span style="float:right;color:#8c2d04;">Fim do mês</span>
+                  <span>Início do mês</span>
+                  <span style="float:right;">Fim do mês</span>
                 </div>"""
                 m.get_root().html.add_child(folium.Element(legenda_modis))
 
@@ -3058,7 +3066,7 @@ if st.session_state.gerar_dashboard:
                                 limite.__geo_interface__,
                                 style_function=lambda x: {
                                     'fillColor': 'transparent',
-                                    'color': '#00d4ff', 'weight': 2
+                                    'color': '#e67e22', 'weight': 2
                                 }
                             ).add_to(m_nbr)
                             
@@ -3077,9 +3085,10 @@ if st.session_state.gerar_dashboard:
                             
                             legenda_html = """
                             <div style="position:fixed; bottom:28px; right:10px; z-index:9999;
-                                        background:rgba(20,20,20,0.88); padding:12px 16px;
-                                        border-radius:10px; font-size:12px; color:white; line-height:2;
-                                        border:1px solid rgba(255,255,255,0.1);">
+                                        background:rgba(255,255,255,0.95); padding:12px 16px;
+                                        border-radius:8px; font-size:12px; color:#2c3e50; line-height:2;
+                                        border:1px solid rgba(0,0,0,0.08);
+                                        box-shadow:0 1px 4px rgba(0,0,0,0.18);">
                                 <b style="font-size:13px;">Severidade dNBR</b><br>
                                 <span style="color:#1a9850;">■</span> Regeneração (dNBR &lt; -0.1)<br>
                                 <span style="color:#91cf60;">■</span> Não afetado (-0.1 a 0.1)<br>
@@ -3595,16 +3604,16 @@ ser gerados por essa floresta perdida.
                             m_car = folium.Map(
                                 location=[centro_car.y, centro_car.x],
                                 zoom_start=10 if tipo_analise == "Por Município" else 7,
-                                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
-                                attr="Esri", prefer_canvas=True,
+                                tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+                                attr="CartoDB", prefer_canvas=True,
                             )
 
                             folium.GeoJson(
                                 limite.__geo_interface__,
                                 name=f"Limite — {val_sel}",
                                 style_function=lambda x: {
-                                    'fillColor': '#00d4ff', 'fillOpacity': 0.02,
-                                    'color': '#00d4ff', 'weight': 2.5, 'dashArray': '6 3',
+                                    'fillColor': '#e67e22', 'fillOpacity': 0.02,
+                                    'color': '#e67e22', 'weight': 2.5, 'dashArray': '6 3',
                                 },
                             ).add_to(m_car)
 
@@ -3627,10 +3636,21 @@ ser gerados por essa floresta perdida.
                                     "aparecem coloridos abaixo)."
                                 )
 
+                            # Faixas discretas ("de X até Y"), estilo TerraBrasilis/INPE,
+                            # em vez de um degradê contínuo — mais fácil de ler no mapa.
                             max_focos_imovel = int(contagem["n_focos"].max())
-                            colormap = branca_cm.LinearColormap(
-                                colors=['#ffffb2', '#fecc5c', '#fd8d3c', '#f03b20', '#bd0026'],
-                                vmin=1, vmax=max(max_focos_imovel, 1),
+                            paleta_car = ['#ffffb2', '#fecc5c', '#fd8d3c', '#f03b20', '#bd0026']
+                            n_bins_car = min(len(paleta_car), max(max_focos_imovel, 1))
+                            bordas_car = sorted(set(
+                                int(round(v)) for v in
+                                np.linspace(1, max_focos_imovel + 1, n_bins_car + 1)
+                            ))
+                            if len(bordas_car) < 2:
+                                bordas_car = [1, max_focos_imovel + 1]
+                            colormap = branca_cm.StepColormap(
+                                colors=paleta_car[:len(bordas_car) - 1],
+                                index=bordas_car,
+                                vmin=bordas_car[0], vmax=bordas_car[-1],
                                 caption="Nº de focos dentro do imóvel"
                             )
                             gdf_afetados_geo = gdf_render_car[gdf_render_car["n_focos"] > 0]
@@ -4364,8 +4384,8 @@ ser gerados por essa floresta perdida.
                             m_risco = folium.Map(
                                 location=[centro_mapa.y, centro_mapa.x],
                                 zoom_start=6 if tipo_analise != "Por Município" else 10,
-                                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
-                                attr="Esri", prefer_canvas=True,
+                                tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+                                attr="CartoDB", prefer_canvas=True,
                             )
 
                             # --- Limites de referência (para o usuário se localizar) ---
@@ -4374,8 +4394,8 @@ ser gerados por essa floresta perdida.
                                 limite.__geo_interface__,
                                 name=f"Limite — {val_sel}",
                                 style_function=lambda x: {
-                                    'fillColor': '#00d4ff', 'fillOpacity': 0.02,
-                                    'color': '#00d4ff', 'weight': 3, 'dashArray': '6 3',
+                                    'fillColor': '#e67e22', 'fillOpacity': 0.02,
+                                    'color': '#e67e22', 'weight': 3, 'dashArray': '6 3',
                                 },
                             ).add_to(m_risco)
 
@@ -4384,7 +4404,7 @@ ser gerados por essa floresta perdida.
                                 gdf_mapa.__geo_interface__,
                                 name="Limites municipais",
                                 style_function=lambda x: {
-                                    'fillOpacity': 0, 'color': '#95a5a6', 'weight': 0.8, 'dashArray': '2 2',
+                                    'fillOpacity': 0, 'color': '#7f8c8d', 'weight': 0.8, 'dashArray': '2 2',
                                 },
                                 tooltip=folium.GeoJsonTooltip(
                                     fields=["name_muni"], aliases=["Município:"],
@@ -4402,7 +4422,7 @@ ser gerados por essa floresta perdida.
                                         gdf_estados.__geo_interface__,
                                         name="Limites estaduais",
                                         style_function=lambda x: {
-                                            'fillOpacity': 0, 'color': '#ecf0f1', 'weight': 1.8,
+                                            'fillOpacity': 0, 'color': '#34495e', 'weight': 1.8,
                                         },
                                         tooltip=folium.GeoJsonTooltip(
                                             fields=["abbrev_state"], aliases=["Estado:"],
@@ -4438,15 +4458,16 @@ ser gerados por essa floresta perdida.
 
                             legenda_risco = """
                             <div style="position: fixed; bottom: 30px; left: 30px; z-index:9999;
-                                        background: rgba(30,30,30,0.9); padding: 12px 16px; border-radius: 10px;
-                                        color: white; font-size: 13px; box-shadow: 2px 2px 8px rgba(0,0,0,0.4);">
+                                        background: rgba(255,255,255,0.95); padding: 12px 16px; border-radius: 8px;
+                                        color: #2c3e50; font-size: 13px; border:1px solid rgba(0,0,0,0.08);
+                                        box-shadow: 0 1px 4px rgba(0,0,0,0.18);">
                                 <b>🎯 Nível de Risco (por foco/município)</b><br>
                                 <span style="color:#2ecc71;">●</span> Baixo (&lt;25%)<br>
                                 <span style="color:#f1c40f;">●</span> Moderado (25-50%)<br>
                                 <span style="color:#e67e22;">●</span> Alto (50-75%)<br>
                                 <span style="color:#e74c3c;">●</span> Crítico (≥75%)<br>
-                                <span style="color:#95a5a6;">- - -</span> Limite municipal<br>
-                                <span style="color:#00d4ff;">- - -</span> Região selecionada
+                                <span style="color:#7f8c8d;">- - -</span> Limite municipal<br>
+                                <span style="color:#e67e22;">- - -</span> Região selecionada
                             </div>
                             """
                             m_risco.get_root().html.add_child(folium.Element(legenda_risco))
