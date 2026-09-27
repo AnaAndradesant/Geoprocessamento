@@ -3581,6 +3581,91 @@ ser gerados por essa floresta perdida.
                                 mime="text/csv",
                             )
 
+                            st.markdown("---")
+                            st.markdown("**🗺️ Mapa dos imóveis — limite de cada um, colorido pela intensidade de focos:**")
+
+                            import branca.colormap as branca_cm
+
+                            gdf_render_car = gdf_car.merge(
+                                contagem[["cod_imovel", "n_focos"]], on="cod_imovel", how="left"
+                            )
+                            gdf_render_car["n_focos"] = gdf_render_car["n_focos"].fillna(0)
+
+                            centro_car = limite.geometry.union_all().centroid
+                            m_car = folium.Map(
+                                location=[centro_car.y, centro_car.x],
+                                zoom_start=10 if tipo_analise == "Por Município" else 7,
+                                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                                attr="Esri", prefer_canvas=True,
+                            )
+
+                            folium.GeoJson(
+                                limite.__geo_interface__,
+                                name=f"Limite — {val_sel}",
+                                style_function=lambda x: {
+                                    'fillColor': '#00d4ff', 'fillOpacity': 0.02,
+                                    'color': '#00d4ff', 'weight': 2.5, 'dashArray': '6 3',
+                                },
+                            ).add_to(m_car)
+
+                            # Contorno de TODOS os imóveis carregados só até um teto —
+                            # com milhares de polígonos o navegador engasga pra renderizar;
+                            # os afetados por foco (o que importa) sempre aparecem abaixo.
+                            if len(gdf_car) <= 1500:
+                                folium.GeoJson(
+                                    gdf_car.__geo_interface__,
+                                    name="Todos os imóveis carregados",
+                                    style_function=lambda x: {
+                                        'fillOpacity': 0, 'color': '#7f8c8d', 'weight': 0.6,
+                                    },
+                                ).add_to(m_car)
+                            else:
+                                st.caption(
+                                    f"ℹ️ {len(gdf_car)} imóveis carregados — o contorno "
+                                    "individual de todos não é desenhado no mapa por "
+                                    "performance do navegador (só os afetados por foco "
+                                    "aparecem coloridos abaixo)."
+                                )
+
+                            max_focos_imovel = int(contagem["n_focos"].max())
+                            colormap = branca_cm.LinearColormap(
+                                colors=['#ffffb2', '#fecc5c', '#fd8d3c', '#f03b20', '#bd0026'],
+                                vmin=1, vmax=max(max_focos_imovel, 1),
+                                caption="Nº de focos dentro do imóvel"
+                            )
+                            gdf_afetados_geo = gdf_render_car[gdf_render_car["n_focos"] > 0]
+                            folium.GeoJson(
+                                gdf_afetados_geo.__geo_interface__,
+                                name="Imóveis com foco (intensidade)",
+                                style_function=lambda feat: {
+                                    'fillColor': colormap(feat['properties']['n_focos']),
+                                    'fillOpacity': 0.75,
+                                    'color': '#1c1c1c', 'weight': 1,
+                                },
+                                tooltip=folium.GeoJsonTooltip(
+                                    fields=["cod_imovel", "municipio_car", "n_focos"],
+                                    aliases=["Imóvel:", "Município:", "Focos:"],
+                                    style=(
+                                        "font-size:12px; background:white; color:#2c3e50; "
+                                        "border-radius:6px; box-shadow:2px 2px 6px rgba(0,0,0,0.25);"
+                                    ),
+                                ),
+                            ).add_to(m_car)
+                            colormap.add_to(m_car)
+
+                            fg_focos_car = folium.FeatureGroup(name="Focos de calor")
+                            for _, row_f in gdf_cruzamento.iterrows():
+                                folium.CircleMarker(
+                                    location=[row_f["latitude"], row_f["longitude"]],
+                                    radius=3, color="#1c1c1c", weight=0.5,
+                                    fill=True, fill_color="#ffeb3b", fill_opacity=0.9,
+                                ).add_to(fg_focos_car)
+                            fg_focos_car.add_to(m_car)
+
+                            folium.LayerControl(collapsed=False).add_to(m_car)
+                            _car_map_key = f"mapa_car_{val_sel}_{estado_dd}_{len(gdf_cruzamento)}"
+                            st_folium(m_car, width=None, height=650, returned_objects=[], key=_car_map_key)
+
                     st.markdown("")
                     if st.button(
                         "🔄 Nova Busca no CAR", key=f"btn_car_reset_{val_sel}_{estado_dd}"
