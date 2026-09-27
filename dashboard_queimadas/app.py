@@ -1630,9 +1630,42 @@ def calcular_area_queimada_modis(geom_json, ano, mes=None):
     return burned, area_km2 or 0
 
 
+@st.cache_data(ttl=604800, show_spinner=False, persist="disk")
+def _area_queimada_modis_km2(geom_json_str, ano, mes):
+    """
+    Área queimada (km²) MODIS para UM (geometria, ano, mês) — devolve só um
+    número (float), o que é seguro pra persistir em disco (um ee.Image não é,
+    por isso fica de fora daqui). Separada de buscar_total_modis pra ser
+    reaproveitada também por calcular_anomalia_modis: sem isso, comparar um
+    ano com o histórico desde 2001 recalculava cada (ano, mês) do zero toda
+    vez que o ano de referência mudava, mesmo quando a maioria já tinha sido
+    calculada numa consulta anterior.
+    """
+    ee_geom = ee.Geometry(json.loads(geom_json_str))
+    ee_geom_simple = ee_geom.simplify(maxError=10000)
+    data_ini = ee.Date.fromYMD(ano, mes, 1)
+    colecao = (
+        ee.ImageCollection('MODIS/061/MCD64A1')
+        .filterDate(data_ini, data_ini.advance(1, 'month'))
+        .filterBounds(ee_geom_simple)
+    )
+    if colecao.size().getInfo() == 0:
+        return 0.0  # dados indisponiveis
+    img = colecao.select('BurnDate').max().clip(ee_geom_simple)
+    stats = (
+        ee.Image.pixelArea().divide(1e6)
+        .updateMask(img.gt(0))
+        .rename('area_km2')
+        .reduceRegion(reducer=ee.Reducer.sum(), geometry=ee_geom_simple,
+                      scale=1000, maxPixels=1e13, bestEffort=True)
+        .getInfo()
+    )
+    return round(stats.get('area_km2') or 0, 2)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def buscar_total_modis(geom_json_str, ano, mes):
-    """Busca area queimada total MODIS. Cache de 1h por geometria+periodo."""
+    """Busca area queimada total MODIS + a imagem pra desenhar no mapa. Cache de 1h."""
     ee_geom = ee.Geometry(json.loads(geom_json_str))
     ee_geom_simple = ee_geom.simplify(maxError=10000)
     data_ini = ee.Date.fromYMD(ano, mes, 1)
@@ -1644,15 +1677,7 @@ def buscar_total_modis(geom_json_str, ano, mes):
     if colecao.size().getInfo() == 0:
         return None, 0.0  # dados indisponiveis
     img = colecao.select('BurnDate').max().clip(ee_geom_simple)
-    stats = (
-        ee.Image.pixelArea().divide(1e6)
-        .updateMask(img.gt(0))
-        .rename('area_km2')
-        .reduceRegion(reducer=ee.Reducer.sum(), geometry=ee_geom_simple,
-                      scale=1000, maxPixels=1e13, bestEffort=True)
-        .getInfo()
-    )
-    area = round(stats.get('area_km2') or 0, 2)
+    area = _area_queimada_modis_km2(geom_json_str, ano, mes)
     return img, area
 
 
@@ -1682,108 +1707,66 @@ def _burndate_seguro(colecao):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def calcular_anomalia_modis(geom_json_str, ano_ref):
-    ee_geom = ee.Geometry(json.loads(geom_json_str))
-
-    # Simplifica a geometria UMA VEZ fora do loop — evita recriá-la a cada imagem
-    geom_simplificada = ee_geom.simplify(maxError=5000)
-
+    """
+    Compara cada mês de ano_ref com a média histórica (2001 até ano_ref-1) do
+    mesmo mês. Cada combinação (ano, mês) passa por _area_queimada_modis_km2,
+    que tem cache próprio em disco — ao trocar o ano de referência, os anos
+    históricos que já apareceram numa consulta anterior saem do cache em vez
+    de recalcular do zero (antes, essa função montava uma única árvore de
+    computação no Earth Engine cobrindo TODOS os anos históricos de uma vez,
+    então mudar o ano de referência refazia tudo, mesmo a parte repetida).
+    """
     anos_historico = list(range(2001, ano_ref))
-    anos_ee = ee.List(anos_historico)
     n_anos = len(anos_historico)
+    if n_anos == 0:
+        return pd.DataFrame()
 
     meses_map = {
         1: 'Jan', 2: 'Fev', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun',
         7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Out', 11: 'Nov', 12: 'Dez'
     }
 
-    def get_area_km2(img):
-        raw = (
-            ee.Image.pixelArea().divide(1e6)
-            .updateMask(img.gt(0))
-            .reduceRegion(
-                reducer=ee.Reducer.sum(),
-                geometry=geom_simplificada,
-                scale=10000,
-                maxPixels=1e13,
-                tileScale=16,
-                bestEffort=True
-            ).get('area')
-        )
-        return ee.Algorithms.If(raw, raw, 0)
+    pares = [(ano_ref, mes) for mes in range(1, 13)]
+    pares += [(ano, mes) for ano in anos_historico for mes in range(1, 13)]
 
-    def calc_mes_feature(mes):
-        mes_n = ee.Number(mes)
-        ini_ref = ee.Date.fromYMD(ano_ref, mes_n, 1)
-        col_ref = (
-            ee.ImageCollection('MODIS/061/MCD64A1')
-            .filterDate(ini_ref, ini_ref.advance(1, 'month'))
-            .filterBounds(geom_simplificada)
-            .select('BurnDate')
-        )
-        img_ref = _burndate_seguro(col_ref).clip(geom_simplificada)
-        area_ref = ee.Number(get_area_km2(img_ref))
-
-        def area_ano_hist(ano):
-            ano_n = ee.Number(ano)
-            ini_h = ee.Date.fromYMD(ano_n, mes_n, 1)
-            col_h = (
-                ee.ImageCollection('MODIS/061/MCD64A1')
-                .filterDate(ini_h, ini_h.advance(1, 'month'))
-                .filterBounds(geom_simplificada)
-                .select('BurnDate')
-            )
-            img_h = _burndate_seguro(col_h).clip(geom_simplificada)
-            return get_area_km2(img_h)
-
-        areas_hist = anos_ee.map(area_ano_hist)
-        soma = areas_hist.iterate(
-            lambda cur, acc: ee.Number(acc).add(ee.Number(cur)),
-            ee.Number(0)
-        )
-        media_hist = ee.Number(soma).divide(ee.Number(n_anos))
-
-        return ee.Feature(None, {
-            'mes': mes_n,
-            'area_ref': area_ref,
-            'media_hist': media_hist
-        })
-
-    # ── PROCESSAMENTO PARALELO (4 meses simultâneos) ───────────
-    # Reduz de ~60s sequencial para ~15s com 4 workers paralelos
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     MAX_RETRIES = 4
-    registros = []
 
-    def processar_mes(mes):
+    def _buscar_par(par):
+        ano, mes = par
         for tentativa in range(1, MAX_RETRIES + 1):
             try:
-                feat_resultado = ee.Feature(calc_mes_feature(mes)).getInfo()
-                p = feat_resultado['properties']
-                val_ref  = round(float(p.get('area_ref')  or 0), 2)
-                media    = round(float(p.get('media_hist') or 0), 2)
-                anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
-                return {
-                    'Mês': mes,
-                    'Mês Nome': meses_map[mes],
-                    f'Área {ano_ref} (km²)': val_ref,
-                    'Média Histórica (km²)': media,
-                    'Anomalia (%)': anomalia
-                }
+                return par, _area_queimada_modis_km2(geom_json_str, ano, mes)
             except Exception as e:
                 msg = str(e)
                 if ('Too many concurrent' in msg or '429' in msg) and tentativa < MAX_RETRIES:
                     time.sleep(2 ** tentativa)
                     continue
-                return {
-                    'Mês': mes, 'Mês Nome': meses_map[mes],
-                    f'Área {ano_ref} (km²)': 0,
-                    'Média Histórica (km²)': 0, 'Anomalia (%)': 0
-                }
+                return par, 0.0
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(processar_mes, mes): mes for mes in range(1, 13)}
-        for future in as_completed(futures):
-            registros.append(future.result())
+    # Paraleliza TODOS os pares (ano, mês) de uma vez — não só os 12 meses do
+    # ano de referência — porque cada par agora é uma chamada independente e
+    # cacheada, então o ganho de paralelismo se estende ao histórico também.
+    areas = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        futuros = {executor.submit(_buscar_par, par): par for par in pares}
+        for futuro in concurrent.futures.as_completed(futuros):
+            par, area = futuro.result()
+            areas[par] = area
+
+    registros = []
+    for mes in range(1, 13):
+        val_ref = areas.get((ano_ref, mes), 0.0)
+        media = round(
+            sum(areas.get((ano, mes), 0.0) for ano in anos_historico) / n_anos, 2
+        )
+        anomalia = round(((val_ref - media) / media * 100), 1) if media > 0 else 0
+        registros.append({
+            'Mês': mes,
+            'Mês Nome': meses_map[mes],
+            f'Área {ano_ref} (km²)': val_ref,
+            'Média Histórica (km²)': media,
+            'Anomalia (%)': anomalia
+        })
 
     return pd.DataFrame(sorted(registros, key=lambda x: x['Mês']))
 
@@ -1839,6 +1822,47 @@ def _construir_dnbr(geom_json_str, ano, mes, _mascara_modis=None, area_km2_hint=
     # RETORNA O DNBR ORIGINAL!
     # Isso fará as cores do mapa combinarem perfeitamente com as do gráfico
     return poly, dnbr
+
+# =====================================================================
+# 🏡 CAR (SICAR) — CRUZAMENTO COM IMÓVEIS RURAIS
+# =====================================================================
+# WFS público oficial do SICAR (Sistema Nacional de Cadastro Ambiental Rural),
+# uma camada por UF (ex: sicar:sicar_imoveis_ms). Sem autenticação, sem
+# captcha — mesmo padrão de acesso já usado pro INPE. A resposta NÃO traz
+# nome/CPF do proprietário, só código do imóvel (hash), município e área —
+# por isso é seguro exibir diretamente no dashboard.
+
+@st.cache_data(ttl=604800, show_spinner=False, persist="disk")
+def buscar_car_imoveis(uf, bbox_wgs84, max_features=5000):
+    """
+    Busca imóveis rurais do CAR via WFS, filtrados por bbox (nunca o estado
+    inteiro — algumas UFs têm centenas de milhares de imóveis). Nunca levanta
+    exceção: indisponibilidade do serviço (comum em portais públicos) devolve
+    um GeoDataFrame vazio em vez de derrubar a aba.
+    """
+    colunas = ["cod_imovel", "municipio", "area", "geometry"]
+    url = "https://geoserver.car.gov.br/geoserver/sicar/ows"
+    minx, miny, maxx, maxy = bbox_wgs84
+    params = {
+        "service": "WFS", "version": "1.0.0", "request": "GetFeature",
+        "typeName": f"sicar:sicar_imoveis_{uf.lower()}",
+        "outputFormat": "application/json",
+        "bbox": f"{minx},{miny},{maxx},{maxy},EPSG:4326",
+        "maxFeatures": max_features,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=60, verify=False)
+        if r.status_code != 200:
+            return gpd.GeoDataFrame(columns=colunas)
+        dados = r.json()
+        if not dados.get("features"):
+            return gpd.GeoDataFrame(columns=colunas)
+        gdf = gpd.GeoDataFrame.from_features(dados["features"], crs="EPSG:4326")
+        cols_presentes = [c for c in colunas if c in gdf.columns]
+        return gdf[cols_presentes]
+    except Exception:
+        return gpd.GeoDataFrame(columns=colunas)
+
 
 # =============================================================
 # --- INTERFACE (BARRA LATERAL) ---
@@ -2315,11 +2339,12 @@ if st.session_state.gerar_dashboard:
         # =============================================================
         # --- ABAS PRINCIPAIS ---
         # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_export, aba_risco = st.tabs([
+        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_car, aba_export, aba_risco = st.tabs([
             "🗺️ Mapa de Focos",
             "📈 Gráficos & Anomalia",
             "🔬 Severidade (NBR Sentinel-2)",
             "💰 Impacto Econômico",
+            "🏡 Propriedades Rurais (CAR)",
             "⬇️ Exportar Dados",
             "🎯 Risco Preditivo (ML)"
         ])
@@ -3386,6 +3411,153 @@ ser gerados por essa floresta perdida.
             import traceback
             st.code(traceback.format_exc(), language="python")
 
+        # ----------------------------------------------------------
+        # ABA — PROPRIEDADES RURAIS (CAR)
+        # ----------------------------------------------------------
+        with aba_car:
+            st.subheader("🏡 Propriedades Rurais (CAR) Afetadas por Queimada")
+            st.caption(
+                "Cruza os focos de calor detectados com os limites de imóveis rurais "
+                "cadastrados no CAR (SICAR), via WFS público oficial. A resposta não "
+                "traz nome ou CPF do proprietário — apenas o código do imóvel (hash), "
+                "município e área."
+            )
+
+            if tipo_analise == "Por Bioma":
+                st.info(
+                    "ℹ️ Não disponível para análise 'Por Bioma': um bioma cruza várias "
+                    "UFs, e a base do CAR é organizada por estado. Selecione "
+                    "'Por Estado' ou 'Por Município' na barra lateral para usar esta aba."
+                )
+            elif "INPE" not in fonte_escolhida:
+                st.info(
+                    "ℹ️ Esta análise usa os focos de calor do INPE (pontos), não a área "
+                    "queimada do MODIS. Troque a fonte de dados para "
+                    "'🔥 Focos de Calor (INPE)' na barra lateral e clique em "
+                    "'Gerar Dashboard' novamente."
+                )
+            elif df_rec.empty:
+                st.info("Nenhum foco de calor nesta região/período para cruzar com o CAR.")
+            else:
+                _car_key = f"car_resultado_{val_sel}_{estado_dd}"
+                if _car_key not in st.session_state:
+                    st.session_state[_car_key] = None
+
+                if st.session_state[_car_key] is None:
+                    st.info(
+                        "⚡ Busca os imóveis do CAR cadastrados dentro dos limites da "
+                        "região selecionada. Pode levar até 1 minuto em regiões maiores."
+                    )
+                    if st.button(
+                        "🔎 Buscar Imóveis do CAR na Região",
+                        type="primary", use_container_width=True,
+                        key=f"btn_car_{val_sel}_{estado_dd}"
+                    ):
+                        with st.spinner("🏡 Consultando o SICAR..."):
+                            bbox = tuple(limite.total_bounds)
+                            gdf_car_bruto = buscar_car_imoveis(estado_dd, bbox)
+                            st.session_state[_car_key] = gdf_car_bruto
+
+                gdf_car_bruto = st.session_state[_car_key]
+                if gdf_car_bruto is not None:
+                    if gdf_car_bruto.empty:
+                        st.warning(
+                            "⚠️ Nenhum imóvel do CAR retornado — o serviço pode estar "
+                            "instável agora, ou a região realmente não tem imóveis "
+                            "cadastrados no recorte consultado. Tente novamente em "
+                            "alguns minutos."
+                        )
+                    else:
+                        if len(gdf_car_bruto) >= 5000:
+                            st.warning(
+                                "⚠️ Atingiu o limite de 5.000 imóveis retornados — pode "
+                                "haver mais imóveis na região que não foram carregados. "
+                                "Prefira 'Por Município' para uma busca mais completa."
+                            )
+
+                        # Renomeia ANTES do cruzamento espacial — df_rec (focos do INPE)
+                        # já tem uma coluna 'municipio' própria; sem isso, o sjoin criaria
+                        # 'municipio_left'/'municipio_right' e a agregação pegaria a errada.
+                        gdf_car = gdf_car_bruto.rename(
+                            columns={"municipio": "municipio_car", "area": "area_ha_car"}
+                        )
+
+                        gdf_focos_pts = gpd.GeoDataFrame(
+                            df_rec,
+                            geometry=gpd.points_from_xy(df_rec["longitude"], df_rec["latitude"]),
+                            crs="EPSG:4326"
+                        )
+                        gdf_cruzamento = gpd.sjoin(
+                            gdf_focos_pts, gdf_car, predicate="within", how="inner"
+                        )
+
+                        if gdf_cruzamento.empty:
+                            st.success(
+                                "✅ Nenhum dos focos detectados caiu dentro de um imóvel "
+                                f"do CAR, entre os {len(gdf_car)} imóveis carregados na região."
+                            )
+                        else:
+                            contagem = (
+                                gdf_cruzamento.groupby("cod_imovel")
+                                .agg(
+                                    n_focos=("cod_imovel", "count"),
+                                    municipio=("municipio_car", "first"),
+                                    area_ha=("area_ha_car", "first"),
+                                )
+                                .reset_index()
+                                .sort_values("n_focos", ascending=False)
+                            )
+
+                            n_imoveis_afetados = len(contagem)
+                            n_focos_em_imoveis = int(contagem["n_focos"].sum())
+
+                            col_car1, col_car2, col_car3 = st.columns(3)
+                            col_car1.metric("🏡 Imóveis com foco", n_imoveis_afetados)
+                            col_car2.metric(
+                                "🔥 Focos dentro de imóveis do CAR",
+                                f"{n_focos_em_imoveis} de {len(df_rec)}"
+                            )
+                            col_car3.metric("📋 Imóveis carregados na região", len(gdf_car))
+
+                            st.markdown("**🔥 Top 10 imóveis com mais focos:**")
+                            top10 = contagem.head(10)
+                            fig_car = px.bar(
+                                top10, x="n_focos", y="cod_imovel", orientation="h",
+                                color="n_focos",
+                                color_continuous_scale=px.colors.sequential.Reds,
+                                hover_data=["municipio", "area_ha"],
+                                labels={"n_focos": "Nº de focos", "cod_imovel": "Imóvel (CAR)"},
+                            )
+                            fig_car.update_layout(
+                                template="plotly_dark",
+                                yaxis={'categoryorder': 'total ascending'},
+                                height=380, margin=dict(t=20, b=20),
+                                coloraxis_showscale=False,
+                            )
+                            st.plotly_chart(fig_car, use_container_width=True)
+
+                            st.dataframe(
+                                contagem.rename(columns={
+                                    "cod_imovel": "Imóvel (CAR)", "n_focos": "Focos",
+                                    "municipio": "Município", "area_ha": "Área do imóvel (ha)",
+                                }),
+                                hide_index=True, use_container_width=True
+                            )
+
+                            csv_car = contagem.to_csv(index=False).encode("utf-8-sig")
+                            st.download_button(
+                                "📄 Baixar CSV — Imóveis do CAR com Foco",
+                                data=csv_car,
+                                file_name=f"car_focos_{val_sel}_{hoje.strftime('%Y%m%d')}.csv",
+                                mime="text/csv",
+                            )
+
+                    st.markdown("")
+                    if st.button(
+                        "🔄 Nova Busca no CAR", key=f"btn_car_reset_{val_sel}_{estado_dd}"
+                    ):
+                        st.session_state[_car_key] = None
+                        st.rerun()
 
         # ----------------------------------------------------------
         # ABA 5 — EXPORTAR DADOS
@@ -3538,6 +3710,18 @@ ser gerados por essa floresta perdida.
         # ----------------------------------------------------------
         with aba_risco:
             st.subheader("🎯 Risco Preditivo de Queimada — Mapa por Município")
+
+            st.info(
+                "📅 **Importante:** esta aba sempre treina e prevê o risco com dados "
+                "climáticos **recentes** (dos últimos 1-3 anos até hoje), "
+                "**independente** do ano/mês escolhido na barra lateral para a "
+                "análise de queimada nas outras abas (Mapa, Gráficos, Severidade, "
+                "Impacto). A pergunta respondida aqui é sempre 'qual o risco de "
+                "queimar nos próximos dias/mês, a partir de hoje?' — por isso o "
+                "modelo nunca usa um ano passado como referência de previsão. Só a "
+                "**região** selecionada (estado/bioma/município) é compartilhada "
+                "com as outras abas; o período não é."
+            )
 
             with st.expander("ℹ️ Como esse modelo funciona (leia antes de treinar)", expanded=False):
                 st.markdown(
