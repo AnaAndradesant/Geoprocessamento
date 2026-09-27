@@ -2557,15 +2557,22 @@ if st.session_state.gerar_dashboard:
 
             # Dados de queimada / focos
             if "INPE" in fonte_escolhida and not df_rec.empty:
+                # radius/blur em PIXELS de tela, não em metros — por isso, afastado o
+                # zoom, focos geograficamente distantes ficam pertos na tela e se
+                # fundem num "blob" só, dando a falsa impressão de que a região
+                # inteira está pegando fogo. Valores menores aqui (e um gradiente que
+                # só fica vermelho intenso em densidade bem alta) reduzem esse efeito;
+                # é uma limitação inerente de mapa de calor por densidade de pontos,
+                # não dá pra eliminar 100% sem trocar de técnica de visualização.
                 HeatMap(
                     df_rec[["latitude", "longitude"]].dropna().values.tolist(),
                     name="Densidade de focos",
-                    radius=8,
-                    blur=12,
+                    radius=5,
+                    blur=7,
                     max_zoom=14,
-                    min_opacity=0.35,
-                    gradient={0.2: '#ffffb2', 0.45: '#fecc5c',
-                               0.65: '#fd8d3c', 0.85: '#f03b20', 1.0: '#bd0026'},
+                    min_opacity=0.2,
+                    gradient={0.3: '#ffffb2', 0.5: '#fecc5c',
+                               0.7: '#fd8d3c', 0.87: '#f03b20', 1.0: '#bd0026'},
                 ).add_to(m)
 
                 # Legenda INPE
