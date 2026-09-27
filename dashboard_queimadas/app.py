@@ -3856,8 +3856,18 @@ ser gerados por essa floresta perdida.
                             }
 
                 _prodes_resultado = st.session_state[_prodes_key]
-                gdf_prodes_bruto = _prodes_resultado["bruto"] if _prodes_resultado else None
-                mascara_prodes = _prodes_resultado["mascara"] if _prodes_resultado else None
+                if isinstance(_prodes_resultado, dict):
+                    gdf_prodes_bruto = _prodes_resultado.get("bruto")
+                    mascara_prodes = _prodes_resultado.get("mascara")
+                else:
+                    # Sessão aberta antes da mudança de formato desse cache (era um
+                    # GeoDataFrame puro, agora é um dict) — "if df:" nessa situação
+                    # levanta ValueError (truth value ambíguo de DataFrame), por isso
+                    # o isinstance acima em vez de checar truthiness direto. Reseta
+                    # e pede uma nova busca em vez de tentar reaproveitar o formato antigo.
+                    gdf_prodes_bruto = None
+                    mascara_prodes = None
+                    st.session_state[_prodes_key] = None
                 if gdf_prodes_bruto is not None:
                     if gdf_prodes_bruto.empty:
                         st.warning(
