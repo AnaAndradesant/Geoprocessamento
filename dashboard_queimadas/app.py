@@ -1924,12 +1924,17 @@ ESTADO_BIOMA_PRODES = {
 
 
 @st.cache_data(ttl=604800, show_spinner=False, persist="disk")
-def buscar_prodes_desmatamento(bioma, bbox_wgs84, max_features=5000):
+def buscar_prodes_desmatamento(bioma, bbox_wgs84, max_features=10000):
     """
     Busca os polígonos de desmatamento acumulado do PRODES pro bioma, filtrados
     por bbox (o bioma inteiro tem centenas de milhares de polígonos — nunca
     baixar sem recorte). Nunca levanta exceção: indisponibilidade do serviço
     devolve um GeoDataFrame vazio em vez de derrubar a aba.
+
+    max_features NÃO é arbitrário: testado ao vivo, uma bbox de porte médio
+    (parte de um estado do Cerrado) já devolve ~20 mil polígonos e ~196 MB de
+    GeoJSON em ~30s — sem limite nenhum, isso estoura a memória do Streamlit
+    Cloud (1 GB no plano gratuito) antes mesmo de chegar a desenhar o mapa.
     """
     colunas = ["year", "area_km", "state", "geometry"]
     if bioma not in PRODES_LAYERS:
@@ -1945,7 +1950,7 @@ def buscar_prodes_desmatamento(bioma, bbox_wgs84, max_features=5000):
         "maxFeatures": max_features,
     }
     try:
-        r = requests.get(url, params=params, timeout=90, verify=False)
+        r = requests.get(url, params=params, timeout=150, verify=False)
         if r.status_code != 200:
             return gpd.GeoDataFrame(columns=colunas)
         dados = r.json()
@@ -3824,12 +3829,35 @@ ser gerados por essa floresta perdida.
                         type="primary", use_container_width=True,
                         key=f"btn_prodes_{val_sel}_{bioma_alvo_prodes}"
                     ):
-                        with st.spinner("🌳 Consultando o PRODES/TerraBrasilis..."):
+                        with st.spinner(
+                            "🌳 Consultando o PRODES e consolidando os polígonos em "
+                            "uma máscara única (pode levar até 1 minuto em regiões "
+                            "grandes)..."
+                        ):
                             bbox_prodes = tuple(limite.total_bounds)
                             gdf_prodes_bruto = buscar_prodes_desmatamento(bioma_alvo_prodes, bbox_prodes)
-                            st.session_state[_prodes_key] = gdf_prodes_bruto
+                            # Dissolve TODOS os polígonos numa máscara só + simplifica —
+                            # calculado UMA VEZ aqui (não a cada rerun do Streamlit) e
+                            # cacheado no session_state. É o que permite desenhar a
+                            # máscara no mapa mesmo com milhares de polígonos de entrada,
+                            # sem travar o navegador com milhares de formas separadas.
+                            mascara_prodes = None
+                            if not gdf_prodes_bruto.empty:
+                                try:
+                                    mascara_prodes = (
+                                        gdf_prodes_bruto.geometry.union_all()
+                                        .simplify(0.0008, preserve_topology=True)
+                                    )
+                                except Exception:
+                                    mascara_prodes = None
+                            st.session_state[_prodes_key] = {
+                                "bruto": gdf_prodes_bruto,
+                                "mascara": mascara_prodes,
+                            }
 
-                gdf_prodes_bruto = st.session_state[_prodes_key]
+                _prodes_resultado = st.session_state[_prodes_key]
+                gdf_prodes_bruto = _prodes_resultado["bruto"] if _prodes_resultado else None
+                mascara_prodes = _prodes_resultado["mascara"] if _prodes_resultado else None
                 if gdf_prodes_bruto is not None:
                     if gdf_prodes_bruto.empty:
                         st.warning(
@@ -3838,12 +3866,16 @@ ser gerados por essa floresta perdida.
                             "desmatamento acumulado registrado no recorte consultado."
                         )
                     else:
-                        if len(gdf_prodes_bruto) >= 5000:
+                        if len(gdf_prodes_bruto) >= 10000:
                             st.warning(
-                                "⚠️ Atingiu o limite de 5.000 polígonos retornados — "
-                                "pode haver mais desmatamento na região que não foi "
-                                "carregado. Prefira 'Por Município' para uma busca "
-                                "mais completa."
+                                "⚠️ Atingiu o limite de 10.000 polígonos retornados "
+                                "nesta consulta — em regiões muito grandes (estado "
+                                "inteiro ou bioma) pode haver desmatamento fora do "
+                                "recorte carregado. A máscara no mapa reflete só o que "
+                                "foi carregado; prefira 'Por Município' para cobertura "
+                                "completa. (Não removi o limite de propósito: uma bbox "
+                                "de porte médio já devolve ~200 MB de dados brutos — "
+                                "sem limite algum, o app trava por falta de memória.)"
                             )
 
                         df_rec_prodes = df_rec.drop(
@@ -3916,21 +3948,20 @@ ser gerados por essa floresta perdida.
                             },
                         ).add_to(m_prodes)
 
-                        if len(gdf_prodes_bruto) <= 1500:
+                        if mascara_prodes is not None and not mascara_prodes.is_empty:
                             folium.GeoJson(
-                                gdf_prodes_bruto.__geo_interface__,
+                                gpd.GeoSeries([mascara_prodes], crs="EPSG:4326").__geo_interface__,
                                 name="Desmatamento acumulado (PRODES)",
                                 style_function=lambda x: {
                                     'fillColor': '#8d6e63', 'fillOpacity': 0.5,
-                                    'color': '#5d4037', 'weight': 0.3,
+                                    'color': '#5d4037', 'weight': 0.6,
                                 },
                             ).add_to(m_prodes)
                         else:
                             st.caption(
-                                f"ℹ️ {len(gdf_prodes_bruto)} polígonos de desmatamento "
-                                "carregados — o contorno individual de todos não é "
-                                "desenhado no mapa por performance do navegador (a "
-                                "estatística acima já considera todos eles)."
+                                "ℹ️ Não foi possível montar a máscara de desmatamento "
+                                "pra desenhar no mapa (os dados brutos ainda foram "
+                                "usados na estatística acima)."
                             )
 
                         fg_focos_prodes = folium.FeatureGroup(name="Focos de calor")
