@@ -2404,9 +2404,9 @@ if st.session_state.gerar_dashboard:
 
             tiles_config = {
                 "☀️ Claro (Institucional)": {
-                    "url": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-                    "attr": "CartoDB",
-                    "ref_url": None,
+                    "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                    "attr": "Esri",
+                    "ref_url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
                 },
                 "🌑 Mapa Dark": {
                     "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
@@ -3604,9 +3604,13 @@ ser gerados por essa floresta perdida.
                             m_car = folium.Map(
                                 location=[centro_car.y, centro_car.x],
                                 zoom_start=10 if tipo_analise == "Por Município" else 7,
-                                tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-                                attr="CartoDB", prefer_canvas=True,
+                                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                                attr="Esri", prefer_canvas=True,
                             )
+                            folium.TileLayer(
+                                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
+                                attr="Esri Ref", overlay=True, control=False,
+                            ).add_to(m_car)
 
                             folium.GeoJson(
                                 limite.__geo_interface__,
@@ -4384,9 +4388,13 @@ ser gerados por essa floresta perdida.
                             m_risco = folium.Map(
                                 location=[centro_mapa.y, centro_mapa.x],
                                 zoom_start=6 if tipo_analise != "Por Município" else 10,
-                                tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-                                attr="CartoDB", prefer_canvas=True,
+                                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                                attr="Esri", prefer_canvas=True,
                             )
+                            folium.TileLayer(
+                                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
+                                attr="Esri Ref", overlay=True, control=False,
+                            ).add_to(m_risco)
 
                             # --- Limites de referência (para o usuário se localizar) ---
                             # Contorno da região selecionada (bioma/estado/município) — igual ao mapa principal
