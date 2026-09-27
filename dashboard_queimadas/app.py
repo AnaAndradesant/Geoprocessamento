@@ -3702,6 +3702,132 @@ ser gerados por essa floresta perdida.
                          "— a fonte só muda o que o modelo aprendeu a reconhecer como risco.)"
                 )
 
+                st.markdown("---")
+                with st.expander(
+                    "🔬 Análise de Sensibilidade da Amostra — a amostra escolhida é suficiente?"
+                ):
+                    st.caption(
+                        "Treina o modelo várias vezes com tamanhos de amostra crescentes e mede o AUC "
+                        "temporal (validação walk-forward) em cada um. Se o AUC parar de subir "
+                        "(\"empacotar\") a partir de um certo tamanho, isso é evidência de que aumentar "
+                        "a amostra além dali não traria ganho relevante — em vez de só afirmar que a "
+                        "amostra é suficiente, este gráfico mostra."
+                    )
+                    if modo_amostragem == "painel" and tipo_analise == "Por Município":
+                        st.info(
+                            "ℹ️ Não aplicável nesta combinação: no modo Painel com análise 'Por "
+                            "Município' só existe 1 unidade espacial possível (o próprio município). "
+                            "Troque para 'Caso-controle' acima para analisar sensibilidade pelo número "
+                            "de focos, ou selecione 'Por Estado'/'Por Bioma' para analisar pelo número "
+                            "de municípios."
+                        )
+                    else:
+                        if modo_amostragem == "painel":
+                            tamanhos_teste = [3, 8, 15, 20]
+                            rotulo_eixo = "Nº de municípios na amostra de treino"
+                            unidade_teste = "municípios"
+                        else:
+                            tamanhos_teste = [100, 200, 400, 800]
+                            rotulo_eixo = "Nº de focos usados como amostra"
+                            unidade_teste = "focos"
+
+                        st.caption(
+                            f"Tamanhos testados: {tamanhos_teste} {unidade_teste}. Cada treino é "
+                            "independente e cacheado (24h) — repetir a análise depois é instantâneo."
+                        )
+
+                        if st.button("▶️ Rodar Análise de Sensibilidade", key="btn_sensibilidade"):
+                            resultados_sens = []
+                            barra_sens = st.progress(0.0, text="Iniciando...")
+                            for i_tam, tam in enumerate(tamanhos_teste):
+                                barra_sens.progress(
+                                    i_tam / len(tamanhos_teste),
+                                    text=f"Treinando com {tam} {unidade_teste}..."
+                                )
+                                if modo_amostragem == "painel":
+                                    res_tam = treinar_modelo_risco_regional(
+                                        tipo_analise, estado_dd, bioma_dd, municipio_dd,
+                                        anos_historico=anos_hist, n_amostra_treino=tam,
+                                        fonte_dados=fonte_dados_risco, modo_amostragem="painel",
+                                    )
+                                else:
+                                    res_tam = treinar_modelo_risco_regional(
+                                        tipo_analise, estado_dd, bioma_dd, municipio_dd,
+                                        anos_historico=anos_hist, fonte_dados=fonte_dados_risco,
+                                        modo_amostragem="caso_controle", max_focos=tam,
+                                    )
+                                if "erro" not in res_tam:
+                                    cv_venc = res_tam["cv_resultados"][res_tam["algoritmo"]]["temporal_auc"]
+                                    resultados_sens.append({
+                                        "tamanho": tam,
+                                        "auc_medio": cv_venc["media"] if cv_venc else None,
+                                        "auc_desvio": cv_venc["desvio"] if cv_venc else None,
+                                        "algoritmo": res_tam["algoritmo"],
+                                    })
+                            barra_sens.progress(1.0, text="Concluído!")
+
+                            df_sens = pd.DataFrame(
+                                [r for r in resultados_sens if r["auc_medio"] is not None]
+                            )
+                            if len(df_sens) < 2:
+                                st.warning(
+                                    "⚠️ Dados insuficientes em pelo menos um dos tamanhos testados "
+                                    "para montar a curva de sensibilidade nesta região/período."
+                                )
+                            else:
+                                fig_sens = go.Figure()
+                                fig_sens.add_trace(go.Scatter(
+                                    x=df_sens["tamanho"], y=df_sens["auc_medio"],
+                                    error_y=dict(
+                                        type="data",
+                                        array=df_sens["auc_desvio"].fillna(0)
+                                    ),
+                                    mode="lines+markers",
+                                    line=dict(color="#e74c3c", width=3),
+                                    marker=dict(size=10),
+                                ))
+                                fig_sens.update_layout(
+                                    template="plotly_dark", height=380,
+                                    xaxis_title=rotulo_eixo,
+                                    yaxis_title="AUC-ROC (validação temporal)",
+                                    yaxis=dict(range=[0.4, 1.0]),
+                                    margin=dict(t=30, b=20),
+                                )
+                                st.plotly_chart(fig_sens, use_container_width=True)
+
+                                ganho_final = (
+                                    df_sens["auc_medio"].iloc[-1] - df_sens["auc_medio"].iloc[-2]
+                                )
+                                if abs(ganho_final) < 0.02:
+                                    st.success(
+                                        f"✅ O AUC estabilizou entre os dois maiores tamanhos testados "
+                                        f"(variação de {ganho_final:+.3f}) — evidência de que a amostra "
+                                        "atual já captura o padrão disponível; aumentá-la não traria "
+                                        "ganho relevante."
+                                    )
+                                else:
+                                    st.warning(
+                                        f"⚠️ O AUC ainda estava subindo entre os dois maiores tamanhos "
+                                        f"testados (variação de {ganho_final:+.3f}) — considere usar "
+                                        "uma amostra maior se o tempo de execução permitir."
+                                    )
+                                st.dataframe(
+                                    df_sens.rename(columns={
+                                        "tamanho": rotulo_eixo,
+                                        "auc_medio": "AUC médio",
+                                        "auc_desvio": "Desvio padrão",
+                                        "algoritmo": "Algoritmo vencedor",
+                                    }),
+                                    hide_index=True, use_container_width=True
+                                )
+                                st.caption(
+                                    "Limitação: cada ponto usa uma única amostragem aleatória (seed "
+                                    "fixa) daquele tamanho — não é a média de várias repetições. Para "
+                                    "o fim deste estudo (justificar a ordem de grandeza da amostra), "
+                                    "isso é suficiente; um estudo de produção repetiria cada tamanho "
+                                    "com seeds diferentes para estimar a variância da própria amostragem."
+                                )
+
                 if st.button("🧠 Treinar Modelo e Gerar Mapa de Risco", use_container_width=True):
                     status = st.status("Treinando modelo regional...", expanded=True)
 
