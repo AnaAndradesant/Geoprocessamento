@@ -3733,7 +3733,10 @@ ser gerados por essa floresta perdida.
         # ----------------------------------------------------------
         # ABA — PROPRIEDADES RURAIS (CAR)
         # ----------------------------------------------------------
-        with aba_car:
+        # Fragmento: clicar em algo DENTRO desta aba reexecuta só a aba, e não o
+        # dashboard inteiro (que recarregava focos, limites e mapas a cada clique).
+        @st.fragment
+        def _aba_car():
             st.subheader("🏡 Propriedades Rurais (CAR) Afetadas por Queimada")
             st.caption(
                 "Cruza os focos de calor detectados com os limites de imóveis rurais "
@@ -4020,12 +4023,18 @@ ser gerados por essa floresta perdida.
                         "🔄 Nova Busca no CAR", key=f"btn_car_reset_{_val_c}_{_uf_c}"
                     ):
                         st.session_state[_car_key] = None
-                        st.rerun()
+                        st.rerun(scope="fragment")
+
+        with aba_car:
+            _aba_car()
 
         # ----------------------------------------------------------
         # ABA — DESMATAMENTO (PRODES)
         # ----------------------------------------------------------
-        with aba_prodes:
+        # Fragmento: clicar em algo DENTRO desta aba reexecuta só a aba, e não o
+        # dashboard inteiro (que recarregava focos, limites e mapas a cada clique).
+        @st.fragment
+        def _aba_prodes():
             st.subheader("🌳 Queimada x Desmatamento (PRODES)")
             st.caption(
                 "Cruza cada foco de calor com o desmatamento mapeado pelo PRODES/INPE "
@@ -4415,7 +4424,10 @@ ser gerados por essa floresta perdida.
                         "🔄 Nova Busca no PRODES", key=f"btn_prodes_reset_{_val_p}"
                     ):
                         st.session_state[_prodes_key] = None
-                        st.rerun()
+                        st.rerun(scope="fragment")
+
+        with aba_prodes:
+            _aba_prodes()
 
         # ----------------------------------------------------------
         # ABA 5 — EXPORTAR DADOS
