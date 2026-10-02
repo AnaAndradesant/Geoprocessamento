@@ -740,6 +740,22 @@ def _carregar_todos_municipios_brasil():
     return read_municipality(code_muni="all", year=2020)
 
 
+@st.cache_data(ttl=2592000, show_spinner=False, persist="disk")
+def listar_municipios_do_bioma(bioma):
+    """
+    Lista (UF, nome) de todos os municípios que tocam o bioma, ordenada.
+    Usada na aba PRODES: em vez de baixar o desmatamento do bioma inteiro
+    (milhões de polígonos), o usuário escolhe um município do bioma.
+    """
+    gdf_bioma = read_biomes(year=2019)
+    gdf_bioma = gdf_bioma[gdf_bioma['name_biome'] == bioma]
+    gdf_todos = _carregar_todos_municipios_brasil()
+    gdf_bioma = gdf_bioma.to_crs(gdf_todos.crs)
+    gdf = gpd.sjoin(gdf_todos, gdf_bioma[['geometry']], predicate='intersects', how='inner')
+    gdf = gdf.drop_duplicates(subset=['code_muni'])
+    return sorted(zip(gdf['abbrev_state'], gdf['name_muni']))
+
+
 @st.cache_data(ttl=604800, show_spinner=False, persist="disk")
 def obter_municipios_regiao(tipo_analise, estado_dd, bioma_dd, municipio_dd, max_municipios=50, seed=42):
     """
@@ -4043,12 +4059,37 @@ ser gerados por essa floresta perdida.
                 "um estado inteiro deixam a busca lenta."
             )
 
+            # Região EFETIVA desta aba. Em "Por Bioma" o usuário escolhe um município
+            # do bioma aqui dentro (baixar o desmatamento do bioma inteiro estoura a
+            # memória); nos demais casos usa a região da barra lateral.
+            _tipo_p, _uf_p, _bioma_p, _muni_p = tipo_analise, estado_dd, bioma_dd, municipio_dd
+            _limite_p, _val_p = limite, val_sel
+            _escolha_ok = True
             if tipo_analise == "Por Bioma":
                 bioma_alvo_prodes = bioma_dd
+                _lista_muni = listar_municipios_do_bioma(bioma_dd)
+                _rotulos = [f"{nome} ({uf})" for uf, nome in _lista_muni]
+                _sel_muni = st.selectbox(
+                    f"Município do bioma {bioma_dd}:", ["— escolha um município —"] + _rotulos,
+                    key=f"muni_prodes_{bioma_dd}",
+                    help=f"{len(_rotulos)} municípios tocam este bioma. O PRODES é "
+                         "consultado só para o município escolhido, o que dá cobertura "
+                         "completa e não derruba o app."
+                )
+                if _sel_muni.startswith("—"):
+                    _escolha_ok = False
+                    st.info("👆 Escolha um município do bioma para analisar o desmatamento e os focos.")
+                else:
+                    _uf_p, _muni_p = _lista_muni[_rotulos.index(_sel_muni)][0], _lista_muni[_rotulos.index(_sel_muni)][1]
+                    _tipo_p = "Por Município"
+                    _limite_p = carregar_fronteira("Por Município", _uf_p, None, _muni_p)
+                    _val_p = f"{_muni_p} ({_uf_p})"
             else:
                 bioma_alvo_prodes = ESTADO_BIOMA_PRODES.get(estado_dd)
 
-            if bioma_alvo_prodes is None or bioma_alvo_prodes not in PRODES_LAYERS:
+            if not _escolha_ok:
+                pass
+            elif bioma_alvo_prodes is None or bioma_alvo_prodes not in PRODES_LAYERS:
                 st.info(
                     "ℹ️ Não foi possível determinar o bioma desta região pra "
                     "escolher a camada certa do PRODES."
@@ -4067,13 +4108,13 @@ ser gerados por essa floresta perdida.
                     help="Quanto mais anos, mais tempo o desmatamento teve para "
                          "aparecer depois do fogo — mas a busca de focos fica mais lenta."
                 )
-                if tipo_analise != "Por Município" and anos_prodes >= 3:
+                if _tipo_p != "Por Município" and anos_prodes >= 3:
                     st.warning(
                         "⏱️ Região grande com vários anos de focos: a busca pode levar "
                         "alguns minutos. Para um primeiro teste, escolha 'Por Município'."
                     )
 
-                _prodes_key = f"prodes_res2_{val_sel}_{bioma_alvo_prodes}"
+                _prodes_key = f"prodes_res2_{_val_p}_{bioma_alvo_prodes}"
                 if _prodes_key not in st.session_state:
                     st.session_state[_prodes_key] = None
                 _res_atual = st.session_state[_prodes_key]
@@ -4090,7 +4131,7 @@ ser gerados por essa floresta perdida.
                         "🔄 Atualizar com este período" if periodo_mudou
                         else "🔎 Buscar Desmatamento (PRODES) e Focos",
                         type="primary", use_container_width=True,
-                        key=f"btn_prodes_{val_sel}_{bioma_alvo_prodes}"
+                        key=f"btn_prodes_{_val_p}_{bioma_alvo_prodes}"
                     ):
                         with st.spinner(
                             "🌳 Consultando o PRODES e os focos do INPE (não feche a "
@@ -4101,10 +4142,10 @@ ser gerados por essa floresta perdida.
                                 gdf_prodes_bruto = _res_atual["bruto"]
                             else:
                                 gdf_prodes_bruto = buscar_prodes_desmatamento(
-                                    bioma_alvo_prodes, tuple(limite.total_bounds)
+                                    bioma_alvo_prodes, tuple(_limite_p.total_bounds)
                                 )
                             focos_prodes = focos_do_periodo(
-                                tipo_analise, estado_dd, bioma_dd, municipio_dd, anos_prodes, limite
+                                _tipo_p, _uf_p, _bioma_p, _muni_p, anos_prodes, _limite_p
                             )
                             st.session_state[_prodes_key] = {
                                 "bruto": gdf_prodes_bruto, "focos": focos_prodes, "anos": anos_prodes,
@@ -4149,7 +4190,7 @@ ser gerados por essa floresta perdida.
                                 "foi atingido. O que fica de fora é o desmatamento MAIS "
                                 "ANTIGO (o recente é baixado primeiro), então focos em "
                                 "áreas desmatadas há muito tempo podem aparecer como 'não "
-                                "virou desmatamento'. Prefira 'Por Município' para "
+                                "virou desmatamento'. Escolha um município menor para "
                                 "cobertura completa. (O limite existe de propósito: sem "
                                 "ele, a memória do app estoura.)"
                             )
@@ -4293,10 +4334,10 @@ ser gerados por essa floresta perdida.
                         st.markdown("---")
                         st.markdown("**🗺️ Mapa: desmatamento acumulado x focos de calor**")
 
-                        centro_prodes = limite.geometry.union_all().centroid
+                        centro_prodes = _limite_p.geometry.union_all().centroid
                         m_prodes = folium.Map(
                             location=[centro_prodes.y, centro_prodes.x],
-                            zoom_start=10 if tipo_analise == "Por Município" else 7,
+                            zoom_start=10 if _tipo_p == "Por Município" else 7,
                             tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
                             attr="Esri", prefer_canvas=True,
                         )
@@ -4306,8 +4347,8 @@ ser gerados por essa floresta perdida.
                         ).add_to(m_prodes)
 
                         folium.GeoJson(
-                            limite.__geo_interface__,
-                            name=f"Limite — {val_sel}",
+                            _limite_p.__geo_interface__,
+                            name=f"Limite — {_val_p}",
                             style_function=lambda x: {
                                 'fillColor': '#e67e22', 'fillOpacity': 0.02,
                                 'color': '#e67e22', 'weight': 2.5, 'dashArray': '6 3',
@@ -4365,7 +4406,7 @@ ser gerados por essa floresta perdida.
                         </div>"""
                         m_prodes.get_root().html.add_child(folium.Element(legenda_prodes))
                         folium.LayerControl(collapsed=False).add_to(m_prodes)
-                        _prodes_map_key = f"mapa_prodes_{val_sel}_{bioma_alvo_prodes}_{n_total_focos}"
+                        _prodes_map_key = f"mapa_prodes_{_val_p}_{bioma_alvo_prodes}_{n_total_focos}"
                         st_folium(m_prodes, width=None, height=650, returned_objects=[], key=_prodes_map_key)
 
                         csv_prodes = gdf_join_prodes.drop(columns="geometry").drop(
@@ -4374,7 +4415,7 @@ ser gerados por essa floresta perdida.
                         st.download_button(
                             "📄 Baixar CSV — Focos x Desmatamento (com categoria e anos)",
                             data=csv_prodes,
-                            file_name=f"prodes_focos_{val_sel}_{hoje.strftime('%Y%m%d')}.csv",
+                            file_name=f"prodes_focos_{_val_p}_{hoje.strftime('%Y%m%d')}.csv",
                             mime="text/csv",
                         )
 
@@ -4409,7 +4450,7 @@ ser gerados por essa floresta perdida.
 
                     st.markdown("")
                     if st.button(
-                        "🔄 Nova Busca no PRODES", key=f"btn_prodes_reset_{val_sel}_{bioma_alvo_prodes}"
+                        "🔄 Nova Busca no PRODES", key=f"btn_prodes_reset_{_val_p}_{bioma_alvo_prodes}"
                     ):
                         st.session_state[_prodes_key] = None
                         st.rerun()
