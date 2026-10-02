@@ -740,30 +740,6 @@ def _carregar_todos_municipios_brasil():
     return read_municipality(code_muni="all", year=2020)
 
 
-@st.cache_data(ttl=2592000, show_spinner=False, persist="disk")
-def listar_municipios_do_bioma(bioma):
-    """
-    Lista (UF, nome) de todos os municípios que tocam o bioma, ordenada.
-    Usada na aba PRODES: em vez de baixar o desmatamento do bioma inteiro
-    (milhões de polígonos), o usuário escolhe um município do bioma.
-    """
-    # Estado a estado (e só os estados que tocam o bioma): carregar os ~5.570
-    # municípios do Brasil de uma vez usa memória demais no Streamlit Cloud.
-    import gc
-    gdf_bioma = read_biomes(year=2019)
-    gdf_bioma = gdf_bioma[gdf_bioma['name_biome'] == bioma][['geometry']].to_crs("EPSG:4674")
-    estados = read_state(code_state="all", year=2020).to_crs("EPSG:4674")
-    ufs = gpd.sjoin(estados, gdf_bioma, predicate='intersects', how='inner')['abbrev_state'].unique()
-    resultado = []
-    for uf in ufs:
-        gdf_uf = read_municipality(code_muni=uf, year=2020).to_crs("EPSG:4674")
-        gdf_uf = gpd.sjoin(gdf_uf, gdf_bioma, predicate='intersects', how='inner')
-        resultado += list(zip(gdf_uf['abbrev_state'], gdf_uf['name_muni']))
-        del gdf_uf
-        gc.collect()
-    return sorted(set(resultado))
-
-
 @st.cache_data(ttl=604800, show_spinner=False, persist="disk")
 def obter_municipios_regiao(tipo_analise, estado_dd, bioma_dd, municipio_dd, max_municipios=50, seed=42):
     """
@@ -4081,32 +4057,38 @@ ser gerados por essa floresta perdida.
                 "um estado inteiro deixam a busca lenta."
             )
 
-            # Região desta aba: bioma e município escolhidos AQUI (independe da barra
-            # lateral). Consultar o desmatamento do bioma inteiro estoura a memória,
-            # então a análise é sempre de um município. Os valores iniciais vêm da
-            # barra lateral quando possível.
-            _bioma_ini = bioma_dd if tipo_analise == "Por Bioma" else ESTADO_BIOMA_PRODES.get(estado_dd)
-            _opcoes_bioma = list(PRODES_LAYERS.keys())
-            bioma_alvo_prodes = st.selectbox(
-                "Bioma:", _opcoes_bioma,
-                index=_opcoes_bioma.index(_bioma_ini) if _bioma_ini in _opcoes_bioma else 0,
-                key="bioma_prodes",
+            # Região desta aba: Estado e município escolhidos AQUI (independe da barra
+            # lateral). Consultar o desmatamento de uma região grande estoura a
+            # memória, então a análise é sempre de um município. O bioma (camada do
+            # PRODES) é sugerido pelo estado e pode ser trocado.
+            _ufs_p = ["AC","AL","AM","AP","BA","CE","DF","ES","GO","MA","MG","MS","MT",
+                      "PA","PB","PE","PI","PR","RJ","RN","RO","RR","RS","SC","SE","SP","TO"]
+            _col_a, _col_b, _col_c = st.columns([1, 3, 2])
+            _uf_p = _col_a.selectbox(
+                "Estado:", _ufs_p, index=_ufs_p.index(estado_dd) if estado_dd in _ufs_p else 0,
+                key="uf_prodes",
             )
-            _lista_muni = listar_municipios_do_bioma(bioma_alvo_prodes)
-            _rotulos = [f"{nome} ({uf})" for uf, nome in _lista_muni]
-            _rot_ini = f"{municipio_dd} ({estado_dd})" if tipo_analise == "Por Município" else None
-            _opcoes_muni = ["— escolha um município —"] + _rotulos
-            _sel_muni = st.selectbox(
-                f"Município do bioma {bioma_alvo_prodes}:", _opcoes_muni,
-                index=_opcoes_muni.index(_rot_ini) if _rot_ini in _opcoes_muni else 0,
-                key=f"muni_prodes_{bioma_alvo_prodes}",
-                help=f"{len(_rotulos)} municípios tocam este bioma. O PRODES é consultado "
-                     "só para o município escolhido: cobertura completa e sem derrubar o app."
+            _cidades_p = ["— escolha um município —"] + list(buscar_cidades(_uf_p))
+            _muni_ini_p = municipio_dd if (tipo_analise == "Por Município" and _uf_p == estado_dd) else None
+            _sel_muni = _col_b.selectbox(
+                "Município:", _cidades_p,
+                index=_cidades_p.index(_muni_ini_p) if _muni_ini_p in _cidades_p else 0,
+                key=f"muni_prodes_{_uf_p}",
+                help="O PRODES é consultado só para o município escolhido: cobertura "
+                     "completa e sem derrubar o app.",
+            )
+            _opcoes_bioma = list(PRODES_LAYERS.keys())
+            _bioma_ini = ESTADO_BIOMA_PRODES.get(_uf_p)
+            bioma_alvo_prodes = _col_c.selectbox(
+                "Bioma (camada PRODES):", _opcoes_bioma,
+                index=_opcoes_bioma.index(_bioma_ini) if _bioma_ini in _opcoes_bioma else 0,
+                key=f"bioma_prodes_{_uf_p}",
+                help="Sugerido pelo estado. Troque se o município estiver em outro bioma "
+                     "(ex.: norte de MT é Amazônia, oeste de MT é Pantanal).",
             )
             _escolha_ok = not _sel_muni.startswith("—")
             if _escolha_ok:
-                _uf_p, _muni_p = _lista_muni[_rotulos.index(_sel_muni)]
-                _tipo_p, _bioma_p = "Por Município", bioma_alvo_prodes
+                _muni_p, _tipo_p, _bioma_p = _sel_muni, "Por Município", bioma_alvo_prodes
                 _limite_p = carregar_fronteira("Por Município", _uf_p, None, _muni_p)
                 _val_p = f"{_muni_p} ({_uf_p})"
             else:
