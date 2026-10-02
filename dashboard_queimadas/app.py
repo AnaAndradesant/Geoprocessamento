@@ -4059,33 +4059,36 @@ ser gerados por essa floresta perdida.
                 "um estado inteiro deixam a busca lenta."
             )
 
-            # Região EFETIVA desta aba. Em "Por Bioma" o usuário escolhe um município
-            # do bioma aqui dentro (baixar o desmatamento do bioma inteiro estoura a
-            # memória); nos demais casos usa a região da barra lateral.
-            _tipo_p, _uf_p, _bioma_p, _muni_p = tipo_analise, estado_dd, bioma_dd, municipio_dd
-            _limite_p, _val_p = limite, val_sel
-            _escolha_ok = True
-            if tipo_analise == "Por Bioma":
-                bioma_alvo_prodes = bioma_dd
-                _lista_muni = listar_municipios_do_bioma(bioma_dd)
-                _rotulos = [f"{nome} ({uf})" for uf, nome in _lista_muni]
-                _sel_muni = st.selectbox(
-                    f"Município do bioma {bioma_dd}:", ["— escolha um município —"] + _rotulos,
-                    key=f"muni_prodes_{bioma_dd}",
-                    help=f"{len(_rotulos)} municípios tocam este bioma. O PRODES é "
-                         "consultado só para o município escolhido, o que dá cobertura "
-                         "completa e não derruba o app."
-                )
-                if _sel_muni.startswith("—"):
-                    _escolha_ok = False
-                    st.info("👆 Escolha um município do bioma para analisar o desmatamento e os focos.")
-                else:
-                    _uf_p, _muni_p = _lista_muni[_rotulos.index(_sel_muni)][0], _lista_muni[_rotulos.index(_sel_muni)][1]
-                    _tipo_p = "Por Município"
-                    _limite_p = carregar_fronteira("Por Município", _uf_p, None, _muni_p)
-                    _val_p = f"{_muni_p} ({_uf_p})"
+            # Região desta aba: bioma e município escolhidos AQUI (independe da barra
+            # lateral). Consultar o desmatamento do bioma inteiro estoura a memória,
+            # então a análise é sempre de um município. Os valores iniciais vêm da
+            # barra lateral quando possível.
+            _bioma_ini = bioma_dd if tipo_analise == "Por Bioma" else ESTADO_BIOMA_PRODES.get(estado_dd)
+            _opcoes_bioma = list(PRODES_LAYERS.keys())
+            bioma_alvo_prodes = st.selectbox(
+                "Bioma:", _opcoes_bioma,
+                index=_opcoes_bioma.index(_bioma_ini) if _bioma_ini in _opcoes_bioma else 0,
+                key="bioma_prodes",
+            )
+            _lista_muni = listar_municipios_do_bioma(bioma_alvo_prodes)
+            _rotulos = [f"{nome} ({uf})" for uf, nome in _lista_muni]
+            _rot_ini = f"{municipio_dd} ({estado_dd})" if tipo_analise == "Por Município" else None
+            _opcoes_muni = ["— escolha um município —"] + _rotulos
+            _sel_muni = st.selectbox(
+                f"Município do bioma {bioma_alvo_prodes}:", _opcoes_muni,
+                index=_opcoes_muni.index(_rot_ini) if _rot_ini in _opcoes_muni else 0,
+                key=f"muni_prodes_{bioma_alvo_prodes}",
+                help=f"{len(_rotulos)} municípios tocam este bioma. O PRODES é consultado "
+                     "só para o município escolhido: cobertura completa e sem derrubar o app."
+            )
+            _escolha_ok = not _sel_muni.startswith("—")
+            if _escolha_ok:
+                _uf_p, _muni_p = _lista_muni[_rotulos.index(_sel_muni)]
+                _tipo_p, _bioma_p = "Por Município", bioma_alvo_prodes
+                _limite_p = carregar_fronteira("Por Município", _uf_p, None, _muni_p)
+                _val_p = f"{_muni_p} ({_uf_p})"
             else:
-                bioma_alvo_prodes = ESTADO_BIOMA_PRODES.get(estado_dd)
+                st.info("👆 Escolha um município para analisar o desmatamento e os focos.")
 
             if not _escolha_ok:
                 pass
