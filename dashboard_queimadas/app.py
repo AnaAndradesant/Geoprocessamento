@@ -2013,7 +2013,7 @@ def _prodes_ano_por_ponto(conteudo_zip, xs, ys, ano_fixo=None):
 
 
 @st.cache_data(show_spinner=False, max_entries=6)
-def classificar_pontos_prodes(biomas, xs, ys, tam_lote=500, n_paralelo=3):
+def classificar_pontos_prodes(biomas, xs, ys, tam_lote=400, n_paralelo=2):
     """
     Para cada ponto (foco), o ano PRODES do desmatamento naquele lugar: o ano da
     camada anual, ou o ano-base do bioma se o ponto está na camada-base (já
@@ -2060,6 +2060,17 @@ def classificar_pontos_prodes(biomas, xs, ys, tam_lote=500, n_paralelo=3):
                 anos[idx] = np.fmin(anos[idx], _prodes_ano_por_ponto(conteudo, xs[idx], ys[idx], ano_fixo))
                 del conteudo
     return anos, falhas, len(tarefas)
+
+
+def _log_mem(etapa):
+    """Escreve no log do Streamlit Cloud a memória em uso (o app cai sem
+    traceback quando passa de 1 GB; isso mostra em qual etapa a memória subiu)."""
+    try:
+        with open("/proc/self/status") as f:
+            rss = next(l for l in f if l.startswith("VmRSS")).split()[1]
+        print(f"[MEM] {etapa}: {int(rss) // 1024} MB", flush=True)
+    except Exception:
+        pass
 
 
 SATELITES_PERIODO = ("AQUA_M-T", "NPP-375", "NPP-375D")
@@ -2619,6 +2630,7 @@ if st.session_state.gerar_dashboard:
         # ----------------------------------------------------------
         # ABA 1 — MAPA
         # ----------------------------------------------------------
+        _log_mem(f"Dashboard {val_sel}: dados principais carregados")
         with aba_mapa:
             col_controles1, col_controles2 = st.columns([1, 1.2])
             with col_controles1:
@@ -3762,6 +3774,7 @@ ser gerados por essa floresta perdida.
                                 gdf_car_bruto = _res_car["imoveis"]
                             else:
                                 gdf_car_bruto = buscar_car_imoveis(_uf_c, tuple(_limite_c.total_bounds))
+                            _log_mem("CAR: antes dos focos")
                             focos_car = focos_do_periodo(
                                 _tipo_c, _uf_c, None, _muni_c, anos_car, _limite_c
                             )
@@ -4079,11 +4092,13 @@ ser gerados por essa floresta perdida.
                                         _limite_p = gpd.GeoDataFrame(geometry=[_recorte], crs="EPSG:4326")
                                 except Exception:
                                     pass
+                            _log_mem(f"PRODES {_uf_p}: antes dos focos")
                             focos_prodes = focos_do_periodo(
                                 "Por Estado", _uf_p, None, None, anos_prodes, _limite_p
                             )
                             _chaves = focos_prodes[["longitude", "latitude"]].astype(float).round(4)
                             _unicos = _chaves.drop_duplicates().reset_index(drop=True)
+                            _log_mem(f"PRODES {_uf_p}: {len(focos_prodes)} focos / {len(_unicos)} pontos unicos")
                             _anos_u, _falhas_p, _total_p = classificar_pontos_prodes(
                                 _biomas_p, _unicos["longitude"].to_numpy(), _unicos["latitude"].to_numpy()
                             )
@@ -4094,6 +4109,7 @@ ser gerados por essa floresta perdida.
                                 _unicos.rename(columns={"longitude": "_lon_r", "latitude": "_lat_r"}),
                                 on=["_lon_r", "_lat_r"], how="left",
                             ).drop(columns=["_lon_r", "_lat_r"])
+                            _log_mem(f"PRODES {_uf_p}: depois da consulta ao PRODES")
                             st.session_state[_prodes_key] = {
                                 "focos": focos_prodes, "anos": anos_prodes, "limite": _limite_p,
                                 "falhas": _falhas_p, "total": _total_p,
@@ -4253,6 +4269,7 @@ ser gerados por essa floresta perdida.
                         st.markdown("**🗺️ Mapa: desmatamento acumulado x focos de calor**")
 
                         centro_prodes = _limite_p.geometry.union_all().centroid
+                        _log_mem(f"PRODES {_uf_p}: classificado, antes do mapa")
                         m_prodes = folium.Map(
                             location=[centro_prodes.y, centro_prodes.x],
                             zoom_start=6,
@@ -4525,6 +4542,7 @@ ser gerados por essa floresta perdida.
         # ----------------------------------------------------------
         # ABA 6 — RISCO PREDITIVO (MACHINE LEARNING)
         # ----------------------------------------------------------
+        _log_mem("Abas renderizadas (antes do Risco)")
         with aba_risco:
             st.subheader("🎯 Risco Preditivo de Queimada — Mapa por Município")
 
