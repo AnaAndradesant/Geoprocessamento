@@ -3776,25 +3776,39 @@ ser gerados por essa floresta perdida.
                 "município e área."
             )
 
-            if tipo_analise == "Por Bioma":
-                st.info(
-                    "ℹ️ Não disponível para análise 'Por Bioma': um bioma cruza várias "
-                    "UFs, e a base do CAR é organizada por estado. Selecione "
-                    "'Por Estado' ou 'Por Município' na barra lateral para usar esta aba."
-                )
+            # Região desta aba: UF e município escolhidos AQUI (independe da barra
+            # lateral). O CAR é organizado por estado, e consultar um estado inteiro
+            # é lento e passa do limite de imóveis, então a análise é de um município.
+            _ufs = ["AC","AL","AM","AP","BA","CE","DF","ES","GO","MA","MG","MS","MT",
+                    "PA","PB","PE","PI","PR","RJ","RN","RO","RR","RS","SC","SE","SP","TO"]
+            _col_uf, _col_mun = st.columns([1, 3])
+            estado_car = _col_uf.selectbox(
+                "Estado:", _ufs, index=_ufs.index(estado_dd) if estado_dd in _ufs else 0,
+                key="uf_car",
+            )
+            _cidades_car = ["— escolha um município —"] + list(buscar_cidades(estado_car))
+            _muni_ini = municipio_dd if (tipo_analise == "Por Município" and estado_car == estado_dd) else None
+            _sel_car = _col_mun.selectbox(
+                "Município:", _cidades_car,
+                index=_cidades_car.index(_muni_ini) if _muni_ini in _cidades_car else 0,
+                key=f"muni_car_{estado_car}",
+                help="O CAR é consultado só para o município escolhido.",
+            )
+            _car_ok = not _sel_car.startswith("—")
+            if _car_ok:
+                _tipo_c, _uf_c, _muni_c = "Por Município", estado_car, _sel_car
+                _limite_c = carregar_fronteira("Por Município", _uf_c, None, _muni_c)
+                _val_c = f"{_muni_c} ({_uf_c})"
+            if not _car_ok:
+                st.info("👆 Escolha um estado e um município para buscar os imóveis do CAR e os focos.")
             else:
                 anos_car = st.select_slider(
                     "Período dos focos de calor:", options=[1, 2, 3, 4, 5], value=1,
                     format_func=lambda x: f"últimos {x} ano(s)", key="anos_car",
                     help="Escolhido aqui na aba, independente da barra lateral."
                 )
-                if tipo_analise != "Por Município" and anos_car >= 3:
-                    st.warning(
-                        "⏱️ Região grande com vários anos de focos: a busca pode levar "
-                        "alguns minutos. Para um primeiro teste, escolha 'Por Município'."
-                    )
 
-                _car_key = f"car_res2_{val_sel}_{estado_dd}"
+                _car_key = f"car_res2_{_val_c}_{_uf_c}"
                 if _car_key not in st.session_state:
                     st.session_state[_car_key] = None
                 _res_car = st.session_state[_car_key]
@@ -3811,15 +3825,15 @@ ser gerados por essa floresta perdida.
                         "🔄 Atualizar com este período" if car_periodo_mudou
                         else "🔎 Buscar Imóveis do CAR e Focos",
                         type="primary", use_container_width=True,
-                        key=f"btn_car_{val_sel}_{estado_dd}"
+                        key=f"btn_car_{_val_c}_{_uf_c}"
                     ):
                         with st.spinner("🏡 Consultando o SICAR e os focos do INPE..."):
                             if car_ja_buscou:
                                 gdf_car_bruto = _res_car["imoveis"]
                             else:
-                                gdf_car_bruto = buscar_car_imoveis(estado_dd, tuple(limite.total_bounds))
+                                gdf_car_bruto = buscar_car_imoveis(_uf_c, tuple(_limite_c.total_bounds))
                             focos_car = focos_do_periodo(
-                                tipo_analise, estado_dd, bioma_dd, municipio_dd, anos_car, limite
+                                _tipo_c, _uf_c, None, _muni_c, anos_car, _limite_c
                             )
                             st.session_state[_car_key] = {
                                 "imoveis": gdf_car_bruto, "focos": focos_car, "anos": anos_car,
@@ -3853,7 +3867,7 @@ ser gerados por essa floresta perdida.
                             st.warning(
                                 "⚠️ Atingiu o limite de 5.000 imóveis retornados — pode "
                                 "haver mais imóveis na região que não foram carregados. "
-                                "Prefira 'Por Município' para uma busca mais completa."
+                                "Escolha um município menor para uma busca mais completa."
                             )
 
                         # Renomeia ANTES do cruzamento espacial — os focos já têm uma
@@ -3930,7 +3944,7 @@ ser gerados por essa floresta perdida.
                             st.download_button(
                                 "📄 Baixar CSV — Imóveis do CAR com Foco",
                                 data=csv_car,
-                                file_name=f"car_focos_{val_sel}_{hoje.strftime('%Y%m%d')}.csv",
+                                file_name=f"car_focos_{_val_c}_{hoje.strftime('%Y%m%d')}.csv",
                                 mime="text/csv",
                             )
 
@@ -3944,10 +3958,10 @@ ser gerados por essa floresta perdida.
                             )
                             gdf_render_car["n_focos"] = gdf_render_car["n_focos"].fillna(0)
 
-                            centro_car = limite.geometry.union_all().centroid
+                            centro_car = _limite_c.geometry.union_all().centroid
                             m_car = folium.Map(
                                 location=[centro_car.y, centro_car.x],
-                                zoom_start=10 if tipo_analise == "Por Município" else 7,
+                                zoom_start=10,
                                 tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
                                 attr="Esri", prefer_canvas=True,
                             )
@@ -3957,8 +3971,8 @@ ser gerados por essa floresta perdida.
                             ).add_to(m_car)
 
                             folium.GeoJson(
-                                limite.__geo_interface__,
-                                name=f"Limite — {val_sel}",
+                                _limite_c.__geo_interface__,
+                                name=f"Limite — {_val_c}",
                                 style_function=lambda x: {
                                     'fillColor': '#e67e22', 'fillOpacity': 0.02,
                                     'color': '#e67e22', 'weight': 2.5, 'dashArray': '6 3',
@@ -4031,12 +4045,12 @@ ser gerados por essa floresta perdida.
                             )
 
                             folium.LayerControl(collapsed=False).add_to(m_car)
-                            _car_map_key = f"mapa_car_{val_sel}_{estado_dd}_{len(gdf_cruzamento)}"
+                            _car_map_key = f"mapa_car_{_val_c}_{_uf_c}_{len(gdf_cruzamento)}"
                             st_folium(m_car, width=None, height=650, returned_objects=[], key=_car_map_key)
 
                     st.markdown("")
                     if st.button(
-                        "🔄 Nova Busca no CAR", key=f"btn_car_reset_{val_sel}_{estado_dd}"
+                        "🔄 Nova Busca no CAR", key=f"btn_car_reset_{_val_c}_{_uf_c}"
                     ):
                         st.session_state[_car_key] = None
                         st.rerun()
