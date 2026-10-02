@@ -2062,9 +2062,26 @@ def classificar_pontos_prodes(biomas, xs, ys, tam_lote=400, n_paralelo=2):
     return anos, falhas, len(tarefas)
 
 
+def _liberar_memoria():
+    """
+    Coleta o lixo e devolve ao sistema a memória que o Python já liberou. Sem o
+    malloc_trim, o glibc (Linux do Streamlit Cloud) guarda essa memória para si:
+    medido no log, a análise do bioma Amazônia subia 1,3 → 2,2 → 2,8 GB a cada
+    reexecução da página até o app cair, mesmo sem dados novos.
+    """
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass  # Windows/macOS: não existe, e não precisa
+
+
 def _log_mem(etapa):
     """Escreve no log do Streamlit Cloud a memória em uso (o app cai sem
     traceback quando passa de 1 GB; isso mostra em qual etapa a memória subiu)."""
+    _liberar_memoria()
     try:
         with open("/proc/self/status") as f:
             rss = next(l for l in f if l.startswith("VmRSS")).split()[1]
@@ -2274,6 +2291,7 @@ st.title("🔥 Dashboard de Queimadas 🔥")
 total_valor = 0
 dados_indisponiveis = False
 
+_liberar_memoria()
 if st.session_state.gerar_dashboard:
     # Usa os filtros CONGELADOS no momento do último clique em "Gerar Dashboard" —
     # não os valores atuais dos widgets (que podem ter mudado nesse meio tempo).
@@ -2303,6 +2321,12 @@ if st.session_state.gerar_dashboard:
         st.write("🌍 Carregando fronteiras geográficas...")
         limite = carregar_fronteira(tipo_analise, estado_dd, bioma_dd, municipio_dd)
         geom_unida = limite.geometry.union_all()
+        # Só para desenhar no mapa: o contorno de um bioma/estado tem centenas de
+        # milhares de vértices, e o folium o reescreve inteiro no HTML a cada
+        # interação. ~2 km de tolerância é invisível no zoom de um bioma/estado.
+        limite_mapa = limite if tipo_analise == "Por Município" else limite.assign(
+            geometry=limite.geometry.simplify(0.02, preserve_topology=True)
+        )
         ee_geom_complex = ee.Geometry(geom_unida.__geo_interface__)
         geom_json_str = json.dumps(geom_unida.__geo_interface__, sort_keys=True)
 
@@ -2702,7 +2726,7 @@ if st.session_state.gerar_dashboard:
             # Borda da região selecionada — laranja, no estilo dos painéis do
             # TerraBrasilis/INPE, mais legível sobre o mapa base claro
             folium.GeoJson(
-                limite.__geo_interface__,
+                limite_mapa.__geo_interface__,
                 name="Região selecionada",
                 style_function=lambda x: {
                     'fillColor': '#e67e22',
@@ -3327,7 +3351,7 @@ if st.session_state.gerar_dashboard:
                             )
                             
                             folium.GeoJson(
-                                limite.__geo_interface__,
+                                limite_mapa.__geo_interface__,
                                 style_function=lambda x: {
                                     'fillColor': 'transparent',
                                     'color': '#e67e22', 'weight': 2
@@ -5096,7 +5120,7 @@ ser gerados por essa floresta perdida.
                             # --- Limites de referência (para o usuário se localizar) ---
                             # Contorno da região selecionada (bioma/estado/município) — igual ao mapa principal
                             folium.GeoJson(
-                                limite.__geo_interface__,
+                                limite_mapa.__geo_interface__,
                                 name=f"Limite — {val_sel}",
                                 style_function=lambda x: {
                                     'fillColor': '#e67e22', 'fillOpacity': 0.02,
