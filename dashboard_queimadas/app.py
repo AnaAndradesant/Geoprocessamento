@@ -747,13 +747,21 @@ def listar_municipios_do_bioma(bioma):
     Usada na aba PRODES: em vez de baixar o desmatamento do bioma inteiro
     (milhões de polígonos), o usuário escolhe um município do bioma.
     """
+    # Estado a estado (e só os estados que tocam o bioma): carregar os ~5.570
+    # municípios do Brasil de uma vez usa memória demais no Streamlit Cloud.
+    import gc
     gdf_bioma = read_biomes(year=2019)
-    gdf_bioma = gdf_bioma[gdf_bioma['name_biome'] == bioma]
-    gdf_todos = _carregar_todos_municipios_brasil()
-    gdf_bioma = gdf_bioma.to_crs(gdf_todos.crs)
-    gdf = gpd.sjoin(gdf_todos, gdf_bioma[['geometry']], predicate='intersects', how='inner')
-    gdf = gdf.drop_duplicates(subset=['code_muni'])
-    return sorted(zip(gdf['abbrev_state'], gdf['name_muni']))
+    gdf_bioma = gdf_bioma[gdf_bioma['name_biome'] == bioma][['geometry']].to_crs("EPSG:4674")
+    estados = read_state(code_state="all", year=2020).to_crs("EPSG:4674")
+    ufs = gpd.sjoin(estados, gdf_bioma, predicate='intersects', how='inner')['abbrev_state'].unique()
+    resultado = []
+    for uf in ufs:
+        gdf_uf = read_municipality(code_muni=uf, year=2020).to_crs("EPSG:4674")
+        gdf_uf = gpd.sjoin(gdf_uf, gdf_bioma, predicate='intersects', how='inner')
+        resultado += list(zip(gdf_uf['abbrev_state'], gdf_uf['name_muni']))
+        del gdf_uf
+        gc.collect()
+    return sorted(set(resultado))
 
 
 @st.cache_data(ttl=604800, show_spinner=False, persist="disk")
