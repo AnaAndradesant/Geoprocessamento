@@ -1937,183 +1937,129 @@ PRODES_LAYERS = {
 }
 PRODES_OWS_URL = "https://terrabrasilis.dpi.inpe.br/geoserver/ows"
 
-# Simplificação: um estado pode cruzar mais de um bioma, mas pra decidir qual
-# camada do PRODES consultar usamos o bioma PREDOMINANTE de cada UF — mesma
-# simplificação já usada na aba de Impacto Econômico, documentada como tal.
-ESTADO_BIOMA_PRODES = {
-    "AM": "Amazônia", "PA": "Amazônia", "AC": "Amazônia",
-    "RO": "Amazônia", "RR": "Amazônia", "AP": "Amazônia",
-    "MT": "Cerrado",  "GO": "Cerrado",  "TO": "Cerrado",
-    "MA": "Cerrado",  "PI": "Caatinga", "BA": "Caatinga",
-    "CE": "Caatinga", "RN": "Caatinga", "PB": "Caatinga",
-    "PE": "Caatinga", "AL": "Caatinga", "SE": "Caatinga",
-    "MS": "Pantanal", "PR": "Mata Atlântica",
-    "SC": "Mata Atlântica", "RS": "Pampa",
-    "SP": "Mata Atlântica", "RJ": "Mata Atlântica",
-    "ES": "Mata Atlântica", "MG": "Mata Atlântica",
-    "DF": "Cerrado",
+# Biomas (com camada PRODES) presentes em cada UF. Usado para (1) listar os
+# estados de um bioma na aba PRODES e (2) consultar todas as camadas de um
+# estado que cruza mais de um bioma — um ponto fora do bioma simplesmente não
+# encontra polígono naquela camada, então consultar a mais não distorce nada.
+ESTADO_BIOMAS_PRODES = {
+    "AC": ("Amazônia",), "AM": ("Amazônia",), "AP": ("Amazônia",),
+    "RR": ("Amazônia",), "PA": ("Amazônia",),
+    "RO": ("Amazônia", "Cerrado"), "TO": ("Cerrado", "Amazônia"),
+    "MT": ("Amazônia", "Cerrado", "Pantanal"),
+    "MA": ("Amazônia", "Cerrado", "Caatinga"),
+    "MS": ("Cerrado", "Pantanal", "Mata Atlântica"),
+    "GO": ("Cerrado", "Mata Atlântica"), "DF": ("Cerrado",),
+    "PI": ("Caatinga", "Cerrado"), "CE": ("Caatinga",),
+    "BA": ("Caatinga", "Cerrado", "Mata Atlântica"),
+    "RN": ("Caatinga", "Mata Atlântica"), "PB": ("Caatinga", "Mata Atlântica"),
+    "PE": ("Caatinga", "Mata Atlântica"), "AL": ("Caatinga", "Mata Atlântica"),
+    "SE": ("Caatinga", "Mata Atlântica"),
+    "MG": ("Cerrado", "Mata Atlântica", "Caatinga"),
+    "SP": ("Mata Atlântica", "Cerrado"), "PR": ("Mata Atlântica", "Cerrado"),
+    "RJ": ("Mata Atlântica",), "ES": ("Mata Atlântica",), "SC": ("Mata Atlântica",),
+    "RS": ("Pampa", "Mata Atlântica"),
 }
 
 
-def _gdf_prodes_vazio():
-    return gpd.GeoDataFrame({"year": []}, geometry=[], crs="EPSG:4326")
-
-
-def _simplificar_aneis(geoms, tol=0.0002):
+def _prodes_baixar_lote(sessao, camada, xs, ys):
     """
-    Simplifica cada ANEL (contorno e buracos) separadamente, como linha. ~22 m,
-    abaixo da resolução do Landsat (30 m) do PRODES.
-
-    Medido na página mais pesada da camada-base (um único polígono com 1 milhão
-    de vértices e 5 mil buracos): GeoSeries.simplify levava 38–52 s e +300 MB de
-    pico (com ou sem preserve_topology); anel a anel leva 0,3 s, com a mesma
-    redução de vértices. O custo é poder gerar polígonos inválidos: os pequenos
-    são corrigidos com make_valid; os enormes ficam como estão (o teste de ponto
-    dentro de polígono funciona mesmo assim, e make_valid neles custa ~10 s).
-    Polígonos menores que a tolerância colapsariam: ficam com a forma original.
+    Só rede (roda em thread). Pede ao INPE apenas os polígonos da camada que
+    contêm ALGUM dos pontos do lote (filtro INTERSECTS com um MULTIPOINT, via
+    POST porque a lista de pontos é longa). Devolve os bytes do shapefile zipado.
     """
-    saida = np.empty(len(geoms), dtype=object)
-    for i, geom in enumerate(geoms):
-        pols = []
-        for parte in shapely.get_parts(geom):
-            if parte.geom_type != "Polygon":
-                continue
-            casca = shapely.get_coordinates(
-                shapely.simplify(shapely.get_exterior_ring(parte), tol, preserve_topology=False))
-            if len(casca) < 4:
-                continue
-            buracos = []
-            for k in range(shapely.get_num_interior_rings(parte)):
-                b = shapely.get_coordinates(
-                    shapely.simplify(shapely.get_interior_ring(parte, k), tol, preserve_topology=False))
-                if len(b) >= 4:
-                    buracos.append(b)
-            pols.append(shapely.Polygon(casca, buracos))
-        if not pols:
-            saida[i] = geom
-        else:
-            saida[i] = pols[0] if len(pols) == 1 else shapely.MultiPolygon(pols)
-    for i in np.where(~shapely.is_valid(saida))[0]:
-        if shapely.get_num_coordinates(saida[i]) <= 20000:
-            saida[i] = shapely.make_valid(saida[i])
-    return saida
-
-
-def _prodes_pedir_pagina(sessao, url, params_base, inicio, pedido):
-    """Só rede (roda em thread): devolve os bytes do zip da página."""
-    r = sessao.get(
-        url, params={**params_base, "maxFeatures": pedido, "startIndex": inicio},
-        timeout=90, verify=False,
-    )
-    r.raise_for_status()
-    if "zip" not in r.headers.get("content-type", ""):
-        raise RuntimeError("Resposta inesperada do PRODES: " + r.text[:200])
-    return r.content
-
-
-def _prodes_processar_pagina(conteudo_zip):
-    try:
-        parte = gpd.read_file(io.BytesIO(conteudo_zip))
-    except Exception:
-        return None, 0
-    n = len(parte)
-    if n == 0:
-        return None, 0
-    # SIRGAS 2000 -> WGS84: diferença < 1 m, a transformação é praticamente nula.
-    parte = parte.to_crs("EPSG:4326")
-    anos = parte["year"].to_numpy() if "year" in parte.columns else np.full(n, np.nan)
-    geoms = _simplificar_aneis(parte.geometry.values)
-    return gpd.GeoDataFrame({"year": anos}, geometry=geoms, crs="EPSG:4326"), n
-
-
-# cache_resource (e não cache_data): o cache_data devolve uma CÓPIA (pickle) a cada
-# chamada, o que dobraria a memória de um GeoDataFrame grande. ttl curto (6h)
-# porque um resultado parcial/vazio por instabilidade do serviço não pode ficar
-# preso por dias; falha na 1ª página levanta exceção, e exceção não é cacheada.
-@st.cache_resource(ttl=21600, max_entries=3, show_spinner=False)
-def _prodes_camada(type_name, bbox_wgs84, max_features, orcamento_s, ordem):
-    minx, miny, maxx, maxy = bbox_wgs84
-    params_base = {
+    mp = "MULTIPOINT(" + ",".join(f"({x:.5f} {y:.5f})" for x, y in zip(xs, ys)) + ")"
+    dados = {
         "service": "WFS", "version": "1.0.0", "request": "GetFeature",
-        "typeName": type_name, "outputFormat": "SHAPE-ZIP",
-        "bbox": f"{minx},{miny},{maxx},{maxy},EPSG:4326",
-        "propertyName": "year,geom", "sortBy": ordem,
+        "typeName": camada, "outputFormat": "SHAPE-ZIP", "propertyName": "year,geom",
+        "CQL_FILTER": f"INTERSECTS(geom, {mp})",
     }
-    # SHAPE-ZIP em vez de GeoJSON (medido): 300 polígonos da base antiga eram 25 MB
-    # de JSON, 44 s e ~400 MB de RAM (o json vira objetos Python, 24 bytes por
-    # número; 10 mil polígonos de uma vez levavam o processo a ~1,5 GB, acima do
-    # 1 GB do Streamlit Cloud). Em shapefile zipado: 6,6 MB e 2 s. A leitura e a
-    # simplificação ficam na thread principal; as threads só baixam.
-    tam_pagina, n_paralelo = 400, 2
-    partes, total, truncado, fim = [], 0, False, False
-    inicio_t = time.time()
-    sessao = requests.Session()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n_paralelo) as pool:
-        while not fim:
-            if total >= max_features or (time.time() - inicio_t) > orcamento_s:
-                truncado = True
-                break
-            lote = []
-            for k in range(n_paralelo):
-                ini = total + k * tam_pagina
-                if ini >= max_features:
-                    break
-                pedido = min(tam_pagina, max_features - ini)
-                lote.append((pool.submit(
-                    _prodes_pedir_pagina, sessao, PRODES_OWS_URL, params_base, ini, pedido), pedido))
-            for fut, pedido in lote:
-                try:
-                    parte, n = _prodes_processar_pagina(fut.result())
-                except Exception:
-                    if not partes:
-                        raise
-                    truncado, fim = True, True
-                    break
-                if parte is not None:
-                    partes.append(parte)
-                total += n
-                if n < pedido:
-                    fim = True
-    if not partes:
-        return _gdf_prodes_vazio()
-    gdf = gpd.GeoDataFrame(pd.concat(partes, ignore_index=True), crs="EPSG:4326")
-    gdf.attrs["truncado"] = truncado
-    return gdf
-
-
-def buscar_prodes_desmatamento(bioma, bbox_wgs84, max_anual=10000, max_base=3000, orcamento_s=90):
-    """
-    Polígonos do PRODES (camada anual + camada-base) pro bioma, dentro da bbox, com
-    a coluna `year`. Nunca levanta exceção: falha total devolve GeoDataFrame vazio.
-
-    A camada anual vem dos anos MAIS RECENTES para os mais antigos (sortBy year D):
-    se o teto de polígonos ou de tempo for atingido, o que fica de fora é o
-    desmatamento mais antigo, e não o recente (que é o que importa pra ver se o
-    fogo foi seguido de desmatamento). gdf.attrs["truncado"] = True nesse caso;
-    gdf.attrs["falha_parcial"] = True se uma das duas camadas não pôde ser baixada.
-    """
-    if bioma not in PRODES_LAYERS:
-        return _gdf_prodes_vazio()
-    camada_base, _ano_base, camada_anual = PRODES_LAYERS[bioma]
-    bbox = tuple(round(float(v), 5) for v in bbox_wgs84)
-    partes, truncado, falhas = [], False, 0
-    for camada, teto, ordem in ((camada_anual, max_anual, "year D,fid"), (camada_base, max_base, "fid")):
+    for tentativa in range(3):
         try:
-            g = _prodes_camada(camada, bbox, teto, orcamento_s, ordem)
+            r = sessao.post(PRODES_OWS_URL, data=dados, timeout=120, verify=False)
+            r.raise_for_status()
+            if "zip" not in r.headers.get("content-type", ""):
+                raise RuntimeError("Resposta inesperada do PRODES: " + r.text[:200])
+            return r.content
         except Exception:
-            falhas += 1
+            if tentativa == 2:
+                raise
+            time.sleep(3 * (tentativa + 1))
+
+
+def _prodes_ano_por_ponto(conteudo_zip, xs, ys, ano_fixo=None):
+    """
+    Lê os polígonos do lote, descobre em qual polígono cada ponto caiu e devolve
+    o ano do desmatamento por ponto (NaN = fora de qualquer polígono). Os
+    polígonos são descartados logo em seguida: só o ano de cada ponto fica na
+    memória. `ano_fixo` é usado na camada-base, que não tem ano por polígono.
+    """
+    anos = np.full(len(xs), np.nan)
+    try:
+        polis = gpd.read_file(io.BytesIO(conteudo_zip))
+    except Exception:
+        return anos  # lote sem nenhum polígono (o INPE devolve um zip vazio)
+    if polis.empty:
+        return anos
+    if ano_fixo is not None or "year" not in polis.columns:
+        ano_pol = np.full(len(polis), np.nan if ano_fixo is None else float(ano_fixo))
+    else:
+        ano_pol = pd.to_numeric(polis.get("year"), errors="coerce").to_numpy(dtype=float)
+    # SIRGAS 2000 x WGS84: diferença < 1 m, sem reprojetar.
+    arvore = shapely.STRtree(polis.geometry.values)
+    i_pt, i_pol = arvore.query(shapely.points(xs, ys), predicate="intersects")
+    # Um ponto em dois polígonos vizinhos fica com o desmatamento MAIS ANTIGO.
+    np.fmin.at(anos, i_pt, ano_pol[i_pol])
+    return anos
+
+
+@st.cache_data(show_spinner=False, max_entries=6)
+def classificar_pontos_prodes(biomas, xs, ys, tam_lote=500, n_paralelo=3):
+    """
+    Para cada ponto (foco), o ano PRODES do desmatamento naquele lugar: o ano da
+    camada anual, ou o ano-base do bioma se o ponto está na camada-base (já
+    desmatado antes do monitoramento anual), ou NaN se nunca foi desmatado.
+
+    Em vez de baixar TODOS os polígonos da região (milhões num estado; estourava
+    a memória e exigia um teto que deixava o desmatamento antigo de fora), pede
+    só os polígonos onde caiu algum foco. Os pontos vão em lotes espacialmente
+    agrupados, então cada lote toca poucos polígonos. Sem teto: a cobertura é
+    completa. attrs["lotes_falhos"]/["lotes_total"] contam falhas de rede.
+    """
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    anos = np.full(len(xs), np.nan)
+    if len(xs) == 0:
+        return anos, 0, 0
+    # Ordena por células de 0,25° para que pontos próximos caiam no mesmo lote.
+    ordem = np.lexsort((xs, np.floor(ys / 0.25), np.floor(xs / 0.25)))
+    lotes = [ordem[i:i + tam_lote] for i in range(0, len(ordem), tam_lote)]
+    tarefas = []
+    for bioma in biomas:
+        if bioma not in PRODES_LAYERS:
             continue
-        if not g.empty:
-            partes.append(g)
-            truncado = truncado or bool(g.attrs.get("truncado"))
-    if not partes:
-        vazio = _gdf_prodes_vazio()
-        vazio.attrs["falha_parcial"] = falhas > 0
-        return vazio
-    gdf = gpd.GeoDataFrame(pd.concat(partes, ignore_index=True), crs="EPSG:4326")
-    gdf.attrs["truncado"] = truncado
-    gdf.attrs["falha_parcial"] = falhas > 0
-    return gdf
+        camada_base, ano_base, camada_anual = PRODES_LAYERS[bioma]
+        for camada, ano_fixo in ((camada_anual, None), (camada_base, ano_base)):
+            tarefas += [(camada, ano_fixo, idx) for idx in lotes]
+    falhas = 0
+    sessao = requests.Session()
+    # Janela de no máximo 2x n_paralelo downloads em andamento: as respostas da
+    # camada-base podem ter alguns MB cada, e não podem se acumular na memória.
+    janela = n_paralelo * 2
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_paralelo) as pool:
+        for ini in range(0, len(tarefas), janela):
+            futuros = [
+                (pool.submit(_prodes_baixar_lote, sessao, camada, xs[idx], ys[idx]), ano_fixo, idx)
+                for camada, ano_fixo, idx in tarefas[ini:ini + janela]
+            ]
+            for fut, ano_fixo, idx in futuros:
+                try:
+                    conteudo = fut.result()
+                except Exception:
+                    falhas += 1
+                    continue
+                anos[idx] = np.fmin(anos[idx], _prodes_ano_por_ponto(conteudo, xs[idx], ys[idx], ano_fixo))
+                del conteudo
+    return anos, falhas, len(tarefas)
 
 
 SATELITES_PERIODO = ("AQUA_M-T", "NPP-375", "NPP-375D")
@@ -4057,71 +4003,50 @@ ser gerados por essa floresta perdida.
                 "um estado inteiro deixam a busca lenta."
             )
 
-            # Região desta aba: Estado e município escolhidos AQUI (independe da barra
-            # lateral). Consultar o desmatamento de uma região grande estoura a
-            # memória, então a análise é sempre de um município. O bioma (camada do
-            # PRODES) é sugerido pelo estado e pode ser trocado.
-            _ufs_p = ["AC","AL","AM","AP","BA","CE","DF","ES","GO","MA","MG","MS","MT",
-                      "PA","PB","PE","PI","PR","RJ","RN","RO","RR","RS","SC","SE","SP","TO"]
-            _col_a, _col_b, _col_c = st.columns([1, 3, 2])
-            _uf_p = _col_a.selectbox(
-                "Estado:", _ufs_p, index=_ufs_p.index(estado_dd) if estado_dd in _ufs_p else 0,
-                key="uf_prodes",
-            )
-            _cidades_p = ["— escolha um município —"] + list(buscar_cidades(_uf_p))
-            _muni_ini_p = municipio_dd if (tipo_analise == "Por Município" and _uf_p == estado_dd) else None
-            _sel_muni = _col_b.selectbox(
-                "Município:", _cidades_p,
-                index=_cidades_p.index(_muni_ini_p) if _muni_ini_p in _cidades_p else 0,
-                key=f"muni_prodes_{_uf_p}",
-                help="O PRODES é consultado só para o município escolhido: cobertura "
-                     "completa e sem derrubar o app.",
-            )
-            _opcoes_bioma = list(PRODES_LAYERS.keys())
-            _bioma_ini = ESTADO_BIOMA_PRODES.get(_uf_p)
-            bioma_alvo_prodes = _col_c.selectbox(
-                "Bioma (camada PRODES):", _opcoes_bioma,
-                index=_opcoes_bioma.index(_bioma_ini) if _bioma_ini in _opcoes_bioma else 0,
-                key=f"bioma_prodes_{_uf_p}",
-                help="Sugerido pelo estado. Troque se o município estiver em outro bioma "
-                     "(ex.: norte de MT é Amazônia, oeste de MT é Pantanal).",
-            )
-            _escolha_ok = not _sel_muni.startswith("—")
-            if _escolha_ok:
-                _muni_p, _tipo_p, _bioma_p = _sel_muni, "Por Município", bioma_alvo_prodes
-                _limite_p = carregar_fronteira("Por Município", _uf_p, None, _muni_p)
-                _val_p = f"{_muni_p} ({_uf_p})"
+            # Região desta aba: um ESTADO inteiro. Vem da barra lateral; se lá a
+            # escolha foi um bioma, o usuário escolhe aqui um dos estados do bioma
+            # (e os focos ficam só na parte do estado que está dentro do bioma).
+            if tipo_analise == "Por Bioma":
+                _ufs_do_bioma = sorted(
+                    uf for uf, bs in ESTADO_BIOMAS_PRODES.items() if bioma_dd in bs
+                )
+                _uf_p = st.selectbox(
+                    f"Estado do bioma {bioma_dd}:", _ufs_do_bioma, key=f"uf_prodes_{bioma_dd}",
+                )
+                _biomas_p = (bioma_dd,) if bioma_dd in PRODES_LAYERS else ()
+                _val_p = f"{bioma_dd} ({_uf_p})"
             else:
-                st.info("👆 Escolha um município para analisar o desmatamento e os focos.")
+                _uf_p = estado_dd
+                _biomas_p = ESTADO_BIOMAS_PRODES.get(_uf_p, ())
+                _val_p = _uf_p
+                st.markdown(f"Estado analisado: **{_uf_p}** (escolhido na barra lateral)")
 
-            if not _escolha_ok:
-                pass
-            elif bioma_alvo_prodes is None or bioma_alvo_prodes not in PRODES_LAYERS:
+            if not _biomas_p:
                 st.info(
                     "ℹ️ Não foi possível determinar o bioma desta região pra "
                     "escolher a camada certa do PRODES."
                 )
             else:
-                camada_base_prodes, ano_base_prodes, camada_anual_prodes = PRODES_LAYERS[bioma_alvo_prodes]
                 st.caption(
-                    f"Bioma usado: **{bioma_alvo_prodes}** — o PRODES mapeia o que já "
-                    f"estava desmatado até **{ano_base_prodes}** (camada-base) e, de "
-                    "lá em diante, o desmatamento novo de cada ano (camada anual)."
+                    "Camadas do PRODES consultadas: " + ", ".join(
+                        f"**{b}** (já desmatado até {PRODES_LAYERS[b][1]} + desmatamento anual)"
+                        for b in _biomas_p
+                    )
                 )
 
                 anos_prodes = st.select_slider(
-                    "Período dos focos de calor:", options=[1, 2, 3, 4, 5], value=3,
+                    "Período dos focos de calor:", options=[1, 2, 3, 4, 5], value=2,
                     format_func=lambda x: f"últimos {x} ano(s)", key="anos_prodes",
                     help="Quanto mais anos, mais tempo o desmatamento teve para "
                          "aparecer depois do fogo — mas a busca de focos fica mais lenta."
                 )
-                if _tipo_p != "Por Município" and anos_prodes >= 3:
+                if anos_prodes >= 3:
                     st.warning(
-                        "⏱️ Região grande com vários anos de focos: a busca pode levar "
-                        "alguns minutos. Para um primeiro teste, escolha 'Por Município'."
+                        "⏱️ Estado inteiro com vários anos de focos: a busca pode levar "
+                        "vários minutos. Não feche a página."
                     )
 
-                _prodes_key = f"prodes_res2_{_val_p}_{bioma_alvo_prodes}"
+                _prodes_key = f"prodes_res3_{_val_p}"
                 if _prodes_key not in st.session_state:
                     st.session_state[_prodes_key] = None
                 _res_atual = st.session_state[_prodes_key]
@@ -4130,76 +4055,74 @@ ser gerados por essa floresta perdida.
 
                 if (not ja_buscou) or periodo_mudou:
                     st.info(
-                        "⚡ Busca os polígonos do PRODES e os focos de calor do período "
-                        "escolhido, na região selecionada. Pode levar de alguns segundos "
-                        "a alguns minutos, conforme o tamanho da região."
+                        "⚡ Busca os focos de calor do período no estado e, para cada "
+                        "foco, consulta no PRODES se aquele ponto foi desmatado e em que "
+                        "ano. Pode levar alguns minutos."
                     )
                     if st.button(
                         "🔄 Atualizar com este período" if periodo_mudou
                         else "🔎 Buscar Desmatamento (PRODES) e Focos",
                         type="primary", use_container_width=True,
-                        key=f"btn_prodes_{_val_p}_{bioma_alvo_prodes}"
+                        key=f"btn_prodes_{_val_p}"
                     ):
                         with st.spinner(
-                            "🌳 Consultando o PRODES e os focos do INPE (não feche a "
-                            "página; regiões grandes podem levar alguns minutos)..."
+                            "🌳 Consultando os focos e o PRODES no INPE (não feche a "
+                            "página; pode levar alguns minutos)..."
                         ):
-                            if ja_buscou:
-                                # Só o período mudou: reaproveita os polígonos já baixados.
-                                gdf_prodes_bruto = _res_atual["bruto"]
-                            else:
-                                gdf_prodes_bruto = buscar_prodes_desmatamento(
-                                    bioma_alvo_prodes, tuple(_limite_p.total_bounds)
-                                )
+                            _limite_p = carregar_fronteira("Por Estado", _uf_p, None, None)
+                            if tipo_analise == "Por Bioma":
+                                try:
+                                    _recorte = _limite_p.geometry.union_all().intersection(
+                                        limite.geometry.union_all()
+                                    )
+                                    if not _recorte.is_empty:
+                                        _limite_p = gpd.GeoDataFrame(geometry=[_recorte], crs="EPSG:4326")
+                                except Exception:
+                                    pass
                             focos_prodes = focos_do_periodo(
-                                _tipo_p, _uf_p, _bioma_p, _muni_p, anos_prodes, _limite_p
+                                "Por Estado", _uf_p, None, None, anos_prodes, _limite_p
                             )
+                            _chaves = focos_prodes[["longitude", "latitude"]].astype(float).round(4)
+                            _unicos = _chaves.drop_duplicates().reset_index(drop=True)
+                            _anos_u, _falhas_p, _total_p = classificar_pontos_prodes(
+                                _biomas_p, _unicos["longitude"].to_numpy(), _unicos["latitude"].to_numpy()
+                            )
+                            _unicos["ano_desmat"] = _anos_u
+                            focos_prodes = focos_prodes.assign(
+                                _lon_r=_chaves["longitude"].to_numpy(), _lat_r=_chaves["latitude"].to_numpy()
+                            ).merge(
+                                _unicos.rename(columns={"longitude": "_lon_r", "latitude": "_lat_r"}),
+                                on=["_lon_r", "_lat_r"], how="left",
+                            ).drop(columns=["_lon_r", "_lat_r"])
                             st.session_state[_prodes_key] = {
-                                "bruto": gdf_prodes_bruto, "focos": focos_prodes, "anos": anos_prodes,
+                                "focos": focos_prodes, "anos": anos_prodes, "limite": _limite_p,
+                                "falhas": _falhas_p, "total": _total_p,
                             }
 
                 _prodes_resultado = st.session_state[_prodes_key]
                 if isinstance(_prodes_resultado, dict):
-                    gdf_prodes_bruto = _prodes_resultado["bruto"]
                     focos_prodes = _prodes_resultado["focos"]
+                    _limite_p = _prodes_resultado["limite"]
                     st.caption(
                         f"Resultado abaixo: focos dos últimos **{_prodes_resultado['anos']} "
                         "ano(s)**, cruzados com o PRODES."
                     )
                 else:
-                    gdf_prodes_bruto = None
                     focos_prodes = None
-                if gdf_prodes_bruto is not None:
-                    if gdf_prodes_bruto.empty:
-                        st.warning(
-                            "⚠️ Nenhum polígono de desmatamento retornado — o serviço "
-                            "pode estar instável agora, ou a região realmente não tem "
-                            "desmatamento registrado no PRODES neste recorte. Se for "
-                            "instabilidade, clique em 'Nova busca' e tente de novo."
-                        )
-                    elif focos_prodes.empty:
+                if focos_prodes is not None:
+                    if focos_prodes.empty:
                         st.info(
                             "Nenhum foco de calor encontrado nesta região no período "
                             "escolhido (ou o serviço do INPE está instável agora)."
                         )
                     else:
                         _avisar_blocos_falhos(focos_prodes)
-                        if gdf_prodes_bruto.attrs.get("falha_parcial"):
+                        if _prodes_resultado.get("falhas"):
                             st.warning(
-                                "⚠️ Uma das duas camadas do PRODES (base ou anual) não pôde "
-                                "ser baixada — o resultado está incompleto. Clique em "
-                                "'Nova busca' e tente de novo."
-                            )
-                        if gdf_prodes_bruto.attrs.get("truncado"):
-                            st.warning(
-                                f"⚠️ Foram carregados {len(gdf_prodes_bruto)} polígonos do "
-                                "PRODES — o limite por consulta (de polígonos ou de tempo) "
-                                "foi atingido. O que fica de fora é o desmatamento MAIS "
-                                "ANTIGO (o recente é baixado primeiro), então focos em "
-                                "áreas desmatadas há muito tempo podem aparecer como 'não "
-                                "virou desmatamento'. Escolha um município menor para "
-                                "cobertura completa. (O limite existe de propósito: sem "
-                                "ele, a memória do app estoura.)"
+                                f"⚠️ {_prodes_resultado['falhas']} de {_prodes_resultado['total']} "
+                                "consultas ao PRODES falharam mesmo após novas tentativas — "
+                                "parte dos focos pode aparecer como 'não virou desmatamento' "
+                                "sem ser. Clique em 'Nova busca' e tente de novo."
                             )
 
                         gdf_focos_prodes = gpd.GeoDataFrame(
@@ -4207,19 +4130,7 @@ ser gerados por essa floresta perdida.
                             geometry=gpd.points_from_xy(focos_prodes["longitude"], focos_prodes["latitude"]),
                             crs="EPSG:4326"
                         )
-                        prodes_anos = gdf_prodes_bruto[["geometry"]].copy()
-                        if "year" in gdf_prodes_bruto.columns:
-                            prodes_anos["ano_desmat"] = pd.to_numeric(gdf_prodes_bruto["year"], errors="coerce")
-                        else:
-                            prodes_anos["ano_desmat"] = np.nan
-                        gdf_join_prodes = gpd.sjoin(
-                            gdf_focos_prodes, prodes_anos,
-                            predicate="within", how="left"
-                        )
-                        # Um foco pode cair na borda de dois polígonos vizinhos —
-                        # fica com o desmatamento MAIS ANTIGO, pra não contar 2x.
-                        gdf_join_prodes = gdf_join_prodes.sort_values("ano_desmat", na_position="last")
-                        gdf_join_prodes = gdf_join_prodes[~gdf_join_prodes.index.duplicated(keep="first")].sort_index()
+                        gdf_join_prodes = gdf_focos_prodes
 
                         # O "ano PRODES" vai de agosto a julho: o PRODES 2023 cobre
                         # ago/2022–jul/2023. Um foco em set/2022 é do ano PRODES 2023,
@@ -4243,7 +4154,7 @@ ser gerados por essa floresta perdida.
                             CAT_NAO: "#2980b9", CAT_INDEF: "#bdc3c7",
                         }
 
-                        dentro_poligono = gdf_join_prodes["index_right"].notna().to_numpy()
+                        dentro_poligono = gdf_join_prodes["ano_desmat"].notna().to_numpy()
                         ano_d = gdf_join_prodes["ano_desmat"].to_numpy(dtype=float)
                         ano_f = gdf_join_prodes["ano_prodes_foco"].to_numpy(dtype=float)
                         gdf_join_prodes["categoria"] = np.select(
@@ -4293,7 +4204,7 @@ ser gerados por essa floresta perdida.
                             st.info(
                                 "💡 Todos os focos carregados são do mesmo ano PRODES. Para "
                                 "ver o fogo virando desmatamento ao longo do tempo, selecione "
-                                "'Anos' (3 a 5) na barra lateral e gere o dashboard de novo."
+                                "um período de 3 a 5 anos no seletor acima."
                             )
 
                         st.markdown("**📊 Destino dos focos por ano do fogo**")
@@ -4344,7 +4255,7 @@ ser gerados por essa floresta perdida.
                         centro_prodes = _limite_p.geometry.union_all().centroid
                         m_prodes = folium.Map(
                             location=[centro_prodes.y, centro_prodes.x],
-                            zoom_start=10 if _tipo_p == "Por Município" else 7,
+                            zoom_start=6,
                             tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
                             attr="Esri", prefer_canvas=True,
                         )
@@ -4366,18 +4277,20 @@ ser gerados por essa floresta perdida.
                         # (WMS: imagem pronta, 0 polígonos no navegador). Desenhar os
                         # polígonos em GeoJSON passava de 10 MB só para 1.600 deles, e
                         # dissolvê-los numa máscara só (union_all) levava minutos.
-                        folium.WmsTileLayer(
-                            url=PRODES_OWS_URL, layers=camada_base_prodes, fmt="image/png",
-                            transparent=True, version="1.1.1", opacity=0.55,
-                            name=f"PRODES — já desmatado até {ano_base_prodes}",
-                            attr="INPE/TerraBrasilis", overlay=True, control=True,
-                        ).add_to(m_prodes)
-                        folium.WmsTileLayer(
-                            url=PRODES_OWS_URL, layers=camada_anual_prodes, fmt="image/png",
-                            transparent=True, version="1.1.1", opacity=0.75,
-                            name="PRODES — desmatamento anual",
-                            attr="INPE/TerraBrasilis", overlay=True, control=True,
-                        ).add_to(m_prodes)
+                        for _b in _biomas_p:
+                            _cb, _ab, _ca = PRODES_LAYERS[_b]
+                            folium.WmsTileLayer(
+                                url=PRODES_OWS_URL, layers=_cb, fmt="image/png",
+                                transparent=True, version="1.1.1", opacity=0.55,
+                                name=f"PRODES {_b} — já desmatado até {_ab}",
+                                attr="INPE/TerraBrasilis", overlay=True, control=True,
+                            ).add_to(m_prodes)
+                            folium.WmsTileLayer(
+                                url=PRODES_OWS_URL, layers=_ca, fmt="image/png",
+                                transparent=True, version="1.1.1", opacity=0.75,
+                                name=f"PRODES {_b} — desmatamento anual",
+                                attr="INPE/TerraBrasilis", overlay=True, control=True,
+                            ).add_to(m_prodes)
 
                         pts_map = gdf_join_prodes[["categoria", "ano_prodes_foco", "ano_desmat", "geometry"]].copy()
                         pts_map["cor"] = pts_map["categoria"].map(CORES_CAT)
@@ -4413,7 +4326,7 @@ ser gerados por essa floresta perdida.
                         </div>"""
                         m_prodes.get_root().html.add_child(folium.Element(legenda_prodes))
                         folium.LayerControl(collapsed=False).add_to(m_prodes)
-                        _prodes_map_key = f"mapa_prodes_{_val_p}_{bioma_alvo_prodes}_{n_total_focos}"
+                        _prodes_map_key = f"mapa_prodes_{_val_p}_{n_total_focos}"
                         st_folium(m_prodes, width=None, height=650, returned_objects=[], key=_prodes_map_key)
 
                         csv_prodes = gdf_join_prodes.drop(columns="geometry").drop(
@@ -4428,13 +4341,14 @@ ser gerados por essa floresta perdida.
 
                         with st.expander("📚 Sobre os dados e limitações"):
                             st.markdown(
-                                f"- No **{bioma_alvo_prodes}**, o PRODES trata tudo o que já estava "
-                                f"desmatado até **{ano_base_prodes}** como uma camada-base "
+                                "- Em cada bioma, o PRODES trata tudo o que já estava "
+                                "desmatado até o ano-base (2000; 2007 na Amazônia) como uma camada-base "
                                 "(sem o ano exato) e informa o ano só do desmatamento novo "
                                 "depois disso. Focos em área da camada-base entram como "
                                 "'já desmatado antes do fogo'.\n"
-                                "- Os polígonos usados na análise são simplificados em ~22 m "
-                                "(menor que o pixel de 30 m do Landsat) para caber na memória.\n"
+                                "- Para cada foco, o INPE é consultado só nos polígonos que "
+                                "contêm aquele ponto — cobertura completa do estado, sem "
+                                "baixar todo o desmatamento da região.\n"
                                 "- Detecção via satélite Landsat (~30m de resolução) — "
                                 "desmatamento muito pequeno ou degradação gradual "
                                 "(sem corte raso) pode não ser capturado.\n"
@@ -4457,7 +4371,7 @@ ser gerados por essa floresta perdida.
 
                     st.markdown("")
                     if st.button(
-                        "🔄 Nova Busca no PRODES", key=f"btn_prodes_reset_{_val_p}_{bioma_alvo_prodes}"
+                        "🔄 Nova Busca no PRODES", key=f"btn_prodes_reset_{_val_p}"
                     ):
                         st.session_state[_prodes_key] = None
                         st.rerun()
