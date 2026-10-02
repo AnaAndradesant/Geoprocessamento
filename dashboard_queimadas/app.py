@@ -3786,12 +3786,18 @@ ser gerados por essa floresta perdida.
         # ABA — DESMATAMENTO (PRODES)
         # ----------------------------------------------------------
         with aba_prodes:
-            st.subheader("🌳 Queimada x Desmatamento Acumulado (PRODES)")
+            st.subheader("🌳 Queimada x Desmatamento (PRODES)")
             st.caption(
-                "Cruza os focos de calor detectados com a área historicamente "
-                "desmatada segundo o PRODES/INPE, pra ver se as queimadas estão "
-                "concentradas em área já desmatada ou avançando sobre vegetação "
-                "nativa ainda de pé."
+                "Cruza cada foco de calor com o desmatamento mapeado pelo PRODES/INPE "
+                "e compara as DATAS: o foco caiu numa área que já estava desmatada, "
+                "ou numa área que só foi desmatada DEPOIS do fogo? A segunda situação "
+                "mostra o fogo como sinal antecipado de desmatamento."
+            )
+            st.caption(
+                "💡 Para essa análise, escolha na barra lateral **'Anos' (3 a 5)**: "
+                "focos recentes ainda não tiveram tempo de virar desmatamento. "
+                "Prefira 'Por Município' — vários anos de focos de um estado inteiro "
+                "deixam a busca lenta."
             )
 
             if tipo_analise == "Por Bioma":
@@ -3903,43 +3909,136 @@ ser gerados por essa floresta perdida.
                             geometry=gpd.points_from_xy(df_rec_prodes["longitude"], df_rec_prodes["latitude"]),
                             crs="EPSG:4326"
                         )
+                        prodes_anos = gdf_prodes_bruto[["geometry"]].copy()
+                        if "year" in gdf_prodes_bruto.columns:
+                            prodes_anos["ano_desmat"] = pd.to_numeric(gdf_prodes_bruto["year"], errors="coerce")
+                        else:
+                            prodes_anos["ano_desmat"] = np.nan
                         gdf_join_prodes = gpd.sjoin(
-                            gdf_focos_prodes, gdf_prodes_bruto[["geometry"]],
+                            gdf_focos_prodes, prodes_anos,
                             predicate="within", how="left"
                         )
                         # Um foco pode cair na borda de dois polígonos vizinhos —
-                        # mantém só a primeira ocorrência pra não contar 2x.
-                        gdf_join_prodes = gdf_join_prodes[~gdf_join_prodes.index.duplicated(keep="first")]
-                        gdf_join_prodes["em_area_desmatada"] = gdf_join_prodes["index_right"].notna()
+                        # fica com o desmatamento MAIS ANTIGO, pra não contar 2x.
+                        gdf_join_prodes = gdf_join_prodes.sort_values("ano_desmat", na_position="last")
+                        gdf_join_prodes = gdf_join_prodes[~gdf_join_prodes.index.duplicated(keep="first")].sort_index()
+
+                        # O "ano PRODES" vai de agosto a julho: o PRODES 2023 cobre
+                        # ago/2022–jul/2023. Um foco em set/2022 é do ano PRODES 2023,
+                        # então é convertido antes de comparar com o ano do polígono.
+                        col_data_foco = (
+                            "data_hora_gmt" if "data_hora_gmt" in gdf_join_prodes.columns
+                            else next(c for c in gdf_join_prodes.columns if "data" in c)
+                        )
+                        datas_foco = pd.to_datetime(gdf_join_prodes[col_data_foco], errors="coerce", utc=True)
+                        gdf_join_prodes["ano_prodes_foco"] = (
+                            datas_foco.dt.year + (datas_foco.dt.month >= 8).astype(int)
+                        )
+
+                        CAT_ANTES = "Já desmatado antes do fogo"
+                        CAT_DEPOIS = "Virou desmatamento depois do fogo"
+                        CAT_MESMO = "Desmatado no mesmo ciclo do fogo"
+                        CAT_NAO = "Não virou desmatamento (até hoje)"
+                        CAT_INDEF = "Desmatado (ano indefinido)"
+                        CORES_CAT = {
+                            CAT_ANTES: "#7f8c8d", CAT_DEPOIS: "#c0392b", CAT_MESMO: "#e67e22",
+                            CAT_NAO: "#2980b9", CAT_INDEF: "#bdc3c7",
+                        }
+
+                        dentro_poligono = gdf_join_prodes["index_right"].notna().to_numpy()
+                        ano_d = gdf_join_prodes["ano_desmat"].to_numpy(dtype=float)
+                        ano_f = gdf_join_prodes["ano_prodes_foco"].to_numpy(dtype=float)
+                        gdf_join_prodes["categoria"] = np.select(
+                            [~dentro_poligono, np.isnan(ano_d) | np.isnan(ano_f), ano_d < ano_f, ano_d == ano_f],
+                            [CAT_NAO, CAT_INDEF, CAT_ANTES, CAT_MESMO],
+                            default=CAT_DEPOIS,
+                        )
+                        gdf_join_prodes["anos_ate_desmat"] = np.where(
+                            gdf_join_prodes["categoria"] == CAT_DEPOIS, ano_d - ano_f, np.nan
+                        )
 
                         n_total_focos = len(gdf_join_prodes)
-                        n_dentro = int(gdf_join_prodes["em_area_desmatada"].sum())
-                        n_fora = n_total_focos - n_dentro
-                        pct_fora = round(n_fora / n_total_focos * 100, 1) if n_total_focos else 0.0
+                        contagem_cat = gdf_join_prodes["categoria"].value_counts()
+                        n_antes = int(contagem_cat.get(CAT_ANTES, 0))
+                        n_depois = int(contagem_cat.get(CAT_DEPOIS, 0))
+                        n_mesmo = int(contagem_cat.get(CAT_MESMO, 0))
+                        n_nao = int(contagem_cat.get(CAT_NAO, 0))
+                        # Base da "taxa de conversão": só os focos que caíram em área
+                        # que AINDA NÃO estava desmatada na época do fogo.
+                        n_base_vegetacao = n_depois + n_mesmo + n_nao
 
-                        col_pr1, col_pr2, col_pr3 = st.columns(3)
-                        col_pr1.metric("🔥 Total de focos analisados", n_total_focos)
-                        col_pr2.metric("🟫 Em área já desmatada", f"{n_dentro} ({100 - pct_fora:.1f}%)")
-                        col_pr3.metric("🌱 Fora da área desmatada", f"{n_fora} ({pct_fora:.1f}%)")
+                        def _pct(n, base):
+                            return f"{n / base * 100:.1f}%" if base else "—"
 
-                        if pct_fora >= 30:
-                            st.error(
-                                f"🚨 **{pct_fora:.1f}%** dos focos detectados estão FORA da "
-                                "área historicamente desmatada pelo PRODES — indício de "
-                                "queimada avançando sobre vegetação nativa ainda de pé, "
-                                "não só reincidência em área já aberta."
+                        col_pr1, col_pr2, col_pr3, col_pr4 = st.columns(4)
+                        col_pr1.metric("🟫 Já desmatado antes do fogo", n_antes, _pct(n_antes, n_total_focos), delta_color="off")
+                        col_pr2.metric("🔥➡️🪓 Virou desmatamento depois", n_depois, _pct(n_depois, n_total_focos), delta_color="off")
+                        col_pr3.metric("⏸️ Mesmo ciclo PRODES", n_mesmo, _pct(n_mesmo, n_total_focos), delta_color="off")
+                        col_pr4.metric("🌱 Não virou (até hoje)", n_nao, _pct(n_nao, n_total_focos), delta_color="off")
+                        st.caption(f"Percentuais sobre o total de {n_total_focos} focos analisados.")
+
+                        if n_base_vegetacao:
+                            st.info(
+                                f"🔎 Dos **{n_base_vegetacao}** focos que caíram em área que "
+                                "ainda NÃO estava desmatada na época do fogo, "
+                                f"**{n_depois} ({_pct(n_depois, n_base_vegetacao)})** viraram "
+                                "desmatamento PRODES em um ciclo posterior — "
+                                f"**{_pct(n_depois + n_mesmo, n_base_vegetacao)}** contando "
+                                "também os desmatados no mesmo ciclo do fogo (nesse caso não "
+                                "dá pra saber, só pela data anual do PRODES, o que veio primeiro)."
                             )
-                        elif pct_fora > 0:
-                            st.warning(
-                                f"⚠️ **{pct_fora:.1f}%** dos focos estão fora da área "
-                                "historicamente desmatada — vale investigar esses pontos "
-                                "individualmente no mapa abaixo."
+
+                        ultimo_ano_prodes = (
+                            int(np.nanmax(ano_d)) if np.isfinite(ano_d).any() else None
+                        )
+                        if gdf_join_prodes["ano_prodes_foco"].nunique() <= 1:
+                            st.info(
+                                "💡 Todos os focos carregados são do mesmo ano PRODES. Para "
+                                "ver o fogo virando desmatamento ao longo do tempo, selecione "
+                                "'Anos' (3 a 5) na barra lateral e gere o dashboard de novo."
                             )
-                        else:
-                            st.success(
-                                "✅ Todos os focos detectados caíram dentro da área já "
-                                "desmatada segundo o PRODES."
+
+                        st.markdown("**📊 Destino dos focos por ano do fogo**")
+                        df_por_ano = (
+                            gdf_join_prodes.dropna(subset=["ano_prodes_foco"])
+                            .groupby(["ano_prodes_foco", "categoria"]).size()
+                            .reset_index(name="focos")
+                        )
+                        df_por_ano["ano_prodes_foco"] = df_por_ano["ano_prodes_foco"].astype(int).astype(str)
+                        fig_ano = px.bar(
+                            df_por_ano, x="ano_prodes_foco", y="focos", color="categoria",
+                            color_discrete_map=CORES_CAT,
+                            category_orders={"categoria": [CAT_ANTES, CAT_MESMO, CAT_DEPOIS, CAT_NAO, CAT_INDEF]},
+                            labels={"ano_prodes_foco": "Ano PRODES do fogo (ago–jul)", "focos": "Nº de focos", "categoria": ""},
+                        )
+                        fig_ano.update_layout(
+                            template="plotly_dark", barmode="stack", height=380,
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                            margin=dict(t=40, b=20),
+                        )
+                        st.plotly_chart(fig_ano, use_container_width=True)
+                        if ultimo_ano_prodes:
+                            st.caption(
+                                f"⏳ O PRODES carregado vai até o ano **{ultimo_ano_prodes}**. "
+                                f"Focos de {ultimo_ano_prodes} em diante ainda não tiveram um "
+                                "ciclo completo de acompanhamento — o 'não virou' desses anos "
+                                "é provisório e tende a cair quando o PRODES for atualizado."
                             )
+
+                        df_defasagem = (
+                            gdf_join_prodes.dropna(subset=["anos_ate_desmat"])
+                            .groupby("anos_ate_desmat").size().reset_index(name="focos")
+                        )
+                        if not df_defasagem.empty:
+                            st.markdown("**⏱️ Quanto tempo depois do fogo veio o desmatamento**")
+                            df_defasagem["anos_ate_desmat"] = df_defasagem["anos_ate_desmat"].astype(int).astype(str)
+                            fig_def = px.bar(
+                                df_defasagem, x="anos_ate_desmat", y="focos", text="focos",
+                                labels={"anos_ate_desmat": "Anos entre o fogo e o desmatamento", "focos": "Nº de focos"},
+                            )
+                            fig_def.update_traces(marker_color=CORES_CAT[CAT_DEPOIS])
+                            fig_def.update_layout(template="plotly_dark", height=320, margin=dict(t=20, b=20))
+                            st.plotly_chart(fig_def, use_container_width=True)
 
                         st.markdown("---")
                         st.markdown("**🗺️ Mapa: desmatamento acumulado x focos de calor**")
@@ -3983,19 +4082,25 @@ ser gerados por essa floresta perdida.
 
                         fg_focos_prodes = folium.FeatureGroup(name="Focos de calor")
                         for _, row_p in gdf_join_prodes.iterrows():
-                            cor_foco = "#7f8c8d" if row_p["em_area_desmatada"] else "#e74c3c"
+                            ano_fogo_txt = (
+                                str(int(row_p["ano_prodes_foco"])) if pd.notna(row_p["ano_prodes_foco"]) else "?"
+                            )
+                            ano_desmat_txt = (
+                                str(int(row_p["ano_desmat"])) if pd.notna(row_p["ano_desmat"]) else "—"
+                            )
                             folium.CircleMarker(
                                 location=[row_p["latitude"], row_p["longitude"]],
                                 radius=4, color="#1c1c1c", weight=0.5,
-                                fill=True, fill_color=cor_foco, fill_opacity=0.9,
+                                fill=True, fill_color=CORES_CAT[row_p["categoria"]], fill_opacity=0.9,
                                 tooltip=(
-                                    "Em área já desmatada" if row_p["em_area_desmatada"]
-                                    else "Fora da área desmatada (vegetação nativa)"
+                                    f"<b>{row_p['categoria']}</b><br>"
+                                    f"Ano PRODES do fogo: {ano_fogo_txt}<br>"
+                                    f"Ano do desmatamento: {ano_desmat_txt}"
                                 ),
                             ).add_to(fg_focos_prodes)
                         fg_focos_prodes.add_to(m_prodes)
 
-                        legenda_prodes = """
+                        legenda_prodes = f"""
                         <div style="position:fixed; bottom:28px; left:12px; z-index:9999;
                                     background:rgba(255,255,255,0.95); padding:10px 14px;
                                     border-radius:8px; font-size:12px; color:#2c3e50;
@@ -4003,8 +4108,10 @@ ser gerados por essa floresta perdida.
                                     box-shadow:0 1px 4px rgba(0,0,0,0.18);">
                             <b style="font-size:13px;">🌳 Queimada x Desmatamento</b><br>
                             <span style="color:#8d6e63;">■</span> Desmatamento acumulado (PRODES)<br>
-                            <span style="color:#e74c3c;">●</span> Foco fora da área desmatada<br>
-                            <span style="color:#7f8c8d;">●</span> Foco em área já desmatada<br>
+                            <span style="color:{CORES_CAT[CAT_ANTES]};">●</span> {CAT_ANTES}<br>
+                            <span style="color:{CORES_CAT[CAT_MESMO]};">●</span> {CAT_MESMO}<br>
+                            <span style="color:{CORES_CAT[CAT_DEPOIS]};">●</span> {CAT_DEPOIS}<br>
+                            <span style="color:{CORES_CAT[CAT_NAO]};">●</span> {CAT_NAO}<br>
                             <span style="color:#e67e22;">- - -</span> Região selecionada
                         </div>"""
                         m_prodes.get_root().html.add_child(folium.Element(legenda_prodes))
@@ -4016,7 +4123,7 @@ ser gerados por essa floresta perdida.
                             columns=[c for c in ["index_right"] if c in gdf_join_prodes.columns]
                         ).to_csv(index=False).encode("utf-8-sig")
                         st.download_button(
-                            "📄 Baixar CSV — Focos x Desmatamento Acumulado",
+                            "📄 Baixar CSV — Focos x Desmatamento (com categoria e anos)",
                             data=csv_prodes,
                             file_name=f"prodes_focos_{val_sel}_{hoje.strftime('%Y%m%d')}.csv",
                             mime="text/csv",
@@ -4030,11 +4137,21 @@ ser gerados por essa floresta perdida.
                                 "- Detecção via satélite Landsat (~30m de resolução) — "
                                 "desmatamento muito pequeno ou degradação gradual "
                                 "(sem corte raso) pode não ser capturado.\n"
-                                "- 'Fora da área desmatada' indica só que o PONTO do "
-                                "foco caiu fora de um polígono já mapeado pelo PRODES — "
-                                "não confirma por si só que houve corte de vegetação "
-                                "nativa nesse exato local (o foco pode ser em pastagem, "
-                                "área agrícola não classificada como floresta, etc.)."
+                                "- O ano PRODES vai de **agosto a julho** (o PRODES 2023 "
+                                "cobre ago/2022–jul/2023); a data de cada foco é convertida "
+                                "para esse calendário antes da comparação.\n"
+                                "- O PRODES só informa o **ano** do desmatamento, não o dia: "
+                                "quando fogo e desmatamento caem no mesmo ciclo, não dá pra "
+                                "saber qual veio primeiro — por isso essa categoria é separada.\n"
+                                "- **Associação, não causa**: um foco seguido de desmatamento "
+                                "não prova que o fogo causou o corte (pode ser o mesmo processo "
+                                "de abertura de área, ou coincidência espacial).\n"
+                                "- O foco do INPE é um pixel de ~375 m a 1 km; o polígono do "
+                                "PRODES pode ser bem menor. Um foco 'dentro' de um polígono é "
+                                "uma aproximação de localização, não uma sobreposição exata.\n"
+                                "- 'Não virou desmatamento' significa só que o ponto não caiu "
+                                "num polígono do PRODES até o último ano publicado — pode ser "
+                                "pastagem, área agrícola ou vegetação que não é floresta."
                             )
 
                     st.markdown("")
