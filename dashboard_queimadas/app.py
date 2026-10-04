@@ -367,6 +367,10 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
         blocos.append((cursor, bloco_fim))
         cursor = bloco_fim + timedelta(days=1)
 
+    # Colunas usadas pelo dashboard (mapa, gráficos, ranking e CSV exportado).
+    colunas = ["longitude", "latitude", "data_hora_gmt", "satelite", "municipio", "estado",
+               "bioma", "risco_fogo", "precipitacao", "numero_dias_sem_chuva", "frp"]
+
     def _buscar_bloco(bloco):
         b_ini, b_fim = bloco
         cql = (
@@ -374,46 +378,50 @@ def buscar_focos_inpe(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim, satel
             f"AND data_hora_gmt <= '{b_fim.strftime('%Y-%m-%d')}T23:59:59' "
             f"AND satelite IN ('{sat_str}') AND {filtro_base}"
         )
-        try:
-            r = session.get(
-                url,
-                params={
-                    "service": "WFS", "version": "1.0.0", "request": "GetFeature",
-                    "typeName": "bdqueimadas:focos", "outputFormat": "application/json",
-                    "CQL_FILTER": cql, "maxFeatures": 50000
-                },
-                headers=headers, verify=False, timeout=90
-            )
-            if r.status_code == 200:
-                dados_json = r.json()
-                if "features" in dados_json and len(dados_json["features"]) > 0:
-                    return [
-                        {"longitude": f["geometry"]["coordinates"][0],
-                         "latitude": f["geometry"]["coordinates"][1],
-                         **f["properties"]}
-                        for f in dados_json["features"]
-                    ]
-        except Exception:
-            pass  # Ignora erros de conexão para não parar as outras chamadas
-        return []
+        # CSV só com as colunas usadas, em vez do GeoJSON completo (~30 colunas, um
+        # dict Python por foco): medido, ~10x menos bytes e muito menos memória. Num
+        # bioma inteiro (Amazônia) o JSON, com 12 downloads simultâneos, deixava o
+        # app a ~1,1 GB só no carregamento — e ele caía ao desenhar as abas.
+        for tentativa in range(3):
+            try:
+                r = session.get(
+                    url,
+                    params={
+                        "service": "WFS", "version": "1.0.0", "request": "GetFeature",
+                        "typeName": "bdqueimadas:focos", "outputFormat": "csv",
+                        "propertyName": ",".join(colunas),
+                        "CQL_FILTER": cql, "maxFeatures": 50000
+                    },
+                    headers=headers, verify=False, timeout=90
+                )
+                if r.status_code == 200 and "csv" in r.headers.get("content-type", ""):
+                    bloco_df = pd.read_csv(io.BytesIO(r.content), usecols=lambda c: c in colunas)
+                    for c in ("longitude", "latitude", "risco_fogo", "precipitacao", "frp"):
+                        if c in bloco_df.columns:
+                            bloco_df[c] = bloco_df[c].astype("float32")
+                    return bloco_df
+            except Exception:
+                pass
+            time.sleep(1.5 * (tentativa + 1))
+        return None
 
-    # Chamadas em paralelo (são independentes — não precisa esperar uma terminar
-    # pra começar a próxima). 12 workers é um bom equilíbrio entre velocidade e
-    # não sobrecarregar o servidor do INPE.
+    # Chamadas em paralelo, mas poucas: cada resposta fica na memória até ser
+    # concatenada.
     all_dfs = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
-        for registros in executor.map(_buscar_bloco, blocos):
-            if registros:
-                all_dfs.append(pd.DataFrame(registros))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        for bloco_df in executor.map(_buscar_bloco, blocos):
+            if bloco_df is not None and not bloco_df.empty:
+                all_dfs.append(bloco_df)
 
     if not all_dfs:
         return pd.DataFrame()
 
     df_final = pd.concat(all_dfs, ignore_index=True)
-    if 'id' in df_final.columns:
-        df_final = df_final.drop_duplicates(subset=['id'])
-    else:
-        df_final = df_final.drop_duplicates()
+    del all_dfs
+    df_final = df_final.drop_duplicates()
+    for c in ("satelite", "estado", "bioma", "municipio"):
+        if c in df_final.columns:
+            df_final[c] = df_final[c].astype("category")
     return df_final
 
 
