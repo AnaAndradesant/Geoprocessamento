@@ -272,49 +272,44 @@ def carregar_fronteira(tipo, estado, bioma, municipio):
 
 @st.cache_data(show_spinner=False, persist="disk")
 def carregar_areas_protegidas(tipo_area):
-    # A partir de versões recentes do geobr, read_indigenous_land() e
-    # read_conservation_units() passaram a exigir um argumento de data/ano
-    # (formato YYYYMM) — chamar sem argumento gera TypeError. Como o geobr
-    # só mantém alguns "snapshots" disponíveis e essa lista muda com o tempo,
-    # tentamos em cascata do mais recente pro mais antigo até um funcionar.
+    # O geobr muda de assinatura/colunas entre versões; medido no geobr 2.1.1 (o do
+    # Streamlit Cloud): read_indigenous_land(year=2025) → coluna name_indigenous_land;
+    # read_conservation_units(date=202503) → colunas nome_uc, grupo e categoria.
+    # Tenta do mais recente ao mais antigo e aceita os nomes de coluna das versões
+    # anteriores também. (Antes passava year=202501 / esperava name_conservation_unit,
+    # o que falhava nessa versão.)
+    ultimo_erro = None
+    gdf_areas = None
     if tipo_area == "Terras Indígenas":
-        candidatos = [202501, 202409, 202312, 202112, 202001, 201907]
-        ultimo_erro = None
-        gdf_areas = None
-        for data_ref in candidatos:
+        for ano_ref in (2025, 2024, 2023, 2022, 2021, 2020, 2019):
             try:
-                gdf_areas = read_indigenous_land(year=data_ref)
+                gdf_areas = read_indigenous_land(year=ano_ref)
                 break
             except Exception as e:
                 ultimo_erro = e
         if gdf_areas is None:
-            raise RuntimeError(
-                f"Não foi possível baixar Terras Indígenas do geobr "
-                f"(tentei as datas {candidatos}). Último erro: {ultimo_erro}"
-            )
-        if 'terrai_nom' in gdf_areas.columns:
-            gdf_areas = gdf_areas.rename(columns={'terrai_nom': 'nome_area'})
+            raise RuntimeError(f"Não foi possível baixar Terras Indígenas do geobr. Último erro: {ultimo_erro}")
+        nomes = ("name_indigenous_land", "terrai_nom")
     else:
-        candidatos = [202503, 202402, 202112, 202001, 201909]
-        ultimo_erro = None
-        gdf_areas = None
-        for data_ref in candidatos:
+        for data_ref in (202503, 202402, 202112, 202001, 201909):
             try:
                 gdf_areas = read_conservation_units(date=data_ref)
                 break
             except Exception as e:
                 ultimo_erro = e
         if gdf_areas is None:
-            raise RuntimeError(
-                f"Não foi possível baixar Unidades de Conservação do geobr "
-                f"(tentei as datas {candidatos}). Último erro: {ultimo_erro}"
-            )
-        if 'name_conservation_unit' in gdf_areas.columns:
-            gdf_areas = gdf_areas.rename(columns={'name_conservation_unit': 'nome_area'})
+            raise RuntimeError(f"Não foi possível baixar Unidades de Conservação do geobr. Último erro: {ultimo_erro}")
+        nomes = ("nome_uc", "name_conservation_unit")
+    col_nome = next((c for c in nomes if c in gdf_areas.columns), None)
+    if col_nome is None:
+        raise RuntimeError(f"Coluna com o nome da área não encontrada (colunas: {list(gdf_areas.columns)})")
+    gdf_areas = gdf_areas.rename(columns={col_nome: "nome_area"})
     gdf_areas['geometry'] = gdf_areas['geometry'].make_valid()
     gdf_areas = gdf_areas.to_crs("EPSG:4326")
     gdf_areas['geometry'] = gdf_areas['geometry'].simplify(tolerance=0.01, preserve_topology=True)
-    return gdf_areas[['nome_area', 'geometry']]
+    extras = [c for c in ("grupo", "categoria") if c in gdf_areas.columns]
+    return gdf_areas[['nome_area'] + extras + ['geometry']]
+
 
 import requests
 import ssl
@@ -1915,6 +1910,49 @@ def buscar_car_imoveis(uf, bbox_wgs84, max_features=5000):
         return gpd.GeoDataFrame(columns=colunas)
 
 
+MESES_PT = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+
+
+def _resumo_por_area(pts, n_janelas):
+    """
+    Resume os focos dentro de cada área protegida. `pts` tem uma linha por foco
+    (pode repetir o mesmo foco se ele cai em duas áreas sobrepostas) com:
+    area_id, lon, lat, data (datetime) e janela (0 = últimos 12 meses, 1 = os 12
+    meses antes desses, ...).
+
+    Devolve um DataFrame indexado por area_id com:
+      focos            total de focos no período
+      anos_com_fogo    em quantas das `n_janelas` janelas de 12 meses houve fogo
+      dias_com_foco    dias distintos com ao menos um foco (episódios de fogo)
+      mes_pico         mês (1-12) com mais focos
+      pct_reincidente  % dos locais (células de ~1 km) que queimaram em 2+ janelas
+      recorrencia      Recorrente / Frequente / Ocasional
+    """
+    p = pts.copy()
+    p["dia"] = p["data"].dt.normalize()
+    p["mes"] = p["data"].dt.month
+    g = p.groupby("area_id")
+    resumo = pd.DataFrame({
+        "focos": g.size(),
+        "anos_com_fogo": g["janela"].nunique(),
+        "dias_com_foco": g["dia"].nunique(),
+    })
+    por_mes = p.groupby(["area_id", "mes"]).size().unstack(fill_value=0).reindex(columns=range(1, 13), fill_value=0)
+    resumo["mes_pico"] = por_mes.idxmax(axis=1)
+    # Reincidência por local: célula de 0,01° (~1 km). Um mesmo lugar que queima em
+    # anos diferentes é fogo recorrente de verdade, diferente de focos espalhados.
+    p["cx"] = np.floor(p["lon"].to_numpy() * 100).astype(int)
+    p["cy"] = np.floor(p["lat"].to_numpy() * 100).astype(int)
+    anos_por_celula = p.groupby(["area_id", "cx", "cy"])["janela"].nunique()
+    resumo["pct_reincidente"] = (anos_por_celula >= 2).groupby("area_id").mean() * 100
+    limite_freq = int(np.ceil(n_janelas / 2))
+    resumo["recorrencia"] = np.select(
+        [resumo["anos_com_fogo"] >= n_janelas, resumo["anos_com_fogo"] >= limite_freq],
+        ["Recorrente", "Frequente"], default="Ocasional",
+    )
+    return resumo.sort_values("focos", ascending=False)
+
+
 def _liberar_memoria():
     """
     Coleta o lixo e devolve ao sistema a memória que o Python já liberou. Sem o
@@ -2075,10 +2113,9 @@ else:
     mes_modis = st.sidebar.selectbox("Mês do Mapa Principal:", list(range(1, 13)), index=7)
 
 st.sidebar.markdown("---")
-area_protegida = st.sidebar.selectbox(
-    "🌳 Análise de Risco (Cruzamento Espacial):",
-    ["Nenhuma", "Terras Indígenas", "Unidades de Conservação"]
-)
+# Áreas protegidas agora têm aba própria (🌿 Unidades de Conservação); aqui fica
+# fixo em "Nenhuma" para o cruzamento antigo da análise principal não rodar.
+area_protegida = "Nenhuma"
 
 # ==========================================
 st.sidebar.markdown("---")
@@ -2493,12 +2530,13 @@ if st.session_state.gerar_dashboard:
         # =============================================================
         # --- ABAS PRINCIPAIS ---
         # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_car, aba_export, aba_risco = st.tabs([
+        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_car, aba_uc, aba_export, aba_risco = st.tabs([
             "🗺️ Mapa de Focos",
             "📈 Gráficos & Anomalia",
             "🔬 Severidade (NBR Sentinel-2)",
             "💰 Impacto Econômico",
             "🏡 Propriedades Rurais (CAR)",
+            "🌿 Unidades de Conservação",
             "⬇️ Exportar Dados",
             "🎯 Risco Preditivo (ML)"
         ])
@@ -3879,6 +3917,351 @@ ser gerados por essa floresta perdida.
 
         with aba_car:
             _aba_car()
+
+        # ----------------------------------------------------------
+        # ABA — UNIDADES DE CONSERVAÇÃO / TERRAS INDÍGENAS
+        # ----------------------------------------------------------
+        # Fragmento: clicar em algo DENTRO desta aba reexecuta só a aba.
+        @st.fragment
+        def _aba_uc():
+            st.subheader("🌿 Unidades de Conservação e Terras Indígenas")
+            st.caption(
+                "Para cada área protegida da região selecionada: quantos focos de calor, "
+                "em quantos anos o fogo volta a ela (recorrência) e em que mês ele se "
+                "concentra. A região é a da barra lateral; o período é escolhido aqui."
+            )
+            col_t, col_p = st.columns(2)
+            tipo_uc = col_t.radio(
+                "Tipo de área protegida:", ["Unidades de Conservação", "Terras Indígenas"],
+                key="tipo_uc", horizontal=True,
+            )
+            anos_uc = col_p.select_slider(
+                "Período analisado:", options=[2, 3, 4, 5], value=3,
+                format_func=lambda x: f"últimos {x} anos", key="anos_uc",
+                help="Cada ano é uma janela de 12 meses contada a partir de hoje. "
+                     "Mínimo de 2 anos, senão não dá para medir recorrência.",
+            )
+            grupo_uc = "Todas"
+            if tipo_uc == "Unidades de Conservação":
+                grupo_uc = st.radio(
+                    "Grupo da unidade:", ["Todas", "Proteção Integral", "Uso Sustentável"],
+                    key="grupo_uc", horizontal=True,
+                    help="Proteção Integral (parques, reservas biológicas...) não admite uso "
+                         "direto dos recursos; Uso Sustentável (APAs, florestas nacionais...) admite.",
+                )
+            if tipo_analise != "Por Município" and anos_uc >= 4:
+                st.warning(
+                    "⏱️ Região grande com vários anos de focos: a busca pode levar alguns "
+                    "minutos. Não feche a página."
+                )
+
+            _uc_key = f"uc_res_{val_sel}_{tipo_uc}_{grupo_uc}"
+            _res_uc = st.session_state.get(_uc_key)
+            uc_ja = isinstance(_res_uc, dict)
+            uc_mudou = uc_ja and _res_uc.get("anos") != anos_uc
+
+            if (not uc_ja) or uc_mudou:
+                st.info(
+                    "⚡ Busca os focos do período na região e cruza com os limites das áreas "
+                    "protegidas. Pode levar de alguns segundos a alguns minutos."
+                )
+                if st.button(
+                    "🔄 Atualizar com este período" if uc_mudou else "🔎 Analisar Recorrência do Fogo",
+                    type="primary", use_container_width=True, key=f"btn_uc_{val_sel}_{tipo_uc}_{grupo_uc}",
+                ):
+                    with st.spinner("🌿 Carregando áreas protegidas e focos de calor do INPE..."):
+                        try:
+                            areas_br = carregar_areas_protegidas(tipo_uc)
+                            if grupo_uc != "Todas" and "grupo" in areas_br.columns:
+                                areas_br = areas_br[areas_br["grupo"] == grupo_uc]
+                            areas_reg = gpd.sjoin(
+                                areas_br, limite[["geometry"]], predicate="intersects", how="inner"
+                            )
+                            areas_reg = areas_reg[~areas_reg.index.duplicated()].drop(
+                                columns=["index_right"], errors="ignore"
+                            ).reset_index(drop=True)
+                            areas_reg["area_id"] = np.arange(len(areas_reg))
+                            _focos_uc = focos_do_periodo(
+                                tipo_analise, estado_dd, bioma_dd, municipio_dd, anos_uc, limite
+                            )
+                            n_dentro_regiao = len(_focos_uc)
+                            if _focos_uc.empty or areas_reg.empty:
+                                pts_uc = pd.DataFrame(columns=["area_id", "lon", "lat", "data", "janela"])
+                                n_unicos = 0
+                            else:
+                                gdf_f = gpd.GeoDataFrame(
+                                    _focos_uc,
+                                    geometry=gpd.points_from_xy(_focos_uc["longitude"], _focos_uc["latitude"]),
+                                    crs="EPSG:4326",
+                                )
+                                dentro = gpd.sjoin(
+                                    gdf_f, areas_reg[["area_id", "geometry"]], predicate="within", how="inner"
+                                )
+                                n_unicos = int(dentro.index.nunique())
+                                datas = pd.to_datetime(dentro["data_hora_gmt"])
+                                pts_uc = pd.DataFrame({
+                                    "area_id": dentro["area_id"].to_numpy(),
+                                    "lon": dentro["longitude"].to_numpy(dtype=float),
+                                    "lat": dentro["latitude"].to_numpy(dtype=float),
+                                    "data": datas.to_numpy(),
+                                })
+                                pts_uc["janela"] = (
+                                    (pd.Timestamp(hoje.date()) - pts_uc["data"]).dt.days // 365
+                                ).clip(lower=0, upper=anos_uc - 1)
+                            st.session_state[_uc_key] = {
+                                "areas": areas_reg, "pts": pts_uc, "anos": anos_uc,
+                                "n_focos_regiao": n_dentro_regiao, "n_unicos": n_unicos,
+                                "falhos": _focos_uc.attrs.get("blocos_falhos", 0),
+                                "total": _focos_uc.attrs.get("blocos_total", 0),
+                            }
+                            del _focos_uc
+                        except Exception as _e_uc:
+                            st.error(f"⚠️ Não foi possível concluir a análise: {_e_uc}")
+                _res_uc = st.session_state.get(_uc_key)
+
+            if not isinstance(_res_uc, dict):
+                return
+
+            areas_uc, pts_uc, n_jan = _res_uc["areas"], _res_uc["pts"], _res_uc["anos"]
+            st.caption(f"Resultado abaixo: últimos **{n_jan} anos** (janelas de 12 meses até hoje).")
+            if _res_uc.get("falhos"):
+                st.warning(
+                    f"⚠️ {_res_uc['falhos']} de {_res_uc['total']} janelas de busca no INPE falharam "
+                    "mesmo após novas tentativas — a contagem de focos pode estar SUBESTIMADA. "
+                    "Clique em 'Nova busca' e tente de novo em alguns minutos."
+                )
+            if areas_uc.empty:
+                st.info(f"Nenhuma área de '{tipo_uc}' intersecta a região selecionada.")
+            elif pts_uc.empty:
+                st.success(
+                    f"✅ {len(areas_uc)} área(s) na região e **nenhum foco** dentro delas "
+                    "no período (ou o serviço do INPE está instável agora)."
+                )
+            else:
+                resumo = _resumo_por_area(pts_uc, n_jan).join(
+                    areas_uc.set_index("area_id")[[c for c in ("nome_area", "grupo", "categoria") if c in areas_uc.columns]]
+                )
+                resumo["mes_pico_txt"] = resumo["mes_pico"].map(lambda m: MESES_PT[int(m) - 1])
+                n_com_fogo = len(resumo)
+                n_recorrentes = int((resumo["recorrencia"] == "Recorrente").sum())
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Áreas na região", len(areas_uc))
+                c2.metric("Áreas com fogo", n_com_fogo, f"{n_com_fogo / len(areas_uc) * 100:.0f}% do total", delta_color="off")
+                c3.metric("Focos dentro delas", f"{_res_uc['n_unicos']:,}".replace(",", "."),
+                          f"{_res_uc['n_unicos'] / max(_res_uc['n_focos_regiao'], 1) * 100:.0f}% dos focos da região", delta_color="off")
+                c4.metric(f"Queimaram nos {n_jan} anos", n_recorrentes, "recorrentes", delta_color="off")
+
+                # --- Quantas vezes queima por ano -----------------------------------
+                hoje_d = pd.Timestamp(hoje.date())
+                rotulos_jan = {
+                    j: f"{(hoje_d - pd.Timedelta(days=365 * (j + 1))):%m/%Y}–{(hoje_d - pd.Timedelta(days=365 * j)):%m/%Y}"
+                    for j in range(n_jan)
+                }
+                por_jan = pts_uc.groupby("janela").size().reindex(range(n_jan), fill_value=0)
+                df_jan = pd.DataFrame({
+                    "Período": [rotulos_jan[j] for j in range(n_jan)][::-1],
+                    "Focos": por_jan.to_numpy()[::-1],
+                })
+                por_mes = pts_uc["data"].dt.month.value_counts().reindex(range(1, 13), fill_value=0)
+                mes_top = int(por_mes.idxmax())
+                df_mes = pd.DataFrame({"Mês": MESES_PT, "Focos": por_mes.to_numpy()})
+                df_mes["destaque"] = np.where(np.arange(1, 13) == mes_top, "Mês de pico", "Demais meses")
+
+                col_g1, col_g2 = st.columns(2)
+                with col_g1:
+                    st.markdown("**📅 Focos por ano (janelas de 12 meses)**")
+                    fig_jan = px.bar(df_jan, x="Período", y="Focos", text="Focos")
+                    fig_jan.update_traces(marker_color="#e67e22")
+                    fig_jan.update_layout(template="plotly_dark", height=340, margin=dict(t=20, b=20))
+                    st.plotly_chart(fig_jan, use_container_width=True)
+                with col_g2:
+                    st.markdown("**🗓️ Em que mês o fogo se concentra**")
+                    fig_mes = px.bar(
+                        df_mes, x="Mês", y="Focos", color="destaque",
+                        color_discrete_map={"Mês de pico": "#c0392b", "Demais meses": "#7f8c8d"},
+                    )
+                    fig_mes.update_layout(
+                        template="plotly_dark", height=340, margin=dict(t=20, b=20), showlegend=False,
+                    )
+                    st.plotly_chart(fig_mes, use_container_width=True)
+                st.info(
+                    f"🔥 O mês de pico é **{MESES_PT[mes_top - 1]}**, com "
+                    f"**{por_mes[mes_top] / por_mes.sum() * 100:.0f}%** dos focos dentro das áreas protegidas."
+                )
+
+                # --- Ranking e mês de pico por área ---------------------------------
+                st.markdown("---")
+                topo = resumo.head(15)
+                col_r1, col_r2 = st.columns(2)
+                with col_r1:
+                    st.markdown(f"**🏆 Top {len(topo)} áreas com mais focos**")
+                    fig_rank = px.bar(
+                        topo.reset_index(), x="focos", y="nome_area", orientation="h",
+                        color="recorrencia", text="focos",
+                        color_discrete_map={"Recorrente": "#c0392b", "Frequente": "#e67e22", "Ocasional": "#f1c40f"},
+                        labels={"focos": "Focos", "nome_area": "", "recorrencia": "Recorrência"},
+                    )
+                    fig_rank.update_layout(
+                        template="plotly_dark", height=460, margin=dict(t=20, b=20),
+                        yaxis={"categoryorder": "total ascending"},
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                    )
+                    st.plotly_chart(fig_rank, use_container_width=True)
+                with col_r2:
+                    st.markdown("**🔥 Mês de pico de cada uma (focos por mês)**")
+                    mapa_calor = (
+                        pts_uc[pts_uc["area_id"].isin(topo.index)]
+                        .assign(mes=lambda d: d["data"].dt.month)
+                        .groupby(["area_id", "mes"]).size().unstack(fill_value=0)
+                        .reindex(index=topo.index, columns=range(1, 13), fill_value=0)
+                    )
+                    mapa_calor.index = topo["nome_area"].to_numpy()
+                    mapa_calor.columns = MESES_PT
+                    fig_calor = px.imshow(
+                        mapa_calor, aspect="auto", color_continuous_scale="YlOrRd",
+                        labels={"color": "Focos"},
+                    )
+                    fig_calor.update_layout(template="plotly_dark", height=460, margin=dict(t=20, b=20))
+                    st.plotly_chart(fig_calor, use_container_width=True)
+
+                # --- Recorrência --------------------------------------------------
+                st.markdown("---")
+                st.markdown("**🔁 Recorrência: o fogo volta?**")
+                st.caption(
+                    f"**Recorrente** = houve fogo em todos os {n_jan} anos; **Frequente** = em pelo menos "
+                    f"metade; **Ocasional** = em menos que isso. **Locais reincidentes** = % dos "
+                    "pontos de ~1 km que queimaram em mais de um ano (fogo que volta ao mesmo lugar)."
+                )
+                tabela = resumo.reset_index(drop=True)[[
+                    c for c in ("nome_area", "categoria", "grupo", "focos", "anos_com_fogo", "dias_com_foco",
+                                "mes_pico_txt", "pct_reincidente", "recorrencia") if c in resumo.columns
+                ]].rename(columns={
+                    "nome_area": "Área", "categoria": "Categoria", "grupo": "Grupo", "focos": "Focos", "anos_com_fogo": f"Anos com fogo (de {n_jan})",
+                    "dias_com_foco": "Dias com foco", "mes_pico_txt": "Mês de pico",
+                    "pct_reincidente": "Locais reincidentes (%)", "recorrencia": "Recorrência",
+                })
+                tabela["Locais reincidentes (%)"] = tabela["Locais reincidentes (%)"].round(1)
+                st.dataframe(tabela, hide_index=True, height=380, use_container_width=True)
+                st.download_button(
+                    "📄 Baixar CSV — Recorrência por área", data=tabela.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"uc_recorrencia_{val_sel}_{hoje.strftime('%Y%m%d')}.csv", mime="text/csv",
+                )
+
+                # --- Detalhe de uma área ------------------------------------------
+                st.markdown("---")
+                st.markdown("**🔍 Detalhe de uma área**")
+                ids = resumo.index.tolist()
+                id_sel = st.selectbox(
+                    "Escolha a área:", ids, key=f"det_uc_{val_sel}_{tipo_uc}_{grupo_uc}",
+                    format_func=lambda i: f"{resumo.loc[i, 'nome_area']} ({int(resumo.loc[i, 'focos'])} focos)",
+                )
+                pts_a = pts_uc[pts_uc["area_id"] == id_sel]
+                lin = resumo.loc[id_sel]
+                st.write(
+                    f"**{lin['nome_area']}** — {int(lin['focos'])} focos em {int(lin['dias_com_foco'])} dias "
+                    f"diferentes; fogo em **{int(lin['anos_com_fogo'])} de {n_jan} anos** "
+                    f"({lin['recorrencia'].lower()}); mês de pico: **{lin['mes_pico_txt']}**."
+                )
+                col_d1, col_d2 = st.columns(2)
+                mes_a = pts_a["data"].dt.month.value_counts().reindex(range(1, 13), fill_value=0)
+                jan_a = pts_a.groupby("janela").size().reindex(range(n_jan), fill_value=0)
+                with col_d1:
+                    fig_da = px.bar(x=MESES_PT, y=mes_a.to_numpy(), labels={"x": "Mês", "y": "Focos"})
+                    fig_da.update_traces(marker_color="#c0392b")
+                    fig_da.update_layout(template="plotly_dark", height=280, margin=dict(t=10, b=10))
+                    st.plotly_chart(fig_da, use_container_width=True)
+                with col_d2:
+                    fig_db = px.bar(
+                        x=[rotulos_jan[j] for j in range(n_jan)][::-1], y=jan_a.to_numpy()[::-1],
+                        labels={"x": "Período", "y": "Focos"},
+                    )
+                    fig_db.update_traces(marker_color="#e67e22")
+                    fig_db.update_layout(template="plotly_dark", height=280, margin=dict(t=10, b=10))
+                    st.plotly_chart(fig_db, use_container_width=True)
+
+                # --- Mapa ---------------------------------------------------------
+                st.markdown("---")
+                st.markdown("**🗺️ Mapa: áreas protegidas coloridas pelo total de focos**")
+                gdf_uc_mapa = areas_uc.merge(
+                    resumo.reset_index()[["area_id", "focos", "anos_com_fogo", "mes_pico_txt", "recorrencia"]],
+                    on="area_id", how="inner",
+                )
+                cortes = np.unique(np.quantile(gdf_uc_mapa["focos"], [0.2, 0.4, 0.6, 0.8]))
+                paleta = ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"]
+                gdf_uc_mapa["cor"] = [
+                    paleta[min(int(np.searchsorted(cortes, v, side="right")), len(paleta) - 1)]
+                    for v in gdf_uc_mapa["focos"]
+                ]
+                centro_uc = limite_mapa.geometry.union_all().centroid
+                m_uc = folium.Map(
+                    location=[centro_uc.y, centro_uc.x], zoom_start=6,
+                    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                    attr="Esri", prefer_canvas=True,
+                )
+                folium.TileLayer(
+                    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
+                    attr="Esri Ref", overlay=True, control=False,
+                ).add_to(m_uc)
+                folium.GeoJson(
+                    limite_mapa.__geo_interface__, name="Região selecionada",
+                    style_function=lambda x: {
+                        "fillColor": "#e67e22", "fillOpacity": 0.02, "color": "#e67e22",
+                        "weight": 2.5, "dashArray": "6 3",
+                    },
+                ).add_to(m_uc)
+                folium.GeoJson(
+                    gdf_uc_mapa[["nome_area", "focos", "anos_com_fogo", "mes_pico_txt", "recorrencia", "cor", "geometry"]].__geo_interface__,
+                    name="Áreas protegidas com fogo",
+                    style_function=lambda f: {
+                        "fillColor": f["properties"]["cor"], "fillOpacity": 0.7,
+                        "color": "#7f8c8d", "weight": 1,
+                    },
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=["nome_area", "focos", "anos_com_fogo", "mes_pico_txt", "recorrencia"],
+                        aliases=["Área:", "Focos:", "Anos com fogo:", "Mês de pico:", "Recorrência:"],
+                    ),
+                ).add_to(m_uc)
+                b_uc = limite_mapa.geometry.total_bounds
+                m_uc.fit_bounds([[b_uc[1], b_uc[0]], [b_uc[3], b_uc[2]]])
+                m_uc.get_root().html.add_child(folium.Element(
+                    """<div style="position:fixed; bottom:28px; left:12px; z-index:9999;
+                    background:rgba(255,255,255,0.95); padding:10px 14px; border-radius:8px;
+                    font-size:12px; color:#2c3e50; line-height:1.9; border:1px solid rgba(0,0,0,0.08);
+                    box-shadow:0 1px 4px rgba(0,0,0,0.18);"><b>🌿 Focos por área</b><br>
+                    <span style="background:linear-gradient(to right,#ffffb2,#fecc5c,#fd8d3c,#f03b20,#bd0026);
+                    display:inline-block;width:130px;height:10px;border-radius:4px;"></span><br>
+                    <span>Menos</span><span style="float:right;">Mais</span></div>"""
+                ))
+                st_folium(
+                    m_uc, width=None, height=600, returned_objects=[],
+                    key=f"mapa_uc_{val_sel}_{tipo_uc}_{grupo_uc}_{n_jan}_{len(gdf_uc_mapa)}",
+                )
+
+                with st.expander("📚 Sobre os dados e limitações"):
+                    st.markdown(
+                        "- **Focos de calor** (satélites de referência do INPE) são pixels de ~375 m a "
+                        "1 km que detectam fogo ativo; não medem área queimada nem a gravidade.\n"
+                        "- Os limites das áreas protegidas (geobr) são **simplificados em ~1 km** para "
+                        "caber na memória: focos muito próximos da divisa podem cair do lado errado.\n"
+                        "- Quando duas áreas **se sobrepõem** (ex.: uma APA e um parque), o mesmo foco "
+                        "conta para as duas; os totais gerais contam cada foco uma vez só.\n"
+                        "- Cada **ano** é uma janela de 12 meses contada a partir de hoje, então todos "
+                        "têm o mesmo tamanho; o ano mais recente pode estar incompleto no INPE.\n"
+                        "- **Recorrência** mede se há fogo em anos diferentes, não se o fogo foi "
+                        "criminoso ou natural: parte do fogo no Cerrado e no Pantanal é manejo e "
+                        "faz parte da dinâmica do bioma.\n"
+                        "- Para Unidades de Conservação, o filtro de grupo (Proteção Integral x Uso "
+                        "Sustentável) e a categoria vêm da base do geobr/CNUC."
+                    )
+
+            st.markdown("")
+            if st.button("🔄 Nova Busca nesta aba", key=f"btn_uc_reset_{val_sel}_{tipo_uc}_{grupo_uc}"):
+                st.session_state[_uc_key] = None
+                st.rerun(scope="fragment")
+
+        with aba_uc:
+            _aba_uc()
 
         # ----------------------------------------------------------
         # ABA 5 — EXPORTAR DADOS
