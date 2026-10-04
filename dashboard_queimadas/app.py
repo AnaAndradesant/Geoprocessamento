@@ -1451,12 +1451,12 @@ def buscar_focos_com_coords(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim,
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
     dic_estados = {
-        "AC": "ACRE", "AL": "ALAGOAS", "AP": "AMAP%", "AM": "AMAZONAS",
-        "BA": "BAHIA", "CE": "CEAR%", "DF": "DISTRITO FEDERAL",
+        "AC": "ACRE", "AL": "ALAGOAS", "AP": "AMAP_", "AM": "AMAZONAS",
+        "BA": "BAHIA", "CE": "CEAR_", "DF": "DISTRITO FEDERAL",
         "ES": "ESP%RITO SANTO", "GO": "GOI%S", "MA": "MARANH%O",
         "MT": "MATO GROSSO", "MS": "MATO GROSSO DO SUL", "MG": "MINAS GERAIS",
-        "PA": "PAR%", "PB": "PARA%BA", "PR": "PARAN%", "PE": "PERNAMBUCO",
-        "PI": "PIAU%", "RJ": "RIO DE JANEIRO", "RN": "RIO GRANDE DO NORTE",
+        "PA": "PAR_", "PB": "PARA_BA", "PR": "PARAN_", "PE": "PERNAMBUCO",
+        "PI": "PIAU_", "RJ": "RIO DE JANEIRO", "RN": "RIO GRANDE DO NORTE",
         "RS": "RIO GRANDE DO SUL", "RO": "ROND%NIA", "RR": "RORAIMA",
         "SC": "SANTA CATARINA", "SP": "S%O PAULO", "SE": "SERGIPE",
         "TO": "TOCANTINS"
@@ -1501,56 +1501,56 @@ def buscar_focos_com_coords(tipo, val_estado, val_bioma, val_muni, d_ini, d_fim,
         # Até 3 tentativas: o servidor do INPE às vezes devolve uma resposta que não é
         # JSON (medido). Antes isso virava "0 focos nesse bloco" em silêncio, o que
         # subestimaria a contagem — agora a falha definitiva é contada e avisada.
+        # CSV com só as 4 colunas usadas, em vez do GeoJSON completo (~30 colunas):
+        # medido, 95 KB contra 995 KB para os mesmos focos. Com 10 blocos baixados
+        # em paralelo, o JSON completo de um estado da Amazônia na seca passava de
+        # 1 GB de memória e derrubava o app. lat/lon vêm dos atributos
+        # longitude/latitude, então não precisa da geometria.
+        # Até 3 tentativas: o servidor do INPE às vezes devolve uma resposta que não
+        # é o CSV (medido). Antes isso virava "0 focos nesse bloco" em silêncio, o
+        # que subestimaria a contagem — agora a falha definitiva é contada e avisada.
         for tentativa in range(3):
             try:
                 r = session.get(
                     url,
                     params={
                         "service": "WFS", "version": "1.0.0", "request": "GetFeature",
-                        "typeName": "bdqueimadas:focos", "outputFormat": "application/json",
-                        # NÃO usar propertyName aqui: restringir as colunas faz o WFS
-                        # devolver as feições SEM a geometria, e esta função existe
-                        # justamente para obter lat/lon. (A função irmã
-                        # buscar_historico_focos_diario pode usar propertyName porque
-                        # só lê propriedades, nunca a geometria.)
+                        "typeName": "bdqueimadas:focos", "outputFormat": "csv",
+                        "propertyName": "longitude,latitude,data_hora_gmt,municipio",
                         "CQL_FILTER": cql, "maxFeatures": 50000
                     },
                     headers=headers, verify=False, timeout=90
                 )
-                if r.status_code == 200:
-                    dados = r.json()
-                    registros_bloco = []
-                    for f in dados.get("features") or []:
-                        geom = f.get("geometry") or {}
-                        coords = geom.get("coordinates")
-                        props = f.get("properties") or {}
-                        data_bruta = props.get("data_hora_gmt")
-                        if not coords or not data_bruta:
-                            continue
-                        registros_bloco.append({
-                            "lon": coords[0],
-                            "lat": coords[1],
-                            "data": str(data_bruta)[:10],
-                            "municipio": props.get("municipio", "?"),
-                        })
-                    return registros_bloco, True
+                if r.status_code == 200 and "csv" in r.headers.get("content-type", ""):
+                    bloco_df = pd.read_csv(
+                        io.BytesIO(r.content),
+                        usecols=["longitude", "latitude", "data_hora_gmt", "municipio"],
+                    ).dropna(subset=["longitude", "latitude", "data_hora_gmt"])
+                    bloco_df = pd.DataFrame({
+                        "lon": bloco_df["longitude"].astype("float32"),
+                        "lat": bloco_df["latitude"].astype("float32"),
+                        "data": bloco_df["data_hora_gmt"].astype(str).str[:10],
+                        "municipio": bloco_df["municipio"].fillna("?"),
+                    })
+                    return bloco_df, True
             except Exception:
                 pass
             time.sleep(1.5 * (tentativa + 1))
-        return [], False
+        return None, False
 
-    registros = []
+    partes = []
     blocos_falhos = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        for bloco_registros, ok in executor.map(_buscar_bloco, blocos):
-            registros.extend(bloco_registros)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        for bloco_df, ok in executor.map(_buscar_bloco, blocos):
+            if bloco_df is not None and not bloco_df.empty:
+                partes.append(bloco_df)
             if not ok:
                 blocos_falhos += 1
 
-    if not registros:
+    if not partes:
         df = pd.DataFrame(columns=["lat", "lon", "data", "municipio"])
     else:
-        df = pd.DataFrame(registros)
+        df = pd.concat(partes, ignore_index=True)
         df["data"] = pd.to_datetime(df["data"])
     df.attrs["blocos_falhos"] = blocos_falhos
     df.attrs["blocos_total"] = len(blocos)
