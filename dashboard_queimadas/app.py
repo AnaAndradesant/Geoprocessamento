@@ -62,6 +62,158 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# =====================================================================
+# PADRÃO DE FORMATAÇÃO DO BUSINESS CASE (Manual USP/Esalq, itens 17.1 a 17.2)
+# Arial, texto preto e justificado; gráficos sem título, grade, borda ou
+# preenchimento; eixos em linha preta sólida; legenda abaixo da figura e
+# título acima da tabela, sempre com numeração sequencial e Fonte.
+# =====================================================================
+import plotly.io as pio
+
+pio.templates["business_case"] = go.layout.Template(
+    layout=dict(
+        font=dict(family="Arial", size=11, color="black"),
+        title=dict(text=""),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        margin=dict(t=20, r=20),
+        xaxis=dict(showgrid=False, zeroline=False, showline=True,
+                   linecolor="black", linewidth=1.5, mirror=False,
+                   title=dict(font=dict(family="Arial", size=11, color="black"))),
+        yaxis=dict(showgrid=False, zeroline=False, showline=True,
+                   linecolor="black", linewidth=1.5, mirror=False,
+                   title=dict(font=dict(family="Arial", size=11, color="black"))),
+    )
+)
+pio.templates.default = "plotly+business_case"
+
+st.markdown("""
+<style>
+html, body, [class*="css"], .stMarkdown, .stDataFrame, .stCaption {
+    font-family: Arial, Helvetica, sans-serif !important;
+}
+.stMarkdown p, .stMarkdown li { text-align: justify; }
+.bc-legenda { font-family: Arial, sans-serif; font-size: 11pt; text-align: justify;
+              margin: 2px 0 14px 0; line-height: 1.2; }
+.bc-titulo-tabela { font-family: Arial, sans-serif; font-size: 11pt; text-align: justify;
+                    margin: 14px 0 2px 0; line-height: 1.2; }
+</style>
+""", unsafe_allow_html=True)
+
+# Numeração pela ordem da primeira exibição; o registro por texto mantém o número
+# estável quando só um fragmento (aba CAR/UC) reexecuta.
+def _numero(chave, texto):
+    reg = st.session_state.setdefault(chave, {})
+    if texto not in reg:
+        reg[texto] = len(reg) + 1
+    return reg[texto]
+
+
+def figura(fig, legenda, fonte="Resultados originais do estudo", nota=None, key=None):
+    """Exibe gráfico Plotly com 'Figura N. legenda' e 'Fonte:' abaixo (sem ponto final)."""
+    n = _numero("_reg_fig", legenda)
+    fig.update_layout(title_text="")
+    st.plotly_chart(fig, use_container_width=True, key=key)
+    html = f"<div class='bc-legenda'>Figura {n}. {legenda}<br>Fonte: {fonte}"
+    if nota:
+        html += f"<br>Nota: {nota}"
+    st.markdown(html + "</div>", unsafe_allow_html=True)
+
+
+def tabela_bc(titulo, df, fonte="Resultados originais do estudo", nota=None, **kwargs):
+    """Exibe DataFrame com 'Tabela N. título' acima e 'Fonte:' abaixo."""
+    n = _numero("_reg_tab", titulo)
+    st.markdown(f"<div class='bc-titulo-tabela'>Tabela {n}. {titulo}</div>", unsafe_allow_html=True)
+    st.dataframe(df, **kwargs)
+    html = f"<div class='bc-legenda'>Fonte: {fonte}"
+    if nota:
+        html += f"<br>Nota: {nota}"
+    st.markdown(html + "</div>", unsafe_allow_html=True)
+
+
+def renderizar_business_case():
+    """Texto do Business Case (Template Algoritmos, MBA DSIA USP/Esalq): seções sem numeração,
+    títulos em negrito, texto justificado. Resultados numéricos ficam nas abas analíticas."""
+    st.markdown("**Considerações Iniciais**")
+    st.markdown(
+        "Os incêndios em vegetação são um dos principais vetores de risco socioambiental no Brasil, "
+        "com efeitos sobre a biodiversidade, as emissões de gases de efeito estufa, a saúde pública e a "
+        "atividade econômica. Esse risco interessa a órgãos ambientais, seguradoras e instituições "
+        "financeiras que precisam priorizar áreas de monitoramento e precificar a exposição de propriedades "
+        "rurais (Temática 6.5, Modelos de Risco Social e Ambiental)."
+    )
+    st.markdown(
+        "O objetivo deste Business Case é estimar, para municípios brasileiros, a probabilidade de ocorrência de "
+        "fogo e o impacto econômico da área queimada, por meio de um modelo preditivo supervisionado "
+        "validado no tempo e no espaço, integrado a um painel interativo de monitoramento."
+    )
+    st.markdown(
+        "Finalidade dos algoritmos: classificação supervisionada (regressão logística, Random Forest e "
+        "LightGBM, com seleção automática pelo melhor desempenho na validação cruzada) e previsão de séries "
+        "temporais (SARIMA sazonal) sobre o histórico mensal de área queimada. Limitações: o MODIS "
+        "tem resolução de aproximadamente 1 km; os focos do INPE incluem falsos positivos; e imagens "
+        "Sentinel-2 sofrem influência de nuvens."
+    )
+
+    st.markdown("**Implementação de Algoritmo(s) de Machine Learning**")
+    st.markdown(
+        "Dados: focos de calor do INPE (BDQueimadas), área queimada MODIS MCD64A1 e imagens Sentinel-2 "
+        "(Google Earth Engine), clima diário do NASA POWER, limites territoriais do pacote geobr, "
+        "propriedades rurais do SICAR e áreas protegidas (unidades de conservação e terras indígenas). "
+        "Todos são dados secundários de acesso público."
+    )
+    st.markdown(
+        "Etapas: (i) coleta e depuração dos dados por região e período; (ii) construção de variáveis "
+        "(clima, NDVI, histórico de focos); (iii) amostragem caso-controle, com focos reais do INPE confirmados "
+        "pelo dNBR como casos positivos; (iv) validação com divisão temporal progressiva e validação espacial "
+        "por município (GroupKFold); (v) comparação dos algoritmos e seleção do vencedor; (vi) mapa de risco e "
+        "ranking de municípios. O código-fonte comentado está no arquivo app.py e as métricas, a matriz de "
+        "confusão e a calibração estão na aba Risco Preditivo (ML)."
+    )
+    st.markdown(
+        "Severidade: NBR = (B8 − B12) / (B8 + B12) e dNBR = (NBR pré-fogo − NBR pós-fogo) × 1000, "
+        "com janelas de 90 dias antes e 60 dias depois do evento. Impacto econômico: área queimada "
+        "(MODIS) × valor de serviços ecossistêmicos por bioma (cenários conservador, moderado e otimista) "
+        "mais carbono liberado × preço da tonelada de CO₂ equivalente, convertido para reais pela cotação do dia."
+    )
+
+    st.markdown("**Discussão dos Resultados**")
+    st.markdown(
+        "Os resultados do recorte selecionado aparecem nas abas analíticas, com figuras e tabelas numeradas. "
+        "Para a interpretação do modelo, considere o AUC-ROC temporal e o espacial, a comparação com o "
+        "modelo de referência (baseline) e a curva de calibração. O AUC espacial é a medida mais rígida, "
+        "pois testa municípios que o modelo nunca viu no treino. A estimativa econômica varia conforme o "
+        "cenário e deve ser lida como ordem de grandeza, e não como valor contábil."
+    )
+
+    st.markdown("**Considerações Finais**")
+    st.markdown(
+        "O painel integra monitoramento (onde está queimando), diagnóstico (quão grave e quão recorrente) e "
+        "previsão (onde há maior risco), conectando a análise ambiental à tomada de decisão de priorização de "
+        "combate e de precificação de risco. Como próximos passos, recomenda-se incorporar o fenômeno "
+        "El Niño (índice ONI) como variável explicativa, calibrar os custos de combate com dados "
+        "oficiais por bioma e validar o modelo com ocorrências de anos posteriores ao período de treino."
+    )
+
+    st.markdown("**Referências**")
+    st.markdown(
+        "<div style='text-align:left; font-size:11pt'>"
+        "GIGLIO, L. et al. The Collection 6 MODIS burned area mapping algorithm and product. "
+        "<i>Remote Sensing of Environment</i>, v. 217, p. 72-85, 2018.<br><br>"
+        "KEY, C. H.; BENSON, N. C. Landscape assessment: ground measure of severity, the Composite Burn Index; "
+        "and remote sensing of severity, the Normalized Burn Ratio. In: LUTES, D. C. et al. <i>FIREMON: Fire "
+        "effects monitoring and inventory system</i>. Ogden: USDA Forest Service, 2006.<br><br>"
+        "KE, G. et al. LightGBM: a highly efficient gradient boosting decision tree. In: ADVANCES IN NEURAL "
+        "INFORMATION PROCESSING SYSTEMS, 30., 2017, Long Beach. <i>Proceedings</i>. 2017.<br><br>"
+        "PEDREGOSA, F. et al. Scikit-learn: machine learning in Python. <i>Journal of Machine Learning "
+        "Research</i>, v. 12, p. 2825-2830, 2011.<br><br>"
+        "COSTANZA, R. et al. Changes in the global value of ecosystem services. <i>Global Environmental "
+        "Change</i>, v. 26, p. 152-158, 2014.<br><br>"
+        "INSTITUTO NACIONAL DE PESQUISAS ESPACIAIS. <i>BDQueimadas</i>: programa queimadas. São José dos "
+        "Campos: INPE. Disponível em: https://terrabrasilis.dpi.inpe.br/queimadas/bdqueimadas/."
+        "</div>", unsafe_allow_html=True
+    )
+
 # ==========================================
 # 🛠️ KEEP-ALIVE E ESTADO
 if 'last_heartbeat' not in st.session_state:
@@ -2507,16 +2659,16 @@ if st.session_state.gerar_dashboard:
                     "Nº de Focos" if "INPE" in fonte_escolhida else "Área Afetada (km²)"
                 )
                 fig_areas.update_layout(
-                    template='plotly_dark',
+                    
                     xaxis_title=nome_eixo_x,
                     yaxis={'categoryorder': 'total ascending'},
                     height=350, margin=dict(t=40, b=20),
                     coloraxis_showscale=False
                 )
-                st.plotly_chart(fig_areas, use_container_width=True)
+                figura(fig_areas, "Áreas com maior número de focos de calor no recorte analisado", "INPE (BDQueimadas)")
             with col_alerta2:
                 st.markdown("**Lista Completa de Áreas Afetadas**")
-                st.dataframe(
+                tabela_bc("Áreas afetadas por focos de calor, em ordem decrescente", 
                     df_ranking_areas, hide_index=True,
                     height=350, use_container_width=True
                 )
@@ -2530,7 +2682,7 @@ if st.session_state.gerar_dashboard:
         # =============================================================
         # --- ABAS PRINCIPAIS ---
         # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_car, aba_uc, aba_export, aba_risco = st.tabs([
+        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_car, aba_uc, aba_export, aba_risco, aba_bc = st.tabs([
             "🗺️ Mapa de Focos",
             "📈 Gráficos & Anomalia",
             "🔬 Severidade (NBR Sentinel-2)",
@@ -2538,8 +2690,12 @@ if st.session_state.gerar_dashboard:
             "🏡 Propriedades Rurais (CAR)",
             "🌿 Unidades de Conservação",
             "⬇️ Exportar Dados",
-            "🎯 Risco Preditivo (ML)"
+            "🎯 Risco Preditivo (ML)",
+            "📘 Business Case"
         ])
+
+        with aba_bc:
+            renderizar_business_case()
 
         # ----------------------------------------------------------
         # ABA 1 — MAPA
@@ -2745,11 +2901,11 @@ if st.session_state.gerar_dashboard:
                 fig_line = px.line(df_g, x=data_col, y='focos', markers=True, height=350)
                 fig_line.update_traces(line_color='#e64a19', line_width=3)
                 fig_line.update_layout(
-                    template='plotly_dark',
+                    
                     xaxis_title="Tempo", yaxis_title="Nº de Focos",
                     margin=dict(t=20, b=20)
                 )
-                st.plotly_chart(fig_line, use_container_width=True)
+                figura(fig_line, "Evolução temporal do número de focos de calor", "INPE (BDQueimadas)")
 
                 if 'municipio' in df_rec.columns and tipo_analise != "Por Município":
                     df_top_mun = df_rec['municipio'].value_counts().reset_index()
@@ -2763,12 +2919,12 @@ if st.session_state.gerar_dashboard:
                         color_continuous_scale=px.colors.sequential.Reds
                     )
                     fig_bar.update_layout(
-                        template='plotly_dark',
+                        
                         yaxis={'categoryorder': 'total ascending'},
                         height=320, margin=dict(t=20, b=20),
                         coloraxis_showscale=False
                     )
-                    st.plotly_chart(fig_bar, use_container_width=True)
+                    figura(fig_bar, "Municípios com maior número de focos de calor", "INPE (BDQueimadas)")
 
             else:
                 # --- Calcula serie temporal e ranking de municipios aqui (sob demanda) ---
@@ -2840,11 +2996,11 @@ if st.session_state.gerar_dashboard:
                     )
                     fig_line.update_traces(line_color='#e64a19', line_width=3)
                     fig_line.update_layout(
-                        template='plotly_dark',
+                        
                         xaxis_title="Mês", yaxis_title="Área Afetada (km²)",
                         margin=dict(t=20, b=20)
                     )
-                    st.plotly_chart(fig_line, use_container_width=True)
+                    figura(fig_line, "Evolução mensal da área afetada pelo fogo (km²)", "MODIS MCD64A1 (NASA)")
 
                 if tipo_analise != "Por Município" and not df_top_mun_modis.empty:
                     st.subheader("🏆 Top 5 Municípios Afetados")
@@ -2854,13 +3010,13 @@ if st.session_state.gerar_dashboard:
                         color_continuous_scale=px.colors.sequential.Reds
                     )
                     fig_bar.update_layout(
-                        template='plotly_dark',
+                        
                         xaxis_title="Área Afetada (km²)",
                         yaxis={'categoryorder': 'total ascending'},
                         height=350, margin=dict(t=20, b=20),
                         coloraxis_showscale=False
                     )
-                    st.plotly_chart(fig_bar, use_container_width=True)
+                    figura(fig_bar, "Cinco municípios com maior área afetada pelo fogo (km²)", "MODIS MCD64A1 (NASA)")
 
                 # --- ANOMALIA HISTÓRICA ---
                 if not df_modis_temporal.empty and ano_modis > 2001:
@@ -2991,10 +3147,10 @@ if st.session_state.gerar_dashboard:
                             annotation_text="Faixa normal (±20%)",
                             annotation_position="top right",
                             annotation_font_size=11,
-                            annotation_font_color='rgba(255,255,255,0.4)',
+                            annotation_font_color='black',
                         )
                         fig_anom.update_layout(
-                            template='plotly_dark',
+                            
                             title=dict(
                                 text=f"Desvio de {ano_modis} em relação à média histórica (%) — por mês",
                                 font_size=14
@@ -3006,7 +3162,7 @@ if st.session_state.gerar_dashboard:
                             showlegend=False,
                             yaxis=dict(zeroline=False),
                         )
-                        st.plotly_chart(fig_anom, use_container_width=True)
+                        figura(fig_anom, "Desvio do ano analisado em relação à média histórica de área queimada (%)", "MODIS MCD64A1 (NASA)")
 
                         # Legenda de cores simples
                         st.markdown("""
@@ -3317,10 +3473,10 @@ if st.session_state.gerar_dashboard:
                             color='Classe', color_discrete_map=cores_sev, hole=0.45
                         )
                         fig_pizza.update_layout(
-                            template='plotly_dark',
+                            
                             height=280, margin=dict(t=10, b=10)
                         )
-                        st.plotly_chart(fig_pizza, use_container_width=True)
+                        figura(fig_pizza, "Distribuição da área queimada por classe de severidade (dNBR)", "Sentinel-2 (Copernicus)")
 
                         # Gráfico de barras
                         fig_bar_sev = px.bar(
@@ -3329,11 +3485,11 @@ if st.session_state.gerar_dashboard:
                             text='Área (km²)'
                         )
                         fig_bar_sev.update_layout(
-                            template='plotly_dark', showlegend=False,
+                            showlegend=False,
                             yaxis={'categoryorder': 'total ascending'},
                             height=260, margin=dict(t=10, b=10)
                         )
-                        st.plotly_chart(fig_bar_sev, use_container_width=True)
+                        figura(fig_bar_sev, "Área queimada por classe de severidade (dNBR)", "Sentinel-2 (Copernicus)")
 
                         # Métricas de destaque
                         area_alta = (
@@ -3529,13 +3685,13 @@ if st.session_state.gerar_dashboard:
                     textposition="inside",
                 )
                 fig_cen.update_layout(
-                    barmode="stack", template="plotly_dark", height=360,
+                    barmode="stack", height=360,
                     yaxis_title="R$ Bilhões",
                     legend=dict(orientation="h", yanchor="bottom", y=1.02),
                     margin=dict(t=40, b=20),
                 )
-                st.plotly_chart(fig_cen, use_container_width=True)
-                st.dataframe(
+                figura(fig_cen, "Cenários de impacto econômico do fogo (R$ bilhões)", "Resultados originais do estudo, com base em TNC Brasil")
+                tabela_bc("Cenários de impacto econômico do fogo", 
                     df_cen.rename(columns={"Total (R$ bi)": "💰 Total (R$ bi)"}),
                     hide_index=True, use_container_width=True
                 )
@@ -3785,14 +3941,14 @@ ser gerados por essa floresta perdida.
                                 labels={"n_focos": "Nº de focos", "cod_imovel": "Imóvel (CAR)"},
                             )
                             fig_car.update_layout(
-                                template="plotly_dark",
+                                
                                 yaxis={'categoryorder': 'total ascending'},
                                 height=380, margin=dict(t=20, b=20),
                                 coloraxis_showscale=False,
                             )
-                            st.plotly_chart(fig_car, use_container_width=True)
+                            figura(fig_car, "Imóveis rurais (CAR) com maior número de focos de calor", "SICAR; INPE (BDQueimadas)")
 
-                            st.dataframe(
+                            tabela_bc("Imóveis rurais (CAR) com focos de calor", 
                                 contagem.rename(columns={
                                     "cod_imovel": "Imóvel (CAR)", "n_focos": "Focos",
                                     "municipio": "Município", "area_ha": "Área do imóvel (ha)",
@@ -4073,8 +4229,8 @@ ser gerados por essa floresta perdida.
                     st.markdown("**📅 Focos por ano (janelas de 12 meses)**")
                     fig_jan = px.bar(df_jan, x="Período", y="Focos", text="Focos")
                     fig_jan.update_traces(marker_color="#e67e22")
-                    fig_jan.update_layout(template="plotly_dark", height=340, margin=dict(t=20, b=20))
-                    st.plotly_chart(fig_jan, use_container_width=True)
+                    fig_jan.update_layout(height=340, margin=dict(t=20, b=20))
+                    figura(fig_jan, "Focos de calor por ano em unidades de conservação", "INPE (BDQueimadas)")
                 with col_g2:
                     st.markdown("**🗓️ Em que mês o fogo se concentra**")
                     fig_mes = px.bar(
@@ -4082,9 +4238,9 @@ ser gerados por essa floresta perdida.
                         color_discrete_map={"Mês de pico": "#c0392b", "Demais meses": "#7f8c8d"},
                     )
                     fig_mes.update_layout(
-                        template="plotly_dark", height=340, margin=dict(t=20, b=20), showlegend=False,
+                        height=340, margin=dict(t=20, b=20), showlegend=False,
                     )
-                    st.plotly_chart(fig_mes, use_container_width=True)
+                    figura(fig_mes, "Concentração mensal dos focos de calor em unidades de conservação", "INPE (BDQueimadas)")
                 st.info(
                     f"🔥 O mês de pico é **{MESES_PT[mes_top - 1]}**, com "
                     f"**{por_mes[mes_top] / por_mes.sum() * 100:.0f}%** dos focos dentro das áreas protegidas."
@@ -4103,11 +4259,11 @@ ser gerados por essa floresta perdida.
                         labels={"focos": "Focos", "nome_area": "", "recorrencia": "Recorrência"},
                     )
                     fig_rank.update_layout(
-                        template="plotly_dark", height=460, margin=dict(t=20, b=20),
+                        height=460, margin=dict(t=20, b=20),
                         yaxis={"categoryorder": "total ascending"},
                         legend=dict(orientation="h", yanchor="bottom", y=1.02),
                     )
-                    st.plotly_chart(fig_rank, use_container_width=True)
+                    figura(fig_rank, "Unidades de conservação com maior número de focos de calor", "INPE (BDQueimadas)")
                 with col_r2:
                     st.markdown("**🔥 Mês de pico de cada uma (focos por mês)**")
                     mapa_calor = (
@@ -4122,8 +4278,8 @@ ser gerados por essa floresta perdida.
                         mapa_calor, aspect="auto", color_continuous_scale="YlOrRd",
                         labels={"color": "Focos"},
                     )
-                    fig_calor.update_layout(template="plotly_dark", height=460, margin=dict(t=20, b=20))
-                    st.plotly_chart(fig_calor, use_container_width=True)
+                    fig_calor.update_layout(height=460, margin=dict(t=20, b=20))
+                    figura(fig_calor, "Mês de pico de focos de calor em cada unidade de conservação", "INPE (BDQueimadas)")
 
                 # --- Recorrência --------------------------------------------------
                 st.markdown("---")
@@ -4142,7 +4298,7 @@ ser gerados por essa floresta perdida.
                     "pct_reincidente": "Locais reincidentes (%)", "recorrencia": "Recorrência",
                 })
                 tabela["Locais reincidentes (%)"] = tabela["Locais reincidentes (%)"].round(1)
-                st.dataframe(tabela, hide_index=True, height=380, use_container_width=True)
+                tabela_bc("Recorrência do fogo por unidade de conservação", tabela, hide_index=True, height=380, use_container_width=True)
                 st.download_button(
                     "📄 Baixar CSV — Recorrência por área", data=tabela.to_csv(index=False).encode("utf-8-sig"),
                     file_name=f"uc_recorrencia_{val_sel}_{hoje.strftime('%Y%m%d')}.csv", mime="text/csv",
@@ -4169,16 +4325,16 @@ ser gerados por essa floresta perdida.
                 with col_d1:
                     fig_da = px.bar(x=MESES_PT, y=mes_a.to_numpy(), labels={"x": "Mês", "y": "Focos"})
                     fig_da.update_traces(marker_color="#c0392b")
-                    fig_da.update_layout(template="plotly_dark", height=280, margin=dict(t=10, b=10))
-                    st.plotly_chart(fig_da, use_container_width=True)
+                    fig_da.update_layout(height=280, margin=dict(t=10, b=10))
+                    figura(fig_da, "Focos de calor por mês na primeira área comparada", "INPE (BDQueimadas)")
                 with col_d2:
                     fig_db = px.bar(
                         x=[rotulos_jan[j] for j in range(n_jan)][::-1], y=jan_a.to_numpy()[::-1],
                         labels={"x": "Período", "y": "Focos"},
                     )
                     fig_db.update_traces(marker_color="#e67e22")
-                    fig_db.update_layout(template="plotly_dark", height=280, margin=dict(t=10, b=10))
-                    st.plotly_chart(fig_db, use_container_width=True)
+                    fig_db.update_layout(height=280, margin=dict(t=10, b=10))
+                    figura(fig_db, "Focos de calor por período na segunda área comparada", "INPE (BDQueimadas)")
 
                 # --- Mapa ---------------------------------------------------------
                 st.markdown("---")
@@ -4676,13 +4832,13 @@ ser gerados por essa floresta perdida.
                                     marker=dict(size=10),
                                 ))
                                 fig_sens.update_layout(
-                                    template="plotly_dark", height=380,
+                                    height=380,
                                     xaxis_title=rotulo_eixo,
                                     yaxis_title="AUC-ROC (validação temporal)",
                                     yaxis=dict(range=[0.4, 1.0]),
                                     margin=dict(t=30, b=20),
                                 )
-                                st.plotly_chart(fig_sens, use_container_width=True)
+                                figura(fig_sens, "Sensibilidade da validação temporal (AUC-ROC) ao parâmetro avaliado", "Resultados originais do estudo")
 
                                 ganho_final = (
                                     df_sens["auc_medio"].iloc[-1] - df_sens["auc_medio"].iloc[-2]
@@ -4700,7 +4856,7 @@ ser gerados por essa floresta perdida.
                                         f"testados (variação de {ganho_final:+.3f}) — considere usar "
                                         "uma amostra maior se o tempo de execução permitir."
                                     )
-                                st.dataframe(
+                                tabela_bc("Sensibilidade da validação temporal ao tamanho da amostra", 
                                     df_sens.rename(columns={
                                         "tamanho": rotulo_eixo,
                                         "auc_medio": "AUC médio",
@@ -4913,7 +5069,7 @@ ser gerados por essa floresta perdida.
                                 "que vem depois, em vários cortes). Espacial = o modelo generaliza pra um "
                                 "município nunca visto no treino — a métrica mais rígida das duas."
                             )
-                            st.dataframe(df_cv_comp, hide_index=True, use_container_width=True)
+                            tabela_bc("Desempenho dos algoritmos por validação cruzada temporal e espacial", df_cv_comp, hide_index=True, use_container_width=True)
                             st.caption(f"⭐ = algoritmo escolhido para o mapa ({resultado['criterio_selecao']}).")
 
                             # Leitura automática em linguagem simples do AUC do vencedor --
@@ -5051,7 +5207,7 @@ ser gerados por essa floresta perdida.
 
                             # ---- Ranking dos municípios em maior risco ----
                             st.markdown("**🔥 Municípios com maior risco na região:**")
-                            st.dataframe(
+                            tabela_bc("Municípios com maior risco previsto de fogo", 
                                 df_res.sort_values("probabilidade", ascending=False)
                                       .head(10)[["name_muni", "probabilidade_fmt", "nivel"]]
                                       .rename(columns={"name_muni": "Município", "probabilidade_fmt": "Probabilidade", "nivel": "Nível"}),
@@ -5085,13 +5241,13 @@ ser gerados por essa floresta perdida.
                                 color_continuous_scale=["#2ecc71", "#f1c40f", "#e74c3c"],
                             )
                             fig_contrib.update_layout(
-                                template="plotly_dark", height=380,
+                                height=380,
                                 yaxis={'categoryorder': 'total ascending'},
                                 coloraxis_showscale=False,
                                 xaxis_title="Contribuição (+ aumenta risco / - reduz risco)",
                                 yaxis_title=""
                             )
-                            st.plotly_chart(fig_contrib, use_container_width=True)
+                            figura(fig_contrib, "Contribuição das variáveis para o risco previsto do município de maior risco", "Resultados originais do estudo")
 
                             # ---- Painel de Transparência do Modelo ----
                             st.markdown("---")
@@ -5149,8 +5305,8 @@ ser gerados por essa floresta perdida.
                                         y=["Real: Sem ocorrência", "Real: Com ocorrência"],
                                         color_continuous_scale="Reds",
                                     )
-                                    fig_cm.update_layout(template="plotly_dark", height=380, coloraxis_showscale=False)
-                                    st.plotly_chart(fig_cm, use_container_width=True)
+                                    fig_cm.update_layout(height=380, coloraxis_showscale=False)
+                                    figura(fig_cm, "Matriz de confusão do modelo de risco preditivo", "Resultados originais do estudo")
                                     st.caption(
                                         "Diagonal principal = acertos. Fora da diagonal = erros do modelo "
                                         "(falso positivo: alarme sem ocorrência real / falso negativo: "
@@ -5173,12 +5329,12 @@ ser gerados por essa floresta perdida.
                                             line=dict(color="#e74c3c", width=3), marker=dict(size=9)
                                         ))
                                         fig_calib.update_layout(
-                                            template="plotly_dark", height=380,
+                                            height=380,
                                             xaxis_title="Probabilidade prevista (média por faixa)",
                                             yaxis_title="Frequência real de ocorrência",
                                             legend=dict(orientation="h", yanchor="bottom", y=1.02),
                                         )
-                                        st.plotly_chart(fig_calib, use_container_width=True)
+                                        figura(fig_calib, "Curva de calibração do modelo de risco preditivo", "Resultados originais do estudo")
                                         st.caption(
                                             "Quanto mais perto da linha tracejada, mais confiável é a "
                                             "probabilidade — ou seja, quando o modelo diz '70% de risco', "
@@ -5205,11 +5361,11 @@ ser gerados por essa floresta perdida.
                                                       y=df_comp["Baseline ingênuo (focos nos últimos 7 dias)"],
                                                       marker_color="#7f8c8d")
                                     fig_comp.update_layout(
-                                        barmode="group", template="plotly_dark", height=360,
+                                        barmode="group", height=360,
                                         yaxis_tickformat=".0%",
                                         legend=dict(orientation="h", yanchor="bottom", y=1.02),
                                     )
-                                    st.plotly_chart(fig_comp, use_container_width=True)
+                                    figura(fig_comp, "Comparação do desempenho entre os algoritmos testados", "Resultados originais do estudo")
                                     st.caption(
                                         "**Baseline ingênuo:** marca risco alto se o município teve pelo menos "
                                         "1 dia com ocorrência nos 7 dias anteriores — sem clima, sem ML, só "
