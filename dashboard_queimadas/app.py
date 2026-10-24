@@ -399,18 +399,20 @@ def buscar_cotacao_dolar():
 def _cidades_cache(uf):
     # Só lista válida entra no cache: falha levanta exceção e não fica gravada
     # por 24 h (antes um timeout isolado deixava "Erro ao carregar cidades" fixo).
+    # Fonte principal: geobr (mesma base usada para desenhar o limite do município).
+    # A API do IBGE pode não responder a partir do Streamlit Cloud, então fica só
+    # como plano B, com uma tentativa curta para não travar a barra lateral.
+    try:
+        gdf = read_municipality(code_muni=uf, year=2020)
+        nomes = sorted(gdf["name_muni"].dropna().unique().tolist())
+        if nomes:
+            return nomes
+    except Exception:
+        pass
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
-    for tentativa in range(3):
-        try:
-            resp = requests.get(url, timeout=15)
-            if resp.status_code == 200 and resp.json():
-                return sorted(d['nome'] for d in resp.json())
-        except Exception:
-            pass
-        time.sleep(1 + tentativa)
-    # Plano B: nomes do próprio geobr (mesma base usada para desenhar o limite)
-    gdf = read_municipality(code_muni=uf, year=2020)
-    nomes = sorted(gdf["name_muni"].dropna().unique().tolist())
+    resp = requests.get(url, timeout=6)
+    resp.raise_for_status()
+    nomes = sorted(d['nome'] for d in resp.json())
     if not nomes:
         raise RuntimeError(f"Nenhum município encontrado para {uf}")
     return nomes
