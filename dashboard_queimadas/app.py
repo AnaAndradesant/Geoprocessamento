@@ -3416,12 +3416,20 @@ if st.session_state.gerar_dashboard:
                     if nbr_ok and dnbr_img is not None:
                         try:
                             centro_nbr = limite.geometry.unary_union.centroid
+                            # Fundo cinza claro (Esri) para não competir com as cores da
+                            # severidade; satélite fica como opção no controle de camadas.
                             m_nbr = folium.Map(
                                 location=[centro_nbr.y, centro_nbr.x],
-                                zoom_start=8,
-                                tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-                                attr='Google'
+                                zoom_start=8, tiles=None
                             )
+                            folium.TileLayer(
+                                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                                attr="Esri", name="Mapa claro",
+                            ).add_to(m_nbr)
+                            folium.TileLayer(
+                                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                                attr="Esri World Imagery", name="Satélite", show=False,
+                            ).add_to(m_nbr)
                             
                             folium.GeoJson(
                                 limite_mapa.__geo_interface__,
@@ -3443,6 +3451,11 @@ if st.session_state.gerar_dashboard:
                                 dnbr_img, vis_dnbr,
                                 'dNBR (severidade contínua)', opacity=0.85
                             )
+                            # Nomes de cidades e limites por cima da severidade
+                            folium.TileLayer(
+                                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
+                                attr="Esri Ref", overlay=True, control=False,
+                            ).add_to(m_nbr)
                             
                             legenda_html = """
                             <div style="position:fixed; bottom:28px; right:10px; z-index:9999;
@@ -3460,7 +3473,6 @@ if st.session_state.gerar_dashboard:
                             </div>"""
                             m_nbr.get_root().html.add_child(folium.Element(legenda_html))
                             
-                            _ocultar_url_base(m_nbr)
                             folium.LayerControl().add_to(m_nbr)
                             
                             _nbr_key = f"nbr_{val_sel}_{ano_modis}_{mes_modis}"
