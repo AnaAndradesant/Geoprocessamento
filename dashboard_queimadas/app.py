@@ -396,15 +396,31 @@ def buscar_cotacao_dolar():
     return 5.04  # fallback caso a API esteja indisponível
 
 @st.cache_data(ttl=86400, show_spinner=False, persist="disk")
-def buscar_cidades(uf):
+def _cidades_cache(uf):
+    # Só lista válida entra no cache: falha levanta exceção e não fica gravada
+    # por 24 h (antes um timeout isolado deixava "Erro ao carregar cidades" fixo).
     url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
+    for tentativa in range(3):
+        try:
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200 and resp.json():
+                return sorted(d['nome'] for d in resp.json())
+        except Exception:
+            pass
+        time.sleep(1 + tentativa)
+    # Plano B: nomes do próprio geobr (mesma base usada para desenhar o limite)
+    gdf = read_municipality(code_muni=uf, year=2020)
+    nomes = sorted(gdf["name_muni"].dropna().unique().tolist())
+    if not nomes:
+        raise RuntimeError(f"Nenhum município encontrado para {uf}")
+    return nomes
+
+
+def buscar_cidades(uf):
     try:
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            return sorted([d['nome'] for d in resp.json()])
-    except:
-        pass
-    return ["Erro ao carregar cidades"]
+        return _cidades_cache(uf)
+    except Exception:
+        return ["Erro ao carregar cidades"]
 
 @st.cache_data(show_spinner=False, persist="disk")
 def carregar_fronteira(tipo, estado, bioma, municipio):
