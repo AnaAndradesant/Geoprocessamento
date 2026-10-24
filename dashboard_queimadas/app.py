@@ -54,6 +54,14 @@ def add_ee_layer(self, ee_image_object, vis_params, name, opacity=1):
 # Adiciona o método à classe folium.Map para que ele possa ser chamado como m.add_ee_layer
 folium.Map.add_ee_layer = add_ee_layer
 
+
+def _ocultar_url_base(mapa):
+    # O mapa de fundo criado por folium.Map(tiles=URL) aparecia no controle de
+    # camadas com o próprio endereço da URL como nome; tira só ele do controle.
+    for filho in mapa._children.values():
+        if isinstance(filho, folium.raster_layers.TileLayer) and not filho.overlay:
+            filho.control = False
+
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
     page_title="Monitor de Queimadas Brasil",
@@ -2885,6 +2893,7 @@ if st.session_state.gerar_dashboard:
                 </div>"""
                 m.get_root().html.add_child(folium.Element(legenda_modis))
 
+            _ocultar_url_base(m)
             folium.LayerControl(collapsed=False).add_to(m)
 
             # Key dinâmico: muda junto com os dados, forçando re-render automático
@@ -3451,6 +3460,7 @@ if st.session_state.gerar_dashboard:
                             </div>"""
                             m_nbr.get_root().html.add_child(folium.Element(legenda_html))
                             
+                            _ocultar_url_base(m_nbr)
                             folium.LayerControl().add_to(m_nbr)
                             
                             _nbr_key = f"nbr_{val_sel}_{ano_modis}_{mes_modis}"
@@ -4078,6 +4088,7 @@ ser gerados por essa floresta perdida.
                                 m_car, pts_car, "Focos de calor", "cor", ["data_txt"], ["Data:"]
                             )
 
+                            _ocultar_url_base(m_car)
                             folium.LayerControl(collapsed=False).add_to(m_car)
                             _car_map_key = f"mapa_car_{_val_c}_{_uf_c}_{len(gdf_cruzamento)}"
                             st_folium(m_car, width=None, height=650, returned_objects=[], key=_car_map_key)
@@ -5220,6 +5231,7 @@ ser gerados por essa floresta perdida.
                             </div>
                             """
                             m_risco.get_root().html.add_child(folium.Element(legenda_risco))
+                            _ocultar_url_base(m_risco)
                             folium.LayerControl(collapsed=False).add_to(m_risco)
                             st_folium(m_risco, width=None, height=650, returned_objects=[], key="mapa_risco_ml")
 
