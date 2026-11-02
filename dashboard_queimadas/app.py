@@ -139,89 +139,6 @@ def tabela_bc(titulo, df, fonte="Resultados originais do estudo", nota=None, **k
     st.markdown(html + "</div>", unsafe_allow_html=True)
 
 
-def renderizar_business_case():
-    """Texto do Business Case (Template Algoritmos, MBA DSIA USP/Esalq): seções sem numeração,
-    títulos em negrito, texto justificado. Resultados numéricos ficam nas abas analíticas."""
-    st.markdown("**Considerações Iniciais**")
-    st.markdown(
-        "Os incêndios em vegetação são um dos principais vetores de risco socioambiental no Brasil, "
-        "com efeitos sobre a biodiversidade, as emissões de gases de efeito estufa, a saúde pública e a "
-        "atividade econômica. Esse risco interessa a órgãos ambientais, seguradoras e instituições "
-        "financeiras que precisam priorizar áreas de monitoramento e precificar a exposição de propriedades "
-        "rurais (Temática 6.5, Modelos de Risco Social e Ambiental)."
-    )
-    st.markdown(
-        "O objetivo deste Business Case é estimar, para municípios brasileiros, a probabilidade de ocorrência de "
-        "fogo e o impacto econômico da área queimada, por meio de um modelo preditivo supervisionado "
-        "validado no tempo e no espaço, integrado a um painel interativo de monitoramento."
-    )
-    st.markdown(
-        "Finalidade dos algoritmos: classificação supervisionada (regressão logística, Random Forest e "
-        "LightGBM, com seleção automática pelo melhor desempenho na validação cruzada) e previsão de séries "
-        "temporais (SARIMA sazonal) sobre o histórico mensal de área queimada. Limitações: o MODIS "
-        "tem resolução de aproximadamente 1 km; os focos do INPE incluem falsos positivos; e imagens "
-        "Sentinel-2 sofrem influência de nuvens."
-    )
-
-    st.markdown("**Implementação de Algoritmo(s) de Machine Learning**")
-    st.markdown(
-        "Dados: focos de calor do INPE (BDQueimadas), área queimada MODIS MCD64A1 e imagens Sentinel-2 "
-        "(Google Earth Engine), clima diário do NASA POWER, limites territoriais do pacote geobr, "
-        "propriedades rurais do SICAR e áreas protegidas (unidades de conservação e terras indígenas). "
-        "Todos são dados secundários de acesso público."
-    )
-    st.markdown(
-        "Etapas: (i) coleta e depuração dos dados por região e período; (ii) construção de variáveis "
-        "(clima, NDVI, histórico de focos); (iii) amostragem caso-controle, com focos reais do INPE confirmados "
-        "pelo dNBR como casos positivos; (iv) validação com divisão temporal progressiva e validação espacial "
-        "por município (GroupKFold); (v) comparação dos algoritmos e seleção do vencedor; (vi) mapa de risco e "
-        "ranking de municípios. O código-fonte comentado está no arquivo app.py e as métricas, a matriz de "
-        "confusão e a calibração estão na aba Risco Preditivo (ML)."
-    )
-    st.markdown(
-        "Severidade: NBR = (B8 − B12) / (B8 + B12) e dNBR = (NBR pré-fogo − NBR pós-fogo) × 1000, "
-        "com janelas de 90 dias antes e 60 dias depois do evento. Impacto econômico: área queimada "
-        "(MODIS) × valor de serviços ecossistêmicos por bioma (cenários conservador, moderado e otimista) "
-        "mais carbono liberado × preço da tonelada de CO₂ equivalente, convertido para reais pela cotação do dia."
-    )
-
-    st.markdown("**Discussão dos Resultados**")
-    st.markdown(
-        "Os resultados do recorte selecionado aparecem nas abas analíticas, com figuras e tabelas numeradas. "
-        "Para a interpretação do modelo, considere o AUC-ROC temporal e o espacial, a comparação com o "
-        "modelo de referência (baseline) e a curva de calibração. O AUC espacial é a medida mais rígida, "
-        "pois testa municípios que o modelo nunca viu no treino. A estimativa econômica varia conforme o "
-        "cenário e deve ser lida como ordem de grandeza, e não como valor contábil."
-    )
-
-    st.markdown("**Considerações Finais**")
-    st.markdown(
-        "O painel integra monitoramento (onde está queimando), diagnóstico (quão grave e quão recorrente) e "
-        "previsão (onde há maior risco), conectando a análise ambiental à tomada de decisão de priorização de "
-        "combate e de precificação de risco. Como próximos passos, recomenda-se incorporar o fenômeno "
-        "El Niño (índice ONI) como variável explicativa, calibrar os custos de combate com dados "
-        "oficiais por bioma e validar o modelo com ocorrências de anos posteriores ao período de treino."
-    )
-
-    st.markdown("**Referências**")
-    st.markdown(
-        "<div style='text-align:left; font-size:11pt'>"
-        "GIGLIO, L. et al. The Collection 6 MODIS burned area mapping algorithm and product. "
-        "<i>Remote Sensing of Environment</i>, v. 217, p. 72-85, 2018.<br><br>"
-        "KEY, C. H.; BENSON, N. C. Landscape assessment: ground measure of severity, the Composite Burn Index; "
-        "and remote sensing of severity, the Normalized Burn Ratio. In: LUTES, D. C. et al. <i>FIREMON: Fire "
-        "effects monitoring and inventory system</i>. Ogden: USDA Forest Service, 2006.<br><br>"
-        "KE, G. et al. LightGBM: a highly efficient gradient boosting decision tree. In: ADVANCES IN NEURAL "
-        "INFORMATION PROCESSING SYSTEMS, 30., 2017, Long Beach. <i>Proceedings</i>. 2017.<br><br>"
-        "PEDREGOSA, F. et al. Scikit-learn: machine learning in Python. <i>Journal of Machine Learning "
-        "Research</i>, v. 12, p. 2825-2830, 2011.<br><br>"
-        "COSTANZA, R. et al. Changes in the global value of ecosystem services. <i>Global Environmental "
-        "Change</i>, v. 26, p. 152-158, 2014.<br><br>"
-        "INSTITUTO NACIONAL DE PESQUISAS ESPACIAIS. <i>BDQueimadas</i>: programa queimadas. São José dos "
-        "Campos: INPE. Disponível em: https://terrabrasilis.dpi.inpe.br/queimadas/bdqueimadas/."
-        "</div>", unsafe_allow_html=True
-    )
-
 # ==========================================
 # 🛠️ KEEP-ALIVE E ESTADO
 if 'last_heartbeat' not in st.session_state:
@@ -2708,7 +2625,7 @@ if st.session_state.gerar_dashboard:
         # =============================================================
         # --- ABAS PRINCIPAIS ---
         # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_car, aba_uc, aba_export, aba_risco, aba_bc = st.tabs([
+        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_car, aba_uc, aba_export, aba_risco = st.tabs([
             "🗺️ Mapa de Focos",
             "📈 Gráficos & Anomalia",
             "🔬 Severidade (NBR Sentinel-2)",
@@ -2716,12 +2633,8 @@ if st.session_state.gerar_dashboard:
             "🏡 Propriedades Rurais (CAR)",
             "🌿 Unidades de Conservação",
             "⬇️ Exportar Dados",
-            "🎯 Risco Preditivo (ML)",
-            "📘 Business Case"
+            "🎯 Risco Preditivo (ML)"
         ])
-
-        with aba_bc:
-            renderizar_business_case()
 
         # ----------------------------------------------------------
         # ABA 1 — MAPA
