@@ -2743,16 +2743,18 @@ if st.session_state.gerar_dashboard:
         # =============================================================
         # --- ABAS PRINCIPAIS ---
         # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_car, aba_uc, aba_export, aba_risco, aba_brigadas = st.tabs([
+        # Ordem de leitura: o que aconteceu -> quão grave -> risco e planejamento ->
+        # áreas protegidas -> custo -> propriedades -> exportar
+        aba_mapa, aba_graficos, aba_nbr, aba_risco, aba_brigadas, aba_uc, aba_impacto, aba_car, aba_export = st.tabs([
             "🗺️ Mapa de Focos",
             "📈 Gráficos & Anomalia",
             "🔬 Severidade (NBR Sentinel-2)",
+            "🎯 Risco Preditivo (ML)",
+            "🚒 Planejamento de Brigadas",
+            "🌿 Unidades de Conservação",
             "💰 Impacto Econômico",
             "🏡 Propriedades Rurais (CAR)",
-            "🌿 Unidades de Conservação",
-            "⬇️ Exportar Dados",
-            "🎯 Risco Preditivo (ML)",
-            "🚒 Planejamento de Brigadas"
+            "⬇️ Exportar Dados"
         ])
 
         # ----------------------------------------------------------
