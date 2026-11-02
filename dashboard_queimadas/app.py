@@ -2048,6 +2048,124 @@ def _resumo_por_area(pts, n_janelas):
     return resumo.sort_values("focos", ascending=False)
 
 
+# =====================================================================
+# CALENDÁRIO DO FOGO POR MUNICÍPIO (aba Planejamento de Brigadas)
+# Série histórica MODIS MCD64A1: área queimada por município e por mês.
+# =====================================================================
+
+@st.cache_data(ttl=2592000, show_spinner=False, persist="disk")
+def _modis_mensal_municipios_ano(fc_json_str, ano, escala):
+    """
+    Área queimada (km²) de cada município em cada mês de UM ano, numa única
+    consulta ao Earth Engine (imagem de 12 bandas, uma por mês, somada por
+    município com reduceRegions). Devolve só números, então pode ir para o
+    cache em disco: um ano já calculado não é refeito em consultas seguintes.
+    """
+    feats = json.loads(fc_json_str)["features"]
+    fc = ee.FeatureCollection([
+        ee.Feature(ee.Geometry(f["geometry"]), {"mid": f["properties"]["mid"]}) for f in feats
+    ])
+    col = ee.ImageCollection("MODIS/061/MCD64A1").filterDate(f"{ano}-01-01", f"{ano + 1}-01-01")
+    bandas = [f"m{m:02d}" for m in range(1, 13)]
+    meses = []
+    for m in range(1, 13):
+        burn = _burndate_seguro(col.filter(ee.Filter.calendarRange(m, m, "month"))).select("BurnDate")
+        meses.append(ee.Image.pixelArea().divide(1e6).updateMask(burn.gt(0)).rename(bandas[m - 1]))
+    img = ee.Image.cat(meses)
+    res = img.reduceRegions(collection=fc, reducer=ee.Reducer.sum(), scale=escala, tileScale=4)
+    res = res.select(["mid"] + bandas, None, False).getInfo()
+    linhas = []
+    for f in res["features"]:
+        p = f["properties"]
+        for m in range(1, 13):
+            linhas.append((int(p["mid"]), ano, m, float(p.get(bandas[m - 1]) or 0.0)))
+    return pd.DataFrame(linhas, columns=["mid", "ano", "mes", "area_km2"])
+
+
+def buscar_calendario_fogo(gdf_munis, anos, escala, progresso=None):
+    """
+    Junta a área queimada mensal de todos os anos pedidos. Cada ano é uma
+    consulta em cache próprio; até 4 anos em paralelo, com nova tentativa
+    quando o Earth Engine responde 'Too many concurrent aggregations' (429).
+    Devolve (DataFrame longo mid/ano/mes/area_km2, lista de anos que falharam).
+    """
+    g = gdf_munis[["geometry"]].copy()
+    g["mid"] = np.arange(len(g))
+    # Coordenadas com 3 casas (~100 m) para reduzir o tamanho do pedido ao EE
+    g["geometry"] = g.geometry.set_precision(0.001)
+    g = g[~g.geometry.is_empty]
+    fc_json_str = g.to_json()
+
+    def _um_ano(ano):
+        for tentativa in range(1, 5):
+            try:
+                return ano, _modis_mensal_municipios_ano(fc_json_str, ano, escala)
+            except Exception as e:
+                msg = str(e)
+                if ("Too many concurrent" in msg or "429" in msg) and tentativa < 4:
+                    time.sleep(2 ** tentativa)
+                    continue
+                return ano, None
+        return ano, None
+
+    partes, falhos = [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futuros = [executor.submit(_um_ano, a) for a in anos]
+        for i, fut in enumerate(concurrent.futures.as_completed(futuros), 1):
+            ano, df = fut.result()
+            if df is None:
+                falhos.append(ano)
+            else:
+                partes.append(df)
+            if progresso is not None:
+                progresso.progress(i / len(anos), text=f"Anos processados: {i} de {len(anos)}")
+    if not partes:
+        return pd.DataFrame(columns=["mid", "ano", "mes", "area_km2"]), sorted(falhos)
+    return pd.concat(partes, ignore_index=True), sorted(falhos)
+
+
+def janela_critica(perfil_12, fracao=0.8):
+    """
+    Menor sequência de meses CONSECUTIVOS (podendo virar o ano, ex.: Dez–Fev)
+    que concentra pelo menos `fracao` da área queimada média do ano.
+    Devolve (mes_inicio, mes_fim, fracao_concentrada), meses de 1 a 12,
+    ou (None, None, 0) se não houve fogo.
+    """
+    v = np.asarray(perfil_12, dtype=float)
+    total = v.sum()
+    if total <= 0:
+        return None, None, 0.0
+    v2 = np.concatenate([v, v])
+    for tamanho in range(1, 13):
+        somas = [v2[s:s + tamanho].sum() for s in range(12)]
+        s_best = int(np.argmax(somas))
+        if somas[s_best] >= fracao * total - 1e-9:
+            return s_best + 1, (s_best + tamanho - 1) % 12 + 1, somas[s_best] / total
+    return 1, 12, 1.0
+
+
+def resumo_calendario(df_longo, n_anos):
+    """
+    Por município (mid): área média anual, anos com fogo, mês de pico,
+    janela crítica (80% da área) e perfil médio mensal (km²/mês).
+    """
+    perfil = (
+        df_longo.groupby(["mid", "mes"])["area_km2"].sum().unstack(fill_value=0)
+        .reindex(columns=range(1, 13), fill_value=0) / n_anos
+    )
+    por_ano = df_longo.groupby(["mid", "ano"])["area_km2"].sum()
+    resumo = pd.DataFrame({
+        "media_anual_km2": perfil.sum(axis=1),
+        "anos_com_fogo": (por_ano > 0).groupby("mid").sum(),
+    })
+    resumo["mes_pico"] = perfil.idxmax(axis=1)
+    jan = [janela_critica(perfil.loc[i].to_numpy()) for i in perfil.index]
+    resumo["ini"] = [j[0] for j in jan]
+    resumo["fim"] = [j[1] for j in jan]
+    resumo["pct_janela"] = [j[2] * 100 for j in jan]
+    return resumo, perfil
+
+
 def _liberar_memoria():
     """
     Coleta o lixo e devolve ao sistema a memória que o Python já liberou. Sem o
@@ -2625,7 +2743,7 @@ if st.session_state.gerar_dashboard:
         # =============================================================
         # --- ABAS PRINCIPAIS ---
         # =============================================================
-        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_car, aba_uc, aba_export, aba_risco = st.tabs([
+        aba_mapa, aba_graficos, aba_nbr, aba_impacto, aba_car, aba_uc, aba_export, aba_risco, aba_brigadas = st.tabs([
             "🗺️ Mapa de Focos",
             "📈 Gráficos & Anomalia",
             "🔬 Severidade (NBR Sentinel-2)",
@@ -2633,7 +2751,8 @@ if st.session_state.gerar_dashboard:
             "🏡 Propriedades Rurais (CAR)",
             "🌿 Unidades de Conservação",
             "⬇️ Exportar Dados",
-            "🎯 Risco Preditivo (ML)"
+            "🎯 Risco Preditivo (ML)",
+            "🚒 Planejamento de Brigadas"
         ])
 
         # ----------------------------------------------------------
@@ -4372,6 +4491,185 @@ ser gerados por essa floresta perdida.
 
         with aba_uc:
             _aba_uc()
+
+        # ----------------------------------------------------------
+        # ABA — PLANEJAMENTO DE BRIGADAS (calendário do fogo)
+        # ----------------------------------------------------------
+        @st.fragment
+        def _aba_brigadas():
+            st.subheader("🚒 Planejamento de Brigadas — Calendário do Fogo")
+            st.caption(
+                "Para cada município da região selecionada: em que meses o fogo se concentra, "
+                "em quantos anos ele aparece e quanto queima em média. Base: série histórica de "
+                "área queimada MODIS (MCD64A1, NASA), disponível desde 2001."
+            )
+            # Último ano completo: o MODIS publica cada mês com ~2 a 3 meses de atraso
+            ultimo_ano = hoje.year - 1 if hoje.month >= 4 else hoje.year - 2
+            anos_br = st.select_slider(
+                "Período do histórico:", options=list(range(2001, ultimo_ano + 1)),
+                value=(ultimo_ano - 9, ultimo_ano), key="anos_brigadas",
+                help="Quanto mais anos, mais confiável o calendário. A primeira consulta de cada "
+                     "ano é feita no Earth Engine; depois fica guardada e sai na hora.",
+            )
+            anos_lista = list(range(anos_br[0], anos_br[1] + 1))
+            if tipo_analise == "Por Bioma":
+                st.warning(
+                    "⏱️ Bioma inteiro: centenas de municípios. A primeira consulta pode levar "
+                    "alguns minutos. Não feche a página."
+                )
+
+            _br_key = f"brig_res_{val_sel}"
+            _res = st.session_state.get(_br_key)
+            ja = isinstance(_res, dict)
+            mudou = ja and _res.get("anos") != anos_br
+
+            if (not ja) or mudou:
+                if st.button(
+                    "🔄 Atualizar com este período" if mudou else "🗓️ Montar Calendário do Fogo",
+                    type="primary", use_container_width=True, key=f"btn_brig_{val_sel}",
+                ):
+                    try:
+                        with st.spinner("🗺️ Carregando os municípios da região..."):
+                            munis = obter_municipios_regiao(
+                                tipo_analise, estado_dd, bioma_dd, municipio_dd, max_municipios=6000
+                            )
+                        if munis.empty:
+                            st.error("Nenhum município encontrado para a região selecionada.")
+                        else:
+                            barra = st.progress(0.0, text="Consultando a série MODIS no Earth Engine...")
+                            escala = 1000 if tipo_analise == "Por Bioma" else 500
+                            df_longo, falhos = buscar_calendario_fogo(munis, anos_lista, escala, barra)
+                            barra.empty()
+                            st.session_state[_br_key] = {
+                                "munis": munis[["name_muni", "abbrev_state"]].reset_index(drop=True),
+                                "df": df_longo, "anos": anos_br, "falhos": falhos, "escala": escala,
+                            }
+                    except Exception as _e_br:
+                        st.error(f"⚠️ Não foi possível montar o calendário: {_e_br}")
+                    _res = st.session_state.get(_br_key)
+
+            if not isinstance(_res, dict) or _res.get("anos") != anos_br:
+                return
+
+            df_longo, munis, falhos = _res["df"], _res["munis"], _res["falhos"]
+            n_anos = len(anos_lista) - len(falhos)
+            if falhos:
+                st.warning(
+                    f"⚠️ Não foi possível consultar {len(falhos)} ano(s) no Earth Engine "
+                    f"({', '.join(map(str, falhos))}); o calendário usa os outros {n_anos}. "
+                    "Clique em 'Nova Busca nesta aba' para tentar de novo."
+                )
+            if df_longo.empty or n_anos == 0:
+                st.info("Sem dados MODIS para a região e o período escolhidos.")
+                return
+
+            resumo, perfil = resumo_calendario(df_longo, n_anos)
+            resumo = resumo.join(munis, how="left")
+            perfil_reg = perfil.sum(axis=0).to_numpy()
+            ini_r, fim_r, frac_r = janela_critica(perfil_reg)
+            com_fogo = resumo[resumo["media_anual_km2"] > 0]
+            if com_fogo.empty or ini_r is None:
+                st.success(f"✅ Nenhuma área queimada detectada pelo MODIS na região entre {anos_br[0]} e {anos_br[1]}.")
+                return
+
+            def _txt_jan(i, f):
+                return MESES_PT[i - 1] if i == f else f"{MESES_PT[i - 1]}–{MESES_PT[f - 1]}"
+
+            metade = int(np.ceil(n_anos / 2))
+            mes_pico_r = int(np.argmax(perfil_reg)) + 1
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Municípios analisados", len(resumo))
+            c2.metric(f"Com fogo em {metade}+ dos {n_anos} anos", int((resumo["anos_com_fogo"] >= metade).sum()))
+            c3.metric("Mês de pico da região", MESES_PT[mes_pico_r - 1])
+            c4.metric("Janela crítica da região", _txt_jan(ini_r, fim_r),
+                      f"{frac_r * 100:.0f}% da área queimada", delta_color="off")
+            mes_mobil = MESES_PT[(ini_r - 2) % 12]
+            st.info(
+                f"📌 **Leitura para o planejamento:** na região, {frac_r * 100:.0f}% da área queimada "
+                f"de {anos_br[0]} a {anos_br[1]} se concentrou entre **{_txt_jan(ini_r, fim_r)}**. "
+                f"Brigadas e ações de prevenção (aceiros, queima prescrita, campanhas) devem estar "
+                f"prontas até **{mes_mobil}**, o mês anterior ao início da janela. "
+                "A tabela abaixo mostra a janela de cada município, que pode ser diferente da regional."
+            )
+
+            # --- Calendário da região ------------------------------------------
+            meses_jan = set(((ini_r - 1 + k) % 12) + 1 for k in range(((fim_r - ini_r) % 12) + 1))
+            df_reg = pd.DataFrame({
+                "Mês": MESES_PT, "Área (km²)": perfil_reg.round(1),
+                "Período": ["Janela crítica" if m in meses_jan else "Demais meses" for m in range(1, 13)],
+            })
+            fig_reg = px.bar(
+                df_reg, x="Mês", y="Área (km²)", color="Período",
+                color_discrete_map={"Janela crítica": "#c0392b", "Demais meses": "#bdbdbd"},
+                labels={"Área (km²)": "Área queimada média (km²)"},
+            )
+            fig_reg.update_layout(height=320, legend=dict(orientation="h", y=1.08, title=""))
+            figura(fig_reg, f"Área queimada média mensal na região de {anos_br[0]} a {anos_br[1]}, "
+                            "com destaque para a janela crítica", "MODIS MCD64A1 (NASA)")
+
+            # --- Mapa de calor município × mês ---------------------------------
+            n_max = len(com_fogo)
+            n_top = n_max if n_max <= 10 else st.slider(
+                "Municípios no mapa de calor (os de maior área queimada):", 10, min(60, n_max),
+                min(25, n_max), key="n_top_brigadas",
+            )
+            topo = com_fogo.sort_values("media_anual_km2", ascending=False).head(n_top)
+            rotulos = [f"{r.name_muni} ({r.abbrev_state})" for r in topo.itertuples()]
+            fig_cal = px.imshow(
+                perfil.loc[topo.index].to_numpy(), x=MESES_PT, y=rotulos,
+                color_continuous_scale="Reds", aspect="auto",
+                labels={"x": "Mês", "y": "", "color": "km²/mês"},
+            )
+            fig_cal.update_layout(height=max(320, 22 * n_top + 80))
+            figura(fig_cal, "Área queimada média por mês nos municípios com maior área queimada (km²)",
+                   "MODIS MCD64A1 (NASA)")
+
+            # --- Tabela por município -------------------------------------------
+            tab = com_fogo.sort_values("media_anual_km2", ascending=False)
+            tab_out = pd.DataFrame({
+                "Município": tab["name_muni"],
+                "UF": tab["abbrev_state"],
+                "Área queimada média anual (km²)": tab["media_anual_km2"].round(1),
+                "Anos com fogo": [f"{int(a)} de {n_anos}" for a in tab["anos_com_fogo"]],
+                "Mês de pico": [MESES_PT[int(m) - 1] for m in tab["mes_pico"]],
+                "Janela crítica (80%)": [_txt_jan(int(i), int(f)) for i, f in zip(tab["ini"], tab["fim"])],
+                "Área na janela (%)": tab["pct_janela"].round(0),
+                "Brigada pronta até": [MESES_PT[(int(i) - 2) % 12] for i in tab["ini"]],
+            })
+            tabela_bc(
+                f"Calendário do fogo por município, de {anos_br[0]} a {anos_br[1]}",
+                tab_out, fonte="MODIS MCD64A1 (NASA); resultados originais do estudo",
+                hide_index=True, height=420, use_container_width=True,
+            )
+            st.download_button(
+                "📄 Baixar CSV — Calendário do fogo",
+                data=tab_out.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"calendario_fogo_{val_sel}_{anos_br[0]}_{anos_br[1]}.csv", mime="text/csv",
+                key=f"dl_brig_{val_sel}",
+            )
+
+            with st.expander("ℹ️ Como o calendário é calculado e limitações"):
+                st.markdown(
+                    "- **Área queimada mensal:** soma, dentro de cada município, dos pixels que o "
+                    f"MODIS MCD64A1 marcou como queimados no mês (resolução de cálculo: {_res['escala']} m).\n"
+                    "- **Janela crítica:** a menor sequência de meses seguidos que concentra pelo "
+                    "menos 80% da área queimada média do ano. Pode virar o ano (ex.: Dez–Fev, "
+                    "comum em Roraima).\n"
+                    "- **Anos com fogo:** em quantos anos do período o município teve alguma área "
+                    "queimada detectada.\n"
+                    "- **Brigada pronta até:** o mês anterior ao início da janela crítica.\n"
+                    "- **Limitações:** o MODIS não detecta bem queimadas menores que cerca de "
+                    "20 a 25 ha nem o fogo rasteiro sob a copa da floresta, então a área real "
+                    "tende a ser maior. Municípios que só têm fogo pequeno podem aparecer sem fogo."
+                )
+
+            st.markdown("")
+            if st.button("🔄 Nova Busca nesta aba", key=f"btn_brig_reset_{val_sel}"):
+                st.session_state[_br_key] = None
+                st.rerun(scope="fragment")
+
+        with aba_brigadas:
+            _aba_brigadas()
 
         # ----------------------------------------------------------
         # ABA 5 — EXPORTAR DADOS
