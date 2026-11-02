@@ -2166,6 +2166,544 @@ def resumo_calendario(df_longo, n_anos):
     return resumo, perfil
 
 
+# =====================================================================
+# RISCO PREDITIVO EM GRADE (aba Risco Preditivo)
+# Unidade = célula da grade × semana; alvo = houve foco INPE na célula na
+# semana. Entram TODAS as células da região, inclusive as que nunca queimam,
+# para o modelo aprender ONDE e QUANDO o fogo acontece (o modelo
+# caso-controle anterior só via locais que já tinham queimado).
+# =====================================================================
+
+EPOCA_SEMANAS = pd.Timestamp("2000-01-03")  # segunda-feira; semana k começa em EPOCA + 7k dias
+BLOCO_SEMANAS = 13  # consultas de clima em blocos de ~3 meses, cada bloco com cache próprio
+
+ASSET_MAPBIOMAS = (
+    "projects/mapbiomas-public/assets/brazil/lulc/collection9/mapbiomas_collection90_integration_v1"
+)
+ANO_MAPBIOMAS = 2023
+GRUPOS_MAPBIOMAS = {
+    "floresta": [3, 5, 6, 49],
+    "savana": [4],
+    "campo_natural": [11, 12, 29, 50],
+    "pastagem": [15],
+    "agricultura": [9, 18, 19, 20, 35, 36, 39, 40, 41, 46, 47, 48, 62],
+    "mosaico": [21],
+}
+
+FEATURES_GRADE = [
+    "focos_sem_ant", "focos_4sem", "focos_52sem", "focos_ano_ant",
+    "chuva_sem_ant", "chuva_4sem", "semanas_secas",
+    "tmax_sem_ant", "ur_sem_ant", "ur_4sem", "vento_sem_ant",
+    "ndvi_mes_ant", *GRUPOS_MAPBIOMAS.keys(), "sem_sin", "sem_cos",
+]
+NOMES_FEATURES_GRADE = {
+    "focos_sem_ant": "Focos na semana anterior",
+    "focos_4sem": "Focos nas 4 semanas anteriores",
+    "focos_52sem": "Focos nas 52 semanas anteriores",
+    "focos_ano_ant": "Focos na mesma época do ano anterior",
+    "chuva_sem_ant": "Chuva na semana anterior (mm)",
+    "chuva_4sem": "Chuva nas 4 semanas anteriores (mm)",
+    "semanas_secas": "Semanas seguidas sem chuva (< 5 mm)",
+    "tmax_sem_ant": "Temperatura máxima média (°C)",
+    "ur_sem_ant": "Umidade relativa média (%)",
+    "ur_4sem": "Umidade relativa média em 4 semanas (%)",
+    "vento_sem_ant": "Vento médio (m/s)",
+    "ndvi_mes_ant": "NDVI do mês anterior",
+    "floresta": "% de floresta (MapBiomas)",
+    "savana": "% de savana (MapBiomas)",
+    "campo_natural": "% de campo e área úmida natural (MapBiomas)",
+    "pastagem": "% de pastagem (MapBiomas)",
+    "agricultura": "% de agricultura e silvicultura (MapBiomas)",
+    "mosaico": "% de mosaico de usos (MapBiomas)",
+    "sem_sin": "Época do ano (seno)",
+    "sem_cos": "Época do ano (cosseno)",
+}
+
+
+def _data_semana(k):
+    """Data de início (segunda-feira) da semana k."""
+    return EPOCA_SEMANAS + pd.Timedelta(days=7 * int(k))
+
+
+def _semana_de(datas):
+    """Índice da semana de cada data (Series de datas -> Series de inteiros)."""
+    return (pd.to_datetime(datas) - EPOCA_SEMANAS).dt.days // 7
+
+
+def montar_grade(limite_gdf, max_celulas=2500):
+    """
+    Divide a região em células quadradas (em graus) que tocam o limite. Usa a
+    menor célula entre 0,05° (~5 km) e 1° (~110 km) que mantenha no máximo
+    `max_celulas` células: estado médio fica com 0,25° (~25 km), bioma grande
+    com 0,5°. Devolve (GeoDataFrame com cid/i/j/lon_c/lat_c, tamanho em graus).
+    """
+    geom = limite_gdf.to_crs("EPSG:4326").geometry.union_all()
+    shapely.prepare(geom)
+    x0, y0, x1, y1 = geom.bounds
+    for res in (0.05, 0.1, 0.25, 0.5, 1.0):
+        i0, i1 = int(np.floor(x0 / res + 1e-9)), int(np.floor(x1 / res + 1e-9))
+        j0, j1 = int(np.floor(y0 / res + 1e-9)), int(np.floor(y1 / res + 1e-9))
+        if (i1 - i0 + 1) * (j1 - j0 + 1) > max_celulas * 6 and res < 1.0:
+            continue
+        ii, jj = np.meshgrid(np.arange(i0, i1 + 1), np.arange(j0, j1 + 1))
+        ii, jj = ii.ravel(), jj.ravel()
+        caixas = shapely.box(ii * res, jj * res, (ii + 1) * res, (jj + 1) * res)
+        dentro = shapely.intersects(caixas, geom)
+        if dentro.sum() <= max_celulas or res >= 1.0:
+            grade = gpd.GeoDataFrame(
+                {"i": ii[dentro], "j": jj[dentro]}, geometry=caixas[dentro], crs="EPSG:4326"
+            ).reset_index(drop=True)
+            grade["cid"] = np.arange(len(grade))
+            grade["lon_c"] = (grade["i"] + 0.5) * res
+            grade["lat_c"] = (grade["j"] + 0.5) * res
+            return grade, res
+    raise RuntimeError("Não foi possível montar a grade para a região.")
+
+
+def _retangulos_grade(grade, res):
+    """Retângulos das células em texto JSON (chave estável para o cache)."""
+    return json.dumps([
+        [round(i * res, 4), round(j * res, 4), round((i + 1) * res, 4), round((j + 1) * res, 4)]
+        for i, j in zip(grade["i"], grade["j"])
+    ])
+
+
+def _fc_grade(retangulos_json):
+    return ee.FeatureCollection([
+        ee.Feature(ee.Geometry.Rectangle(r, "EPSG:4326", False), {"cid": c})
+        for c, r in enumerate(json.loads(retangulos_json))
+    ])
+
+
+def _ur_diaria(img):
+    """Umidade relativa (%) pela fórmula de Magnus, a partir da temperatura e do ponto de orvalho."""
+    t = img.select("temperature_2m").subtract(273.15)
+    td = img.select("dewpoint_temperature_2m").subtract(273.15)
+    return td.expression(
+        "100 * exp(17.625 * td / (243.04 + td)) / exp(17.625 * t / (243.04 + t))",
+        {"t": t, "td": td},
+    ).rename("ur")
+
+
+def _vento_diario(img):
+    return img.expression(
+        "sqrt(u * u + v * v)",
+        {"u": img.select("u_component_of_wind_10m"), "v": img.select("v_component_of_wind_10m")},
+    ).rename("vento")
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _ultima_data_era5():
+    """Último dia com dado no ERA5-Land diário (o produto sai com alguns dias de atraso)."""
+    agora = datetime.now()
+    ms = (
+        ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+        .filterDate((agora - timedelta(days=150)).strftime("%Y-%m-%d"),
+                    (agora + timedelta(days=1)).strftime("%Y-%m-%d"))
+        .aggregate_max("system:time_start").getInfo()
+    )
+    if ms is None:
+        raise RuntimeError("ERA5-Land sem dados recentes no Earth Engine.")
+    return pd.Timestamp(ms, unit="ms").normalize()
+
+
+@st.cache_data(ttl=2592000, show_spinner=False, persist="disk")
+def _clima_grade_bloco(retangulos_json, k_ini, n_sem, escala):
+    """
+    Clima semanal ERA5-Land de cada célula, semanas k_ini..k_ini+n_sem-1, numa
+    consulta só (4 bandas por semana: temperatura máxima, chuva, umidade, vento).
+    """
+    fc = _fc_grade(retangulos_json)
+    col = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+    imgs, bandas = [], []
+    for w in range(n_sem):
+        ini = _data_semana(k_ini + w)
+        sub = col.filterDate(ini.strftime("%Y-%m-%d"), (ini + pd.Timedelta(days=7)).strftime("%Y-%m-%d"))
+        sfx = f"_{w:02d}"
+        imgs += [
+            sub.select("temperature_2m_max").mean().subtract(273.15).rename("tmax" + sfx),
+            sub.select("total_precipitation_sum").sum().multiply(1000).rename("chuva" + sfx),
+            sub.map(_ur_diaria).mean().rename("ur" + sfx),
+            sub.map(_vento_diario).mean().rename("vento" + sfx),
+        ]
+        bandas += ["tmax" + sfx, "chuva" + sfx, "ur" + sfx, "vento" + sfx]
+    res = ee.Image.cat(imgs).reduceRegions(
+        collection=fc, reducer=ee.Reducer.mean(), scale=escala, tileScale=2
+    )
+    res = res.select(["cid"] + bandas, None, False).getInfo()
+    linhas = []
+    for f in res["features"]:
+        p = f["properties"]
+        for w in range(n_sem):
+            sfx = f"_{w:02d}"
+            linhas.append((int(p["cid"]), k_ini + w, p.get("tmax" + sfx), p.get("chuva" + sfx),
+                           p.get("ur" + sfx), p.get("vento" + sfx)))
+    return pd.DataFrame(linhas, columns=["cid", "semana", "tmax", "chuva", "ur", "vento"])
+
+
+@st.cache_data(ttl=2592000, show_spinner=False, persist="disk")
+def _ndvi_grade_ano(retangulos_json, ano, ultimo_mes):
+    """NDVI médio mensal (MODIS MOD13A2, 1 km) de cada célula, meses 1..ultimo_mes do ano."""
+    fc = _fc_grade(retangulos_json)
+    col = ee.ImageCollection("MODIS/061/MOD13A2").select("NDVI").filter(
+        ee.Filter.calendarRange(ano, ano, "year"))
+    imgs, bandas = [], []
+    for m in range(1, ultimo_mes + 1):
+        c = col.filter(ee.Filter.calendarRange(m, m, "month"))
+        vazio = ee.Image.constant(0).updateMask(ee.Image.constant(0))
+        img = ee.Image(ee.Algorithms.If(c.size().gt(0), c.mean(), vazio))
+        imgs.append(img.multiply(0.0001).rename(f"n{m:02d}"))
+        bandas.append(f"n{m:02d}")
+    res = ee.Image.cat(imgs).reduceRegions(
+        collection=fc, reducer=ee.Reducer.mean(), scale=1000, tileScale=2
+    )
+    res = res.select(["cid"] + bandas, None, False).getInfo()
+    linhas = [
+        (int(f["properties"]["cid"]), ano, m, f["properties"].get(f"n{m:02d}"))
+        for f in res["features"] for m in range(1, ultimo_mes + 1)
+    ]
+    return pd.DataFrame(linhas, columns=["cid", "ano", "mes", "ndvi"])
+
+
+@st.cache_data(ttl=2592000, show_spinner=False, persist="disk")
+def _mapbiomas_grade(retangulos_json):
+    """Fração de cada grupo de uso do solo (MapBiomas) em cada célula."""
+    fc = _fc_grade(retangulos_json)
+    img = ee.Image(ASSET_MAPBIOMAS).select(f"classification_{ANO_MAPBIOMAS}")
+    bandas = list(GRUPOS_MAPBIOMAS.keys())
+    cat = ee.Image.cat([
+        img.remap(classes, [1] * len(classes), 0).rename(nome)
+        for nome, classes in GRUPOS_MAPBIOMAS.items()
+    ])
+    res = cat.reduceRegions(collection=fc, reducer=ee.Reducer.mean(), scale=500, tileScale=4)
+    res = res.select(["cid"] + bandas, None, False).getInfo()
+    return pd.DataFrame([
+        {"cid": int(f["properties"]["cid"]), **{b: f["properties"].get(b) for b in bandas}}
+        for f in res["features"]
+    ])
+
+
+@st.cache_data(ttl=2592000, show_spinner=False, persist="disk")
+def _focos_semanais_periodo(tipo, uf, bioma, muni, d_ini, d_fim, res):
+    """
+    Focos INPE (satélites de referência) de um período, já somados por
+    (coluna i, linha j da grade, semana). Guarda só a contagem, não os pontos,
+    para caber vários anos de bioma inteiro na memória. Falha em mais de 20%
+    das janelas de busca levanta erro (e não vai para o cache).
+    """
+    bloco = {"Por Município": 14, "Por Estado": 5}.get(tipo, 3)
+    df = buscar_focos_com_coords(
+        tipo, uf, bioma, muni, d_ini, d_fim, dias_bloco=bloco, satelites=SATELITES_PERIODO
+    )
+    falhos, total = df.attrs.get("blocos_falhos", 0), df.attrs.get("blocos_total", 0)
+    if total and falhos > 0.2 * total:
+        raise RuntimeError(f"INPE: {falhos} de {total} janelas de busca falharam ({d_ini} a {d_fim}).")
+    if df.empty:
+        return pd.DataFrame(columns=["i", "j", "semana", "n"]), falhos, total
+    cnt = pd.DataFrame({
+        "i": np.floor(df["lon"].to_numpy(dtype=float) / res + 1e-9).astype(int),
+        "j": np.floor(df["lat"].to_numpy(dtype=float) / res + 1e-9).astype(int),
+        "semana": _semana_de(df["data"]).to_numpy(),
+    }).groupby(["i", "j", "semana"]).size().rename("n").reset_index()
+    return cnt, falhos, total
+
+
+def _executar_paralelo(funcao, lista_args, max_workers=4, progresso=None, texto=""):
+    """
+    Roda funcao(*args) para cada tupla de lista_args, até max_workers em
+    paralelo, repetindo quando o Earth Engine responde 429 (muitas consultas
+    simultâneas). Devolve a lista de resultados na mesma ordem (None = falhou)
+    e a lista de mensagens de erro.
+    """
+    def _uma(args):
+        for tentativa in range(1, 5):
+            try:
+                return funcao(*args), None
+            except Exception as e:
+                msg = str(e)
+                if ("Too many concurrent" in msg or "429" in msg) and tentativa < 4:
+                    time.sleep(2 ** tentativa)
+                    continue
+                return None, msg[:200]
+        return None, "sem resposta"
+
+    resultados, erros = [None] * len(lista_args), []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futuros = {executor.submit(_uma, a): n for n, a in enumerate(lista_args)}
+        for feitos, fut in enumerate(concurrent.futures.as_completed(futuros), 1):
+            valor, erro = fut.result()
+            resultados[futuros[fut]] = valor
+            if erro:
+                erros.append(erro)
+            if progresso is not None:
+                progresso.progress(feitos / len(lista_args), text=f"{texto}: {feitos} de {len(lista_args)}")
+    return resultados, erros
+
+
+def montar_tabela_grade(grade, k_alvo_ini, k_ult, cnt_focos, clima, ndvi, uso):
+    """
+    Uma linha por célula × semana-alvo t, para t de k_alvo_ini até k_ult + 1.
+    Todas as variáveis usam só informação até a semana t-1 (nunca a própria
+    semana prevista). A semana k_ult + 1 não tem alvo: é a previsão.
+
+    cnt_focos: i, j, semana, n | clima: cid, semana, tmax, chuva, ur, vento
+    ndvi: cid, ano, mes, ndvi  | uso: cid + colunas de GRUPOS_MAPBIOMAS
+    """
+    n = len(grade)
+    T = np.arange(k_alvo_ini, k_ult + 2)
+    n_t = len(T)
+
+    # --- Focos: matriz célula × semana a partir de k_alvo_ini - 54 ---
+    k_f0 = k_alvo_ini - 54
+    F = np.zeros((n, k_ult - k_f0 + 1), dtype=np.float64)
+    if cnt_focos is not None and not cnt_focos.empty:
+        ij2cid = {(int(i), int(j)): int(c) for i, j, c in zip(grade["i"], grade["j"], grade["cid"])}
+        cids = np.array([ij2cid.get((int(i), int(j)), -1) for i, j in zip(cnt_focos["i"], cnt_focos["j"])])
+        sem = cnt_focos["semana"].to_numpy(dtype=int)
+        ok = (cids >= 0) & (sem >= k_f0) & (sem <= k_ult)
+        np.add.at(F, (cids[ok], sem[ok] - k_f0), cnt_focos["n"].to_numpy(dtype=float)[ok])
+    csF = np.concatenate([np.zeros((n, 1)), np.cumsum(F, axis=1)], axis=1)
+
+    def soma_focos(lo, hi):  # soma das semanas t+lo .. t+hi (lo <= hi < 0)
+        return csF[:, T + hi - k_f0 + 1] - csF[:, T + lo - k_f0]
+
+    col = {
+        "focos_sem_ant": F[:, T - 1 - k_f0],
+        "focos_4sem": soma_focos(-4, -1),
+        "focos_52sem": soma_focos(-52, -1),
+        "focos_ano_ant": soma_focos(-54, -50),
+    }
+
+    # --- Clima: matriz célula × semana a partir de k_alvo_ini - 30 ---
+    k_c0 = k_alvo_ini - 30
+    nc = k_ult - k_c0 + 1
+
+    def matriz_clima(var):
+        M = np.full((n, nc), np.nan)
+        if clima is not None and not clima.empty:
+            c = clima[(clima["semana"] >= k_c0) & (clima["semana"] <= k_ult)]
+            M[c["cid"].to_numpy(dtype=int), c["semana"].to_numpy(dtype=int) - k_c0] = (
+                pd.to_numeric(c[var], errors="coerce").to_numpy(dtype=float)
+            )
+        return M
+
+    chuva, tmax, ur, vento = (matriz_clima(v) for v in ("chuva", "tmax", "ur", "vento"))
+    idx1 = T - 1 - k_c0
+    csC = np.concatenate([np.zeros((n, 1)), np.cumsum(np.nan_to_num(chuva), axis=1)], axis=1)
+    ur_val = ~np.isnan(ur)
+    csU = np.concatenate([np.zeros((n, 1)), np.cumsum(np.where(ur_val, ur, 0), axis=1)], axis=1)
+    csN = np.concatenate([np.zeros((n, 1)), np.cumsum(ur_val, axis=1)], axis=1)
+    secas = np.zeros((n, nc))
+    for w in range(nc):
+        anterior = secas[:, w - 1] if w > 0 else 0
+        secas[:, w] = np.where(chuva[:, w] < 5, anterior + 1, 0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ur4 = (csU[:, idx1 + 1] - csU[:, idx1 - 3]) / (csN[:, idx1 + 1] - csN[:, idx1 - 3])
+    col.update({
+        "chuva_sem_ant": chuva[:, idx1],
+        "chuva_4sem": csC[:, idx1 + 1] - csC[:, idx1 - 3],
+        "semanas_secas": secas[:, idx1],
+        "tmax_sem_ant": tmax[:, idx1],
+        "ur_sem_ant": ur[:, idx1],
+        "ur_4sem": ur4,
+        "vento_sem_ant": vento[:, idx1],
+    })
+
+    # --- NDVI do mês anterior ao início da semana prevista ---
+    inicio_t = pd.DatetimeIndex([_data_semana(t) for t in T])
+    mes_ant = inicio_t.to_period("M") - 1
+    ndvi_m = np.full((n, n_t), np.nan)
+    if ndvi is not None and not ndvi.empty:
+        per = pd.to_datetime(pd.DataFrame({"year": ndvi["ano"], "month": ndvi["mes"], "day": 1})).dt.to_period("M")
+        piv = ndvi.assign(per=per, ndvi=pd.to_numeric(ndvi["ndvi"], errors="coerce")) \
+                  .pivot_table(index="cid", columns="per", values="ndvi", aggfunc="mean")
+        piv = piv.reindex(index=range(n))
+        for col_t, per in enumerate(mes_ant):
+            if per in piv.columns:
+                ndvi_m[:, col_t] = piv[per].to_numpy(dtype=float)
+    col["ndvi_mes_ant"] = ndvi_m
+
+    # --- Uso do solo (fixo no tempo) ---
+    uso_idx = uso.set_index("cid").reindex(range(n)) if (uso is not None and not uso.empty) else None
+    for g in GRUPOS_MAPBIOMAS:
+        v = uso_idx[g].to_numpy(dtype=float) if uso_idx is not None and g in uso_idx else np.full(n, np.nan)
+        col[g] = np.repeat(v[:, None], n_t, axis=1)
+
+    # --- Época do ano ---
+    ang = 2 * np.pi * inicio_t.dayofyear.to_numpy() / 365.25
+    col["sem_sin"] = np.repeat(np.sin(ang)[None, :], n, axis=0)
+    col["sem_cos"] = np.repeat(np.cos(ang)[None, :], n, axis=0)
+
+    # --- Alvo (só até k_ult) ---
+    alvo = np.full((n, n_t), np.nan)
+    alvo[:, :-1] = (F[:, T[:-1] - k_f0] > 0).astype(float)
+
+    df = pd.DataFrame({
+        "cid": np.tile(np.arange(n), n_t), "semana": np.repeat(T, n),
+        "lon_c": np.tile(grade["lon_c"].to_numpy(), n_t), "lat_c": np.tile(grade["lat_c"].to_numpy(), n_t),
+    })
+    for nome in FEATURES_GRADE:
+        df[nome] = col[nome].T.ravel().astype(np.float32)
+    df["alvo"] = alvo.T.ravel()
+    return df
+
+
+def _fabricas_modelos_grade():
+    """Candidatos comparados: regressão logística (referência linear), Random
+    Forest e boosting. Sem class_weight, para a probabilidade sair na escala
+    real (chance de haver foco na célula na semana)."""
+    from sklearn.pipeline import make_pipeline
+    from sklearn.impute import SimpleImputer
+
+    def lr(n):
+        return make_pipeline(SimpleImputer(strategy="median"), StandardScaler(),
+                             LogisticRegression(max_iter=2000))
+
+    def rf(n):
+        return make_pipeline(SimpleImputer(strategy="median"), RandomForestClassifier(
+            n_estimators=100, max_depth=12, min_samples_leaf=20,
+            max_samples=min(n, 40000), n_jobs=2, random_state=42))
+
+    def boost(n):
+        if _LGBM_DISPONIVEL:
+            return LGBMClassifier(n_estimators=400, learning_rate=0.05, num_leaves=31,
+                                  min_child_samples=40, subsample=0.8, subsample_freq=1,
+                                  colsample_bytree=0.8, random_state=42, verbosity=-1)
+        return HistGradientBoostingClassifier(max_iter=400, learning_rate=0.05, max_leaf_nodes=31,
+                                              min_samples_leaf=40, random_state=42)
+
+    nome_boost = "LightGBM" if _LGBM_DISPONIVEL else "Gradient Boosting (sklearn)"
+    return {"Regressão Logística": lr, "Random Forest": rf, nome_boost: boost}
+
+
+def curva_captura(semanas, alvo, score, ks=range(1, 51)):
+    """
+    % das ocorrências de fogo (célula-semana com foco) que caem nas k% células
+    priorizadas de cada semana, para k em ks. Empates são desfeitos ao acaso
+    (semente fixa), para uma regra com muitos zeros não ganhar nem perder por ordem.
+    """
+    rng = np.random.default_rng(0)
+    d = pd.DataFrame({
+        "s": np.asarray(semanas), "y": np.asarray(alvo, dtype=float),
+        "sc": np.asarray(score, dtype=float) + rng.uniform(0, 1e-6, len(alvo)),
+    })
+    total = d["y"].sum()
+    if total == 0:
+        return np.zeros(len(list(ks)))
+    g = d.groupby("s")["sc"]
+    d["pct"] = g.rank(ascending=False, method="first") / g.transform("size")
+    return np.array([d.loc[d["pct"] <= k / 100, "y"].sum() / total * 100 for k in ks])
+
+
+def treinar_avaliar_grade(df):
+    """
+    Divide no tempo: as últimas 52 semanas com alvo são o TESTE (o modelo
+    nunca as vê no treino); das semanas anteriores, as últimas 26 servem de
+    VALIDAÇÃO para escolher o algoritmo. O escolhido é medido no teste, comparado
+    a regras simples, e por fim retreinado com tudo para prever a próxima semana.
+    """
+    from sklearn.metrics import average_precision_score, brier_score_loss
+    from sklearn.inspection import permutation_importance
+
+    feats = [f for f in FEATURES_GRADE if df[f].notna().any()]
+    hist = df[df["alvo"].notna()]
+    prev = df[df["alvo"].isna()]
+    k_ult = int(hist["semana"].max())
+    k_teste = k_ult - 51
+    treino, teste = hist[hist["semana"] < k_teste], hist[hist["semana"] >= k_teste]
+    k_val = k_teste - 26
+    tr_in, val = treino[treino["semana"] < k_val], treino[treino["semana"] >= k_val]
+    for nome, parte in (("treino", tr_in), ("validação", val), ("teste", teste)):
+        if parte["alvo"].sum() < 10 or parte["alvo"].nunique() < 2:
+            raise ValueError(
+                f"Poucas ocorrências de fogo no período de {nome} para treinar com segurança. "
+                "Aumente os anos de histórico ou escolha uma região maior."
+            )
+
+    fabricas = _fabricas_modelos_grade()
+    comparacao = []
+    for nome, fab in fabricas.items():
+        m = fab(len(tr_in)).fit(tr_in[feats], tr_in["alvo"].astype(int))
+        p = m.predict_proba(val[feats])[:, 1]
+        comparacao.append({"Algoritmo": nome, "AUC-ROC": roc_auc_score(val["alvo"], p),
+                           "PR-AUC": average_precision_score(val["alvo"], p)})
+    comparacao = pd.DataFrame(comparacao)
+    escolhido = comparacao.loc[comparacao["PR-AUC"].idxmax(), "Algoritmo"]
+    fab = fabricas[escolhido]
+
+    modelo = fab(len(treino)).fit(treino[feats], treino["alvo"].astype(int))
+    p_teste = modelo.predict_proba(teste[feats])[:, 1]
+    y_teste = teste["alvo"].to_numpy()
+
+    # Regras simples para comparação (o que se faria sem modelo)
+    regra_recente = (teste["focos_sem_ant"].to_numpy(dtype=float) * 1e6
+                     + teste["focos_4sem"].to_numpy(dtype=float) * 1e3
+                     + teste["focos_52sem"].to_numpy(dtype=float))
+    regra_hist = teste["focos_52sem"].to_numpy(dtype=float)
+    ks = list(range(1, 51))
+    curvas = pd.DataFrame({
+        "k": ks,
+        "Modelo": curva_captura(teste["semana"], y_teste, p_teste, ks),
+        "Regra prática (fogo recente)": curva_captura(teste["semana"], y_teste, regra_recente, ks),
+        "Histórico do último ano": curva_captura(teste["semana"], y_teste, regra_hist, ks),
+        "Sem critério (sorteio)": [float(k) for k in ks],
+    })
+
+    metricas = {
+        "auc": roc_auc_score(y_teste, p_teste),
+        "pr_auc": average_precision_score(y_teste, p_teste),
+        "pr_auc_regra": average_precision_score(y_teste, regra_recente),
+        "taxa_base": float(y_teste.mean()),
+        "brier": brier_score_loss(y_teste, p_teste),
+        "semanas_teste": (k_teste, k_ult),
+        "semanas_treino": (int(treino["semana"].min()), k_teste - 1),
+        "n_treino": len(treino), "n_teste": len(teste),
+        "pos_treino": int(treino["alvo"].sum()), "pos_teste": int(y_teste.sum()),
+    }
+
+    # Validação espacial: blocos de ~1° nunca divididos entre treino e teste
+    grupos = (np.floor(treino["lon_c"]).astype(int).astype(str) + "_"
+              + np.floor(treino["lat_c"]).astype(int).astype(str)) if "lon_c" in treino else None
+    metricas["auc_espacial"] = None
+    if grupos is not None and grupos.nunique() >= 4:
+        sub = treino.sample(n=min(len(treino), 80000), random_state=42)
+        g_sub = grupos.loc[sub.index]
+        aucs = []
+        for i_tr, i_te in GroupKFold(n_splits=4).split(sub, groups=g_sub):
+            a, b = sub.iloc[i_tr], sub.iloc[i_te]
+            if b["alvo"].nunique() < 2 or a["alvo"].nunique() < 2:
+                continue
+            m = fab(len(a)).fit(a[feats], a["alvo"].astype(int))
+            aucs.append(roc_auc_score(b["alvo"], m.predict_proba(b[feats])[:, 1]))
+        if aucs:
+            metricas["auc_espacial"] = float(np.mean(aucs))
+
+    # Calibração: probabilidade prevista x frequência observada, por decil
+    cal = pd.DataFrame({"p": p_teste, "y": y_teste})
+    cal["faixa"] = pd.qcut(cal["p"].rank(method="first"), 10, labels=False)
+    calibracao = cal.groupby("faixa").agg(prevista=("p", "mean"), observada=("y", "mean")).reset_index()
+
+    # Importância por permutação no teste: quanto a PR-AUC cai ao embaralhar cada variável
+    amostra = teste.sample(n=min(len(teste), 10000), random_state=42)
+    if amostra["alvo"].nunique() == 2:
+        imp = permutation_importance(modelo, amostra[feats], amostra["alvo"].astype(int),
+                                     scoring="average_precision", n_repeats=2, random_state=42)
+        importancias = pd.DataFrame({"variavel": feats, "queda": imp.importances_mean})
+    else:
+        importancias = pd.DataFrame({"variavel": feats, "queda": np.nan})
+
+    # Modelo final com todo o histórico, para prever a próxima semana
+    final = fab(len(hist)).fit(hist[feats], hist["alvo"].astype(int))
+    p_prev = final.predict_proba(prev[feats])[:, 1]
+
+    return {
+        "escolhido": escolhido, "comparacao": comparacao, "metricas": metricas,
+        "curvas": curvas, "calibracao": calibracao, "importancias": importancias,
+        "previsao": pd.DataFrame({"cid": prev["cid"].to_numpy(), "prob": p_prev}),
+        "semana_prevista": int(prev["semana"].iloc[0]), "features": feats,
+    }
+
+
 def _liberar_memoria():
     """
     Coleta o lixo e devolve ao sistema a memória que o Python já liberou. Sem o
@@ -4820,869 +5358,344 @@ ser gerados por essa floresta perdida.
                     )
 
         # ----------------------------------------------------------
-        # ABA 6 — RISCO PREDITIVO (MACHINE LEARNING)
+        # ABA — RISCO PREDITIVO (modelo em grade: célula × semana)
         # ----------------------------------------------------------
         _log_mem("Abas renderizadas (antes do Risco)")
-        with aba_risco:
-            st.subheader("🎯 Risco Preditivo de Queimada — Mapa por Município")
 
-            st.info(
-                "📅 **Importante:** esta aba sempre treina e prevê o risco com dados "
-                "climáticos **recentes** (dos últimos 1-3 anos até hoje), "
-                "**independente** do ano/mês escolhido na barra lateral para a "
-                "análise de queimada nas outras abas (Mapa, Gráficos, Severidade, "
-                "Impacto). A pergunta respondida aqui é sempre 'qual o risco de "
-                "queimar nos próximos dias/mês, a partir de hoje?' — por isso o "
-                "modelo nunca usa um ano passado como referência de previsão. Só a "
-                "**região** selecionada (estado/bioma/município) é compartilhada "
-                "com as outras abas; o período não é."
+        def _classe_risco_grade(p):
+            if p >= 0.5:
+                return "Muito alto", "#bd0026"
+            if p >= 0.3:
+                return "Alto", "#f03b20"
+            if p >= 0.1:
+                return "Moderado", "#feb24c"
+            return "Baixo", "#ffffb2"
+
+        @st.fragment
+        def _aba_risco_grade():
+            st.subheader("🎯 Risco Preditivo — onde o fogo deve aparecer na próxima semana")
+            st.caption(
+                "A região é dividida em células (quadrados de 5 a 50 km, conforme o tamanho da "
+                "região) acompanhadas semana a semana. O modelo aprende com os anos anteriores "
+                "quais condições antecedem o fogo (fogo recente, chuva, umidade, temperatura, "
+                "vegetação e uso do solo) e estima, para cada célula, a chance de haver pelo "
+                "menos um foco de calor na próxima semana."
             )
-
-            with st.expander("ℹ️ Como esse modelo funciona (leia antes de treinar)", expanded=False):
-                st.markdown(
-                    "- Você escolhe treinar o modelo com **Focos de Calor (INPE)** ou **Área Queimada "
-                    "(MODIS)** — o alvo que o modelo aprende a prever muda conforme essa escolha (foco "
-                    "pontual de calor vs. pixel de área efetivamente queimada).\n"
-                    "- O modelo é treinado com uma **amostra de municípios** da região selecionada "
-                    "(bioma ou estado inteiro — não é mais um único ponto central).\n"
-                    "- Para **cada** município da amostra, o modelo usa **todos os dias** do período "
-                    "de histórico escolhido (clima diário + se houve ou não ocorrência naquele dia) "
-                    "— não é uma amostra de dias, é o histórico diário completo.\n"
-                    "- Além do clima, o modelo usa a **taxa histórica de cada município** (calculada só "
-                    "com o período de treino) e o **NDVI do mês anterior** (Sentinel-2, indicador de "
-                    "estresse hídrico da vegetação) como features extras — assim, dois municípios com o "
-                    "mesmo clima podem receber risco diferente se um deles historicamente pega fogo "
-                    "muito mais que o outro, ou se a vegetação já estava mais seca antes do evento.\n"
-                    "- A performance é validada com **duas** estratégias de validação cruzada: "
-                    "temporal (walk-forward, o modelo generaliza pro futuro?) e espacial "
-                    "(GroupKFold por município, o modelo generaliza pra um município nunca visto?), "
-                    "comparando **três** candidatos: Regressão Logística, Random Forest e Boosting.\n"
-                    "- O algoritmo **vencedor** é escolhido automaticamente (maior AUC médio na "
-                    "validação temporal) e é ele que é treinado com **todos** os dados e "
-                    "aplicado às condições climáticas **atuais** de cada município da região "
-                    "(podendo ser um conjunto maior que o usado no treino) para colorir o mapa.\n"
-                    "- **Amanhã** usa o clima real mais recente disponível. **Próximo mês** é uma "
-                    "**estimativa sazonal** (desloca o risco atual pela diferença histórica entre o mês "
-                    "atual e o mês seguinte, em espaço log-odds — para não saturar bruscamente em 100%) "
-                    "— não existe fonte gratuita de previsão climática de 30 dias, então isso não é uma "
-                    "previsão dia-a-dia, e sim uma tendência baseada em climatologia."
+            st.info(
+                "📅 Esta aba não usa o ano/mês da barra lateral: ela treina com os últimos anos até "
+                "hoje e prevê a próxima semana. A região é a da barra lateral."
+            )
+            anos_r = st.select_slider(
+                "Anos de histórico:", options=[2, 3, 4, 5], value=3,
+                format_func=lambda x: f"{x} anos", key="anos_risco_grade",
+                help="O último ano fica separado como TESTE (o modelo não o vê no treino). "
+                     "Com 3 anos: treina em 2 e testa no mais recente.",
+            )
+            if tipo_analise == "Por Bioma":
+                st.warning(
+                    "⏱️ Bioma inteiro: a primeira execução pode levar vários minutos (focos de "
+                    "vários anos e clima de milhares de células). Depois fica guardada em cache."
                 )
 
-            with st.expander("📖 Glossário rápido (pra quem não é da área)", expanded=False):
-                st.markdown(
-                    "**AUC-ROC** — nota de 0 a 1 pra dizer se o modelo separa bem dia-de-risco de "
-                    "dia-sem-risco. 0,50 = mesma coisa que jogar moeda (não aprendeu nada). "
-                    "1,00 = separa perfeitamente. Na prática, acima de 0,70 já é considerado útil; "
-                    "acima de 0,85 é forte.\n\n"
-                    "**F1-score** — nota de 0 a 1 que equilibra duas coisas: 'quando o modelo diz "
-                    "risco, ele acerta?' (precisão) e 'de todas as vezes que teve risco de verdade, "
-                    "quantas o modelo pegou?' (recall). Serve pra não confiar só na AUC, que pode "
-                    "esconder um modelo bom em teoria mas ruim na prática.\n\n"
-                    "**Validação temporal** — testar o modelo em dias que ele nunca viu, sempre "
-                    "no FUTURO em relação ao que ele aprendeu. Simula o uso real: hoje eu só sei "
-                    "o passado.\n\n"
-                    "**Validação espacial** — testar o modelo num MUNICÍPIO que ele nunca viu "
-                    "no treino. Mais rígida que a temporal: mostra se o modelo aprendeu um padrão "
-                    "de verdade (clima → risco) ou só decorou o comportamento de alguns lugares.\n\n"
-                    "**NDVI** — um número entre -1 e 1 calculado a partir de imagem de satélite que "
-                    "indica o quão 'verde e saudável' está a vegetação. Vegetação seca/estressada "
-                    "tem NDVI mais baixo e queima mais fácil.\n\n"
-                    "**Baseline ingênuo** — o modelo mais simples possível, sem nenhuma "
-                    "inteligência: 'se pegou fogo nos últimos 7 dias, marco risco alto'. Serve de "
-                    "régua mínima — se o modelo de Machine Learning não superar isso, ele não "
-                    "está agregando valor de verdade."
-                )
+            _rk = f"risco_grade_{val_sel}"
+            _res = st.session_state.get(_rk)
+            ja = isinstance(_res, dict)
+            mudou = ja and _res.get("anos") != anos_r
 
-            try:
-                fonte_sugerida = "MODIS" if "MODIS" in fonte_escolhida else "INPE"
-                fonte_risco = st.radio(
-                    "Treinar o modelo com:",
-                    ["🔥 Focos de Calor (INPE)", "🗺️ Área Queimada (MODIS)"],
-                    index=0 if fonte_sugerida == "INPE" else 1,
-                    key="fonte_dados_risco",
-                    horizontal=True,
-                    help="Focos (INPE) = detecções pontuais de calor, mais rápido de treinar. "
-                         "Área Queimada (MODIS) = baseado em pixels queimados detectados por satélite, "
-                         "mais coerente com a fonte escolhida na barra lateral, porém mais lento."
-                )
-                fonte_dados_risco = "MODIS" if "MODIS" in fonte_risco else "INPE"
-                if fonte_dados_risco == "MODIS":
-                    st.caption(
-                        "⏱️ Treinar com Área Queimada (MODIS) é mais lento — cada município consulta "
-                        "o Earth Engine mês a mês (em vez de uma busca simples do INPE). Considere usar "
-                        "menos municípios e menos anos de histórico."
-                    )
-
-                st.markdown("---")
-                modo_label = st.radio(
-                    "Como montar as amostras de treino:",
-                    ["🗺️ Caso-controle (focos como amostra) — recomendado",
-                     "🏙️ Painel município-dia (amostra de municípios)"],
-                    key="modo_amostragem_risco",
-                    help="Caso-controle usa cada foco real como amostra positiva e o mesmo local "
-                         "numa data anterior como controle negativo -- cobre muito mais área da "
-                         "região. Painel usa uma amostra de municípios e todos os dias de cada um."
-                )
-                modo_amostragem = "caso_controle" if "Caso-controle" in modo_label else "painel"
-
-                max_focos = 400
-                confirmar_imagem = False
-                if modo_amostragem == "caso_controle":
-                    st.caption(
-                        "📍 Cada foco vira uma amostra **positiva**; o mesmo local, 45 dias antes, "
-                        "vira o **controle negativo**. A validação espacial agrupa por célula de "
-                        "grade (~25 km) em vez de município, para que focos vizinhos nunca fiquem "
-                        "divididos entre treino e teste."
-                    )
-                    col_cc1, col_cc2 = st.columns(2)
-                    with col_cc1:
-                        max_focos = st.select_slider(
-                            "Focos usados como amostra:",
-                            options=[100, 200, 400, 800], value=400,
-                            key="max_focos_risco",
-                            help="Mais focos = melhor cobertura espacial, porém mais lento."
-                        )
-                    with col_cc2:
-                        confirmar_imagem = st.toggle(
-                            "🛰️ Confirmar focos por imagem (dNBR)",
-                            value=False,
-                            key="confirmar_imagem_risco",
-                            help="Verifica, via Sentinel-2, se cada foco deixou cicatriz real de "
-                                 "queimada. Descarta falso-positivo do sensor térmico (flare de gás, "
-                                 "reflexo em água, telhado quente). MUITO mais lento -- uma consulta "
-                                 "ao Earth Engine por foco."
-                        )
-                    if confirmar_imagem:
-                        st.warning(
-                            f"⏱️ A confirmação por imagem faz **uma consulta ao Earth Engine por foco** "
-                            f"(até {max_focos}). Pode levar vários minutos. Considere reduzir o número "
-                            f"de focos na primeira execução."
-                        )
-                st.markdown("---")
-
-                col_p1, col_p2, col_p3 = st.columns(3)
-                with col_p1:
-                    anos_hist = st.select_slider(
-                        "Histórico para treinar o modelo:",
-                        options=[1, 2, 3], value=1 if fonte_dados_risco == "MODIS" else 2,
-                        format_func=lambda x: f"{x} ano(s)",
-                        key="anos_hist_risco"
-                    )
-                with col_p2:
-                    if tipo_analise == "Por Município":
-                        n_amostra_treino = 1
-                        # st.select_slider com uma ÚNICA opção quebra o componente JS do
-                        # Streamlit (RangeError: min(0) >= max(0)) -- por isso aqui é só
-                        # um texto informativo, não um slider.
-                        st.caption("Municípios usados no treino: **1** (o selecionado)")
-                    else:
-                        n_amostra_treino = st.select_slider(
-                            "Municípios usados no treino:",
-                            options=[3, 5, 8, 12, 15, 20],
-                            value=5 if fonte_dados_risco == "MODIS" else 8,
-                            key="n_treino_risco",
-                            help="Mais municípios = modelo mais representativo do bioma/estado, "
-                                 "porém mais lento para treinar."
-                        )
-                with col_p3:
-                    horizonte = st.radio(
-                        "Horizonte da previsão:",
-                        ["Amanhã", "Próximo mês"],
-                        key="horizonte_risco",
-                        help="'Próximo mês' é uma estimativa sazonal (climatologia), não uma previsão exata."
-                    )
-
-                max_mapa = st.select_slider(
-                    "Municípios exibidos no mapa (região inteira):",
-                    options=[15, 30, 50, 80], value=30,
-                    key="max_mapa_risco",
-                    help="Quantos municípios da região terão o risco calculado e coloridos no mapa. "
-                         "(O mapa sempre usa clima real recente, independente da fonte escolhida acima "
-                         "— a fonte só muda o que o modelo aprendeu a reconhecer como risco.)"
-                )
-
-                st.markdown("---")
-                with st.expander(
-                    "🔬 Análise de Sensibilidade da Amostra — a amostra escolhida é suficiente?"
+            if (not ja) or mudou:
+                if st.button(
+                    "🔄 Atualizar com este histórico" if mudou else "🎯 Treinar modelo e gerar mapa de risco",
+                    type="primary", use_container_width=True, key=f"btn_risco_grade_{val_sel}",
                 ):
-                    st.caption(
-                        "Treina o modelo várias vezes com tamanhos de amostra crescentes e mede o AUC "
-                        "temporal (validação walk-forward) em cada um. Se o AUC parar de subir "
-                        "(\"empacotar\") a partir de um certo tamanho, isso é evidência de que aumentar "
-                        "a amostra além dali não traria ganho relevante — em vez de só afirmar que a "
-                        "amostra é suficiente, este gráfico mostra."
-                    )
-                    if modo_amostragem == "painel" and tipo_analise == "Por Município":
-                        st.info(
-                            "ℹ️ Não aplicável nesta combinação: no modo Painel com análise 'Por "
-                            "Município' só existe 1 unidade espacial possível (o próprio município). "
-                            "Troque para 'Caso-controle' acima para analisar sensibilidade pelo número "
-                            "de focos, ou selecione 'Por Estado'/'Por Bioma' para analisar pelo número "
-                            "de municípios."
-                        )
-                    else:
-                        if modo_amostragem == "painel":
-                            tamanhos_teste = [3, 8, 15, 20]
-                            rotulo_eixo = "Nº de municípios na amostra de treino"
-                            unidade_teste = "municípios"
-                        else:
-                            tamanhos_teste = [100, 200, 400, 800]
-                            rotulo_eixo = "Nº de focos usados como amostra"
-                            unidade_teste = "focos"
+                    avisos = []
+                    try:
+                        barra = st.progress(0.0, text="Montando a grade da região...")
+                        grade, res_g = montar_grade(limite)
+                        rets = _retangulos_grade(grade, res_g)
+                        ultima = min(_ultima_data_era5(), pd.Timestamp(hoje.date()) - pd.Timedelta(days=1))
+                        k_ult = int(((ultima - EPOCA_SEMANAS).days - 6) // 7)
+                        k_alvo_ini = k_ult - 52 * anos_r + 1
 
-                        st.caption(
-                            f"Tamanhos testados: {tamanhos_teste} {unidade_teste}. Cada treino é "
-                            "independente e cacheado (24h) — repetir a análise depois é instantâneo."
-                        )
-
-                        if st.button("▶️ Rodar Análise de Sensibilidade", key="btn_sensibilidade"):
-                            resultados_sens = []
-                            barra_sens = st.progress(0.0, text="Iniciando...")
-                            for i_tam, tam in enumerate(tamanhos_teste):
-                                barra_sens.progress(
-                                    i_tam / len(tamanhos_teste),
-                                    text=f"Treinando com {tam} {unidade_teste}..."
-                                )
-                                if modo_amostragem == "painel":
-                                    res_tam = treinar_modelo_risco_regional(
-                                        tipo_analise, estado_dd, bioma_dd, municipio_dd,
-                                        anos_historico=anos_hist, n_amostra_treino=tam,
-                                        fonte_dados=fonte_dados_risco, modo_amostragem="painel",
-                                    )
-                                else:
-                                    res_tam = treinar_modelo_risco_regional(
-                                        tipo_analise, estado_dd, bioma_dd, municipio_dd,
-                                        anos_historico=anos_hist, fonte_dados=fonte_dados_risco,
-                                        modo_amostragem="caso_controle", max_focos=tam,
-                                    )
-                                if "erro" not in res_tam:
-                                    cv_venc = res_tam["cv_resultados"][res_tam["algoritmo"]]["temporal_auc"]
-                                    resultados_sens.append({
-                                        "tamanho": tam,
-                                        "auc_medio": cv_venc["media"] if cv_venc else None,
-                                        "auc_desvio": cv_venc["desvio"] if cv_venc else None,
-                                        "algoritmo": res_tam["algoritmo"],
-                                    })
-                            barra_sens.progress(1.0, text="Concluído!")
-
-                            df_sens = pd.DataFrame(
-                                [r for r in resultados_sens if r["auc_medio"] is not None]
+                        # 1) Focos INPE, um período por ano civil (anos completos ficam em cache)
+                        d_lo = _data_semana(k_alvo_ini - 54)
+                        d_hi = _data_semana(k_ult) + pd.Timedelta(days=6)
+                        periodos, cur = [], d_lo
+                        while cur <= d_hi:
+                            fim = min(pd.Timestamp(cur.year, 12, 31), d_hi)
+                            periodos.append((cur, fim))
+                            cur = fim + pd.Timedelta(days=1)
+                        args_f = [(tipo_analise, estado_dd, bioma_dd, municipio_dd,
+                                   a.strftime("%Y-%m-%d"), b.strftime("%Y-%m-%d"), res_g) for a, b in periodos]
+                        res_f, err_f = _executar_paralelo(_focos_semanais_periodo, args_f, max_workers=2,
+                                                          progresso=barra, texto="Focos do INPE (por ano)")
+                        if any(r is None for r in res_f):
+                            raise RuntimeError(
+                                "O serviço do INPE não respondeu para todo o período "
+                                f"({'; '.join(err_f[:2])}). Tente de novo em alguns minutos."
                             )
-                            if len(df_sens) < 2:
-                                st.warning(
-                                    "⚠️ Dados insuficientes em pelo menos um dos tamanhos testados "
-                                    "para montar a curva de sensibilidade nesta região/período."
-                                )
-                            else:
-                                fig_sens = go.Figure()
-                                fig_sens.add_trace(go.Scatter(
-                                    x=df_sens["tamanho"], y=df_sens["auc_medio"],
-                                    error_y=dict(
-                                        type="data",
-                                        array=df_sens["auc_desvio"].fillna(0)
-                                    ),
-                                    mode="lines+markers",
-                                    line=dict(color="#e74c3c", width=3),
-                                    marker=dict(size=10),
-                                ))
-                                fig_sens.update_layout(
-                                    height=380,
-                                    xaxis_title=rotulo_eixo,
-                                    yaxis_title="AUC-ROC (validação temporal)",
-                                    yaxis=dict(range=[0.4, 1.0]),
-                                    margin=dict(t=30, b=20),
-                                )
-                                figura(fig_sens, "Sensibilidade da validação temporal (AUC-ROC) ao parâmetro avaliado", "Resultados originais do estudo")
+                        cnt_focos = pd.concat([r[0] for r in res_f], ignore_index=True)
+                        falhos = sum(r[1] for r in res_f)
+                        if falhos:
+                            avisos.append(f"{falhos} janela(s) de busca no INPE falharam; a contagem de focos "
+                                          "pode estar levemente subestimada.")
 
-                                ganho_final = (
-                                    df_sens["auc_medio"].iloc[-1] - df_sens["auc_medio"].iloc[-2]
-                                )
-                                if abs(ganho_final) < 0.02:
-                                    st.success(
-                                        f"✅ O AUC estabilizou entre os dois maiores tamanhos testados "
-                                        f"(variação de {ganho_final:+.3f}) — evidência de que a amostra "
-                                        "atual já captura o padrão disponível; aumentá-la não traria "
-                                        "ganho relevante."
-                                    )
-                                else:
-                                    st.warning(
-                                        f"⚠️ O AUC ainda estava subindo entre os dois maiores tamanhos "
-                                        f"testados (variação de {ganho_final:+.3f}) — considere usar "
-                                        "uma amostra maior se o tempo de execução permitir."
-                                    )
-                                tabela_bc("Sensibilidade da validação temporal ao tamanho da amostra", 
-                                    df_sens.rename(columns={
-                                        "tamanho": rotulo_eixo,
-                                        "auc_medio": "AUC médio",
-                                        "auc_desvio": "Desvio padrão",
-                                        "algoritmo": "Algoritmo vencedor",
-                                    }),
-                                    hide_index=True, use_container_width=True
-                                )
-                                st.caption(
-                                    "Limitação: cada ponto usa uma única amostragem aleatória (seed "
-                                    "fixa) daquele tamanho — não é a média de várias repetições. Para "
-                                    "o fim deste estudo (justificar a ordem de grandeza da amostra), "
-                                    "isso é suficiente; um estudo de produção repetiria cada tamanho "
-                                    "com seeds diferentes para estimar a variância da própria amostragem."
-                                )
+                        # 2) Clima ERA5-Land em blocos de ~3 meses (blocos fechados ficam em cache)
+                        escala_clima = int(min(11132, res_g * 111000 / 3))
+                        k_c0 = k_alvo_ini - 30
+                        b0 = k_c0 - (k_c0 % BLOCO_SEMANAS)
+                        args_c = [(rets, b, min(BLOCO_SEMANAS, k_ult - b + 1), escala_clima)
+                                  for b in range(b0, k_ult + 1, BLOCO_SEMANAS)]
+                        res_c, err_c = _executar_paralelo(_clima_grade_bloco, args_c, max_workers=4,
+                                                          progresso=barra, texto="Clima ERA5-Land (blocos de 3 meses)")
+                        n_falhos_c = sum(r is None for r in res_c)
+                        if n_falhos_c > 0.2 * len(res_c):
+                            raise RuntimeError(f"O Earth Engine não devolveu o clima ({'; '.join(err_c[:2])}).")
+                        if n_falhos_c:
+                            avisos.append(f"{n_falhos_c} bloco(s) de clima falharam; essas semanas ficam sem clima.")
+                        clima = pd.concat([r for r in res_c if r is not None], ignore_index=True)
 
-                if st.button("🧠 Treinar Modelo e Gerar Mapa de Risco", use_container_width=True):
-                    status = st.status("Treinando modelo regional...", expanded=True)
+                        # 3) NDVI mensal por ano
+                        ano_ndvi0 = (_data_semana(k_alvo_ini) - pd.Timedelta(days=40)).year
+                        args_n = [(rets, a, 12 if a < ultima.year else max(1, ultima.month - 1))
+                                  for a in range(ano_ndvi0, ultima.year + 1)]
+                        res_n, _ = _executar_paralelo(_ndvi_grade_ano, args_n, max_workers=4,
+                                                      progresso=barra, texto="NDVI MODIS (por ano)")
+                        ndvi = pd.concat([r for r in res_n if r is not None], ignore_index=True) \
+                            if any(r is not None for r in res_n) else None
+                        if ndvi is None:
+                            avisos.append("NDVI indisponível: o modelo foi treinado sem essa variável.")
 
-                    if modo_amostragem == "caso_controle":
-                        status.write(f"🔥 Buscando focos reais em '{val_sel}' para usar como amostra...")
-                        if confirmar_imagem:
-                            status.write("🛰️ Confirmando focos por imagem (dNBR) — isso demora...")
-                    else:
-                        status.write(f"🔎 Selecionando municípios de '{val_sel}' para treino...")
-                    resultado = treinar_modelo_risco_regional(
-                        tipo_analise, estado_dd, bioma_dd, municipio_dd,
-                        anos_historico=anos_hist, n_amostra_treino=n_amostra_treino,
-                        fonte_dados=fonte_dados_risco,
-                        modo_amostragem=modo_amostragem,
-                        max_focos=max_focos,
-                        confirmar_com_imagem=confirmar_imagem
-                    )
+                        # 4) Uso do solo MapBiomas
+                        barra.progress(1.0, text="Uso do solo (MapBiomas)...")
+                        try:
+                            uso = _mapbiomas_grade(rets)
+                        except Exception as e_uso:
+                            uso = None
+                            avisos.append(f"MapBiomas indisponível ({str(e_uso)[:120]}): treinado sem uso do solo.")
 
-                    if "erro" in resultado:
-                        status.update(label="Falha no treino", state="error")
-                        st.warning(f"⚠️ {resultado['erro']}")
-                    else:
-                        fonte_txt = "Área Queimada (MODIS)" if resultado["fonte_dados"] == "MODIS" else "Focos de Calor (INPE)"
-                        if resultado["modo_amostragem"] == "caso_controle":
-                            unidade = "célula(s) de grade"
-                            detalhe = f"{resultado['n_linhas_total']} amostras (casos + controles)"
-                        else:
-                            unidade = "município(s)"
-                            detalhe = f"{resultado['n_linhas_total']} dias no total"
-                        msg_treino = (
-                            f"✅ Modelo treinado com **{resultado['n_municipios_treino']} {unidade}** "
-                            f"usando **{fonte_txt}** · algoritmo: **{resultado['algoritmo']}** "
-                            f"({detalhe})."
-                        )
-                        if resultado["auc"] is not None:
-                            msg_treino += f" · AUC-ROC (walk-forward, média entre folds): **{resultado['auc']:.2f}**"
-                        status.write(msg_treino)
-                        status.write(f"📐 Amostragem: **{resultado['rotulo_modo']}**")
-                        status.write(
-                            f"🏆 Algoritmo escolhido automaticamente: **{resultado['algoritmo']}** "
-                            f"({resultado['criterio_selecao']})."
-                        )
+                        # 5) Tabela célula × semana, treino, teste e previsão
+                        barra.progress(1.0, text="Treinando e testando os modelos (pode levar 1 a 3 minutos)...")
+                        df_grade = montar_tabela_grade(grade, k_alvo_ini, k_ult, cnt_focos, clima, ndvi, uso)
+                        del clima, ndvi, cnt_focos
+                        resultado = treinar_avaliar_grade(df_grade)
+                        del df_grade
+                        _liberar_memoria()
 
-                        diag = resultado.get("diagnostico_amostragem")
-                        if diag:
-                            status.write(
-                                f"🔥 Focos brutos: {diag.get('focos_brutos', 0)} → "
-                                f"após deduplicação: {diag.get('focos_apos_dedup', 0)} → "
-                                f"amostrados: {diag.get('focos_amostrados', 0)} "
-                                f"({diag.get('n_celulas', 0)} células de grade)"
-                            )
-                            if diag.get("confirmacao_ativada"):
-                                status.write(
-                                    f"🛰️ Confirmação por imagem: **{diag.get('confirmados', 0)} confirmados**, "
-                                    f"**{diag.get('rejeitados', 0)} rejeitados** (sem cicatriz visível), "
-                                    f"{diag.get('indeterminados', 0)} indeterminados (nuvem/sem imagem — mantidos)."
-                                )
+                        # 6) Células -> municípios (para o ranking e o tooltip)
+                        munis = obter_municipios_regiao(tipo_analise, estado_dd, bioma_dd, municipio_dd,
+                                                        max_municipios=6000)
+                        pares = gpd.sjoin(grade[["cid", "geometry"]], munis[["name_muni", "abbrev_state", "geometry"]],
+                                          predicate="intersects", how="inner")[["cid", "name_muni", "abbrev_state"]]
+                        centro = gpd.GeoDataFrame(grade[["cid"]], geometry=gpd.points_from_xy(grade["lon_c"], grade["lat_c"]),
+                                                  crs="EPSG:4326")
+                        nome_centro = gpd.sjoin(centro, munis[["name_muni", "geometry"]], predicate="within", how="left") \
+                            .drop_duplicates("cid").set_index("cid")["name_muni"]
+                        barra.empty()
 
-                        if resultado["amostrado_treino"]:
-                            if resultado["modo_amostragem"] == "caso_controle":
-                                status.write(
-                                    f"ℹ️ A região tem {resultado['total_disponivel']} focos distintos — "
-                                    f"uma amostra foi usada para o treino ser mais rápido."
-                                )
-                            else:
-                                status.write(
-                                    f"ℹ️ A região tem {resultado['total_disponivel']} municípios — "
-                                    f"uma amostra foi usada para o treino ser mais rápido."
-                                )
-                        if resultado["n_municipios_falha"] > 0:
-                            status.write(
-                                f"⚠️ {resultado['n_municipios_falha']} município(s) da amostra não "
-                                f"retornaram dados e foram descartados do treino (isso é normal em "
-                                f"instabilidades pontuais de rede — não impede o treino de continuar)."
-                            )
+                        st.session_state[_rk] = {
+                            "anos": anos_r, "res": res_g, "ultima": ultima, "avisos": avisos,
+                            "grade": grade[["cid", "geometry"]].assign(municipio=grade["cid"].map(nome_centro).fillna("—")),
+                            "pares": pares.reset_index(drop=True), "r": resultado,
+                        }
+                    except Exception as _e_rg:
+                        st.error(f"⚠️ Não foi possível treinar o modelo: {_e_rg}")
+                        with st.expander("Detalhes técnicos do erro"):
+                            st.code(traceback.format_exc(), language="python")
+                    _res = st.session_state.get(_rk)
 
-                        def _linha_cv(nome_modelo, cv):
-                            def _fmt(m):
-                                return f"{m['media']:.2f} ± {m['desvio']:.2f} ({m['n_folds']} folds)" if m else "— (dados insuficientes)"
-                            return {
-                                "Modelo": nome_modelo,
-                                "AUC — Temporal (walk-forward)": _fmt(cv["temporal_auc"]),
-                                "AUC — Espacial (município novo)": _fmt(cv["espacial_auc"]),
-                                "F1 — Temporal": _fmt(cv["temporal_f1"]),
-                                "F1 — Espacial": _fmt(cv["espacial_f1"]),
-                            }
+            if not isinstance(_res, dict) or _res.get("anos") != anos_r:
+                return
 
-                        status.write("📊 Comparando Regressão Logística, Random Forest e Boosting (validação cruzada)...")
-                        df_cv_comp = pd.DataFrame([
-                            _linha_cv(nome + ("  ⭐" if nome == resultado["algoritmo"] else ""), cv)
-                            for nome, cv in resultado["cv_resultados"].items()
-                        ])
+            r, m = _res["r"], _res["r"]["metricas"]
+            for aviso in _res["avisos"]:
+                st.warning(f"⚠️ {aviso}")
+            ini_prev = _data_semana(r["semana_prevista"])
+            fim_prev = ini_prev + pd.Timedelta(days=6)
+            t0, t1 = (_data_semana(m["semanas_teste"][0]),
+                      _data_semana(m["semanas_teste"][1]) + pd.Timedelta(days=6))
+            tr0, tr1 = (_data_semana(m["semanas_treino"][0]),
+                        _data_semana(m["semanas_treino"][1]) + pd.Timedelta(days=6))
+            st.markdown(
+                f"**📅 Previsão para a semana de {ini_prev:%d/%m} a {fim_prev:%d/%m/%Y}** "
+                f"(clima ERA5-Land disponível até {_res['ultima']:%d/%m/%Y}). "
+                f"Células de {_res['res']}° (~{_res['res'] * 111:.0f} km)."
+            )
+            if ini_prev <= pd.Timestamp(hoje.date()):
+                st.caption(
+                    "ℹ️ A semana prevista já começou: o ERA5-Land é publicado com alguns dias de "
+                    "atraso, então a previsão usa o clima da última semana completa disponível."
+                )
 
-                        status.write("🗺️ Buscando lista de municípios para o mapa...")
-                        gdf_mapa = obter_municipios_regiao(
-                            tipo_analise, estado_dd, bioma_dd, municipio_dd, max_municipios=max_mapa
-                        )
+            # --- Resultado no ano de teste ------------------------------------
+            curvas = r["curvas"]
+            cap_m = float(curvas.loc[curvas["k"] == 10, "Modelo"].iloc[0])
+            cap_r = float(curvas.loc[curvas["k"] == 10, "Regra prática (fogo recente)"].iloc[0])
+            cap_h = float(curvas.loc[curvas["k"] == 10, "Histórico do último ano"].iloc[0])
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("AUC-ROC no teste", f"{m['auc']:.3f}",
+                      help="Capacidade de ordenar células com e sem fogo (0,5 = sorteio; 1 = perfeito).")
+            c2.metric("PR-AUC no teste", f"{m['pr_auc']:.3f}", f"regra prática: {m['pr_auc_regra']:.3f}",
+                      delta_color="off",
+                      help=f"Mais exigente que o AUC quando o fogo é raro. Sorteio daria {m['taxa_base']:.3f} "
+                           "(a proporção de células-semana com fogo).")
+            c3.metric("Fogo capturado nas 10% células priorizadas", f"{cap_m:.0f}%",
+                      f"regra prática: {cap_r:.0f}%", delta_color="off")
+            c4.metric("AUC espacial", f"{m['auc_espacial']:.3f}" if m["auc_espacial"] else "—",
+                      help="Validação em blocos de ~110 km que o modelo nunca viu no treino.")
+            ganho = cap_m - cap_r
+            leitura = (
+                f"Se a cada semana de {t0:%m/%Y} a {t1:%m/%Y} as equipes fossem concentradas nas **10% "
+                f"células de maior risco** apontadas pelo modelo, elas estariam onde ocorreram **{cap_m:.0f}%** "
+                f"dos registros de fogo. Pela regra prática (onde houve fogo recente) seriam {cap_r:.0f}%, "
+                f"pelo histórico do último ano {cap_h:.0f}% e, sem critério, 10%."
+            )
+            if ganho >= 1:
+                st.success(f"🟢 {leitura} **O modelo agrega valor sobre a regra prática (+{ganho:.0f} pontos).**")
+            elif ganho > -1:
+                st.warning(f"🟡 {leitura} **O modelo empata com a regra prática neste recorte**: o fogo recente "
+                           "já explica quase tudo; o ganho do modelo está em apontar áreas sem fogo recente.")
+            else:
+                st.error(f"🔴 {leitura} **Neste recorte a regra prática foi melhor que o modelo ({ganho:.0f} pontos).**")
 
-                        status.write(f"🌡️ Calculando risco atual em {len(gdf_mapa)} município(s)...")
-                        modelo, scaler = resultado["modelo"], resultado["scaler"]
-                        modelo_lr = resultado["modelo_lr"]
-                        hoje = datetime.now()
-                        mes_atual = hoje.month
-                        mes_alvo = (mes_atual % 12) + 1
-                        clima_mensal = resultado["climatologia_mensal"]
-                        clim_atual = clima_mensal.get(mes_atual, resultado["taxa_base"])
-                        clim_alvo = clima_mensal.get(mes_alvo, resultado["taxa_base"])
-                        # Deslocamento sazonal em ESPAÇO LOGIT (log-odds), não multiplicativo direto.
-                        # Isso evita que o ajuste "exploda" para 100% quando a taxa histórica do mês
-                        # atual é muito baixa e a do mês-alvo é muito mais alta — o deslocamento em
-                        # log-odds satura suavemente perto dos extremos, igual o próprio modelo logístico.
-                        deslocamento_sazonal = _logit(clim_alvo) - _logit(clim_atual)
+            # --- Mapa de risco -------------------------------------------------
+            prob = r["previsao"].set_index("cid")["prob"]
+            g = _res["grade"].copy()
+            g["prob"] = g["cid"].map(prob).fillna(0.0)
+            classes = g["prob"].map(_classe_risco_grade)
+            g["classe"] = [c[0] for c in classes]
+            g["cor"] = [c[1] for c in classes]
+            g["prob_txt"] = (g["prob"] * 100).round(0).astype(int).astype(str) + "%"
+            centro_m = limite.geometry.union_all().centroid
+            m_rg = folium.Map(
+                location=[centro_m.y, centro_m.x], zoom_start=6 if tipo_analise != "Por Município" else 9,
+                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                attr="Esri", prefer_canvas=True,
+            )
+            folium.GeoJson(
+                g[["municipio", "prob_txt", "classe", "cor", "geometry"]].to_json(),
+                style_function=lambda f: {"fillColor": f["properties"]["cor"], "fillOpacity": 0.65,
+                                          "color": f["properties"]["cor"], "weight": 0.3},
+                tooltip=folium.GeoJsonTooltip(fields=["municipio", "prob_txt", "classe"],
+                                              aliases=["Município:", "Chance de foco na semana:", "Risco:"]),
+            ).add_to(m_rg)
+            folium.GeoJson(
+                limite.__geo_interface__,
+                style_function=lambda x: {"fillColor": "transparent", "color": "#333333", "weight": 1.5},
+            ).add_to(m_rg)
+            folium.TileLayer(
+                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
+                attr="Esri Ref", overlay=True, control=False,
+            ).add_to(m_rg)
+            m_rg.get_root().html.add_child(folium.Element("""
+                <div style="position:fixed; bottom:28px; left:12px; z-index:9999;
+                            background:rgba(255,255,255,0.95); padding:10px 14px; border-radius:8px;
+                            font-size:12px; color:#2c3e50; line-height:1.9; border:1px solid rgba(0,0,0,0.08);
+                            box-shadow:0 1px 4px rgba(0,0,0,0.18);">
+                  <b style="font-size:13px;">Chance de foco na semana</b><br>
+                  <span style="color:#bd0026;">■</span> Muito alto (≥ 50%)<br>
+                  <span style="color:#f03b20;">■</span> Alto (30 a 50%)<br>
+                  <span style="color:#feb24c;">■</span> Moderado (10 a 30%)<br>
+                  <span style="color:#e6d97a;">■</span> Baixo (&lt; 10%)
+                </div>"""))
+            st_folium(m_rg, width=None, height=620, returned_objects=[],
+                      key=f"mapa_risco_grade_{val_sel}_{anos_r}")
 
-                        linhas_municipios_mapa = [row for _, row in gdf_mapa.iterrows()]
+            # --- Ranking de municípios -----------------------------------------
+            pares = _res["pares"].merge(g[["cid", "prob"]], on="cid")
+            if not pares.empty:
+                rk = pares.groupby(["name_muni", "abbrev_state"]).agg(
+                    pmax=("prob", "max"), pmed=("prob", "mean"),
+                    n_alto=("prob", lambda s: int((s >= 0.3).sum())), n_cel=("prob", "size"),
+                ).reset_index().sort_values(["pmax", "pmed"], ascending=False).head(20)
+                tab_rk = pd.DataFrame({
+                    "Município": rk["name_muni"], "UF": rk["abbrev_state"],
+                    "Chance máxima entre as células (%)": (rk["pmax"] * 100).round(0),
+                    "Chance média das células (%)": (rk["pmed"] * 100).round(0),
+                    "Células com risco alto ou muito alto": [f"{a} de {b}" for a, b in zip(rk["n_alto"], rk["n_cel"])],
+                })
+                tabela_bc(
+                    f"Municípios com maior risco de foco de calor na semana de {ini_prev:%d/%m} a {fim_prev:%d/%m/%Y}",
+                    tab_rk, fonte="Resultados originais do estudo", hide_index=True, use_container_width=True,
+                )
 
-                        # Busca as condições atuais de todos os municípios em paralelo
-                        # (até 15 de cada vez) — a previsão do modelo em si é instantânea,
-                        # o gargalo é só a chamada de rede.
-                        condicoes = {}
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                            futuros = {
-                                executor.submit(buscar_condicoes_atuais, r["lat"], r["lon"]): r["name_muni"]
-                                for r in linhas_municipios_mapa
-                            }
-                            for futuro in concurrent.futures.as_completed(futuros):
-                                nome_muni = futuros[futuro]
-                                try:
-                                    condicoes[nome_muni] = futuro.result()
-                                except Exception:
-                                    condicoes[nome_muni] = None  # falha isolada não derruba o mapa
+            # --- Prova de valor: curva de captura no ano de teste ------------
+            longo = curvas.melt(id_vars="k", var_name="Estratégia", value_name="Fogo capturado (%)")
+            fig_cap = px.line(
+                longo, x="k", y="Fogo capturado (%)", color="Estratégia",
+                color_discrete_map={"Modelo": "#c0392b", "Regra prática (fogo recente)": "#2c3e50",
+                                    "Histórico do último ano": "#7f8c8d", "Sem critério (sorteio)": "#bdbdbd"},
+                labels={"k": "Células priorizadas a cada semana (%)"},
+            )
+            fig_cap.update_layout(height=380, legend=dict(orientation="h", y=-0.25, title=""))
+            figura(fig_cap, f"Ocorrências de fogo capturadas conforme a porcentagem de células priorizadas, "
+                            f"de {t0:%m/%Y} a {t1:%m/%Y} (período de teste)",
+                   "Resultados originais do estudo, com focos do INPE")
 
-                        n_falhas_mapa = sum(1 for v in condicoes.values() if v is None)
-                        if n_falhas_mapa > 0:
-                            status.write(
-                                f"⚠️ {n_falhas_mapa} de {len(linhas_municipios_mapa)} município(s) "
-                                f"não retornaram dados climáticos e ficarão de fora do mapa."
-                            )
+            with st.expander("🔬 Detalhes do modelo: algoritmos, variáveis e calibração"):
+                comp = r["comparacao"].copy()
+                comp["Algoritmo"] = [f"⭐ {a}" if a == r["escolhido"] else a for a in comp["Algoritmo"]]
+                tabela_bc(
+                    "Comparação dos algoritmos no período de validação (escolha pelo maior PR-AUC)",
+                    comp.round(3), fonte="Resultados originais do estudo", hide_index=True,
+                    use_container_width=True,
+                )
+                imp = r["importancias"].dropna().sort_values("queda", ascending=True).tail(12)
+                if not imp.empty:
+                    imp["Variável"] = imp["variavel"].map(NOMES_FEATURES_GRADE).fillna(imp["variavel"])
+                    fig_imp = px.bar(imp, x="queda", y="Variável", orientation="h",
+                                     labels={"queda": "Queda do PR-AUC ao embaralhar a variável", "Variável": ""})
+                    fig_imp.update_traces(marker_color="#c0392b")
+                    fig_imp.update_layout(height=40 * len(imp) + 80)
+                    figura(fig_imp, f"Importância das variáveis no modelo escolhido ({r['escolhido']})")
+                cal = r["calibracao"]
+                fig_cal = go.Figure()
+                lim = float(max(cal["prevista"].max(), cal["observada"].max(), 0.05))
+                fig_cal.add_trace(go.Scatter(x=[0, lim], y=[0, lim], mode="lines", name="Calibração perfeita",
+                                             line=dict(color="#bdbdbd", dash="dash")))
+                fig_cal.add_trace(go.Scatter(x=cal["prevista"], y=cal["observada"], mode="lines+markers",
+                                             name="Modelo", line=dict(color="#c0392b")))
+                fig_cal.update_layout(height=340, xaxis_title="Chance prevista (média da faixa)",
+                                      yaxis_title="Frequência observada de fogo",
+                                      legend=dict(orientation="h", y=-0.3, title=""))
+                figura(fig_cal, "Calibração do modelo no período de teste, por faixa de chance prevista")
+                def _mil(x):
+                    return f"{int(x):,}".replace(",", ".")
 
-                        linhas_resultado = []
-                        cond_por_municipio = {}
-                        taxa_por_municipio = resultado["taxa_por_municipio"]
-                        taxa_fallback = resultado["taxa_geral_fallback"]
-                        for row in linhas_municipios_mapa:
-                            cond = condicoes.get(row["name_muni"])
-                            if cond is None:
-                                continue
-                            cond = cond.copy()
-                            # Município que participou do treino usa sua própria taxa histórica
-                            # conhecida; município novo (só apareceu no mapa) usa a média geral
-                            # da amostra de treino como aproximação razoável.
-                            # No modo PAINEL as chaves de taxa_por_municipio são nomes de
-                            # município; no modo CASO-CONTROLE são células de grade. Aqui
-                            # buscamos pela célula correspondente ao centro do município.
-                            if resultado["col_grupo"] == "celula":
-                                _cel = _celula_grade(row["lat"], row["lon"])
-                                _chave = f"{_cel[0]}_{_cel[1]}"
-                            else:
-                                _chave = row["name_muni"]
-                            cond["taxa_hist_municipio"] = taxa_por_municipio.get(_chave, taxa_fallback)
-                            # NDVI pode não vir (nuvens cobrindo a região na janela de 60 dias) --
-                            # cai pro NDVI médio observado no treino em vez de deixar o modelo
-                            # receber NaN (que quebraria a predição).
-                            if pd.isna(cond["ndvi_mes_anterior"]).any():
-                                cond["ndvi_mes_anterior"] = resultado["ndvi_medio_treino"]
-                            X = scaler.transform(cond[FEATURES_RISCO])
-                            prob_amanha = float(modelo.predict_proba(X)[0, 1])
-                            if horizonte == "Próximo mês":
-                                prob_final = float(_sigmoid(_logit(prob_amanha) + deslocamento_sazonal))
-                            else:
-                                prob_final = prob_amanha
-                            nivel, emoji, cor_hex = classificar_risco(prob_final)
-                            linhas_resultado.append({
-                                "name_muni": row["name_muni"], "lat": row["lat"], "lon": row["lon"],
-                                "probabilidade": prob_final, "nivel": nivel, "emoji": emoji, "cor": cor_hex,
-                            })
-                            cond_por_municipio[row["name_muni"]] = (cond, X)
+                st.markdown(
+                    f"- **Treino:** {tr0:%d/%m/%Y} a {tr1:%d/%m/%Y} — {_mil(m['n_treino'])} células-semana, "
+                    f"{_mil(m['pos_treino'])} com fogo.\n"
+                    f"- **Teste:** {t0:%d/%m/%Y} a {t1:%d/%m/%Y} — {_mil(m['n_teste'])} células-semana, "
+                    f"{_mil(m['pos_teste'])} com fogo ({m['taxa_base'] * 100:.1f}%).\n"
+                    f"- **Brier score no teste:** {m['brier']:.4f} (quanto menor, melhor)."
+                )
 
-                        status.update(label="✅ Mapa de risco pronto", state="complete")
+            with st.expander("ℹ️ Como o modelo funciona e limitações"):
+                st.markdown(
+                    "- **Unidade:** cada célula da grade em cada semana (segunda a domingo). O alvo é "
+                    "haver pelo menos um foco de calor do INPE (satélites de referência AQUA e NPP).\n"
+                    "- **Sem vazamento:** as variáveis de uma semana usam só dados até a semana anterior.\n"
+                    "- **Variáveis:** focos na semana anterior, nas 4 e nas 52 semanas anteriores e na mesma "
+                    "época do ano anterior; chuva, umidade, temperatura máxima e vento (ERA5-Land); semanas "
+                    "seguidas sem chuva; NDVI do mês anterior (MODIS); uso do solo (MapBiomas "
+                    f"{ANO_MAPBIOMAS}); época do ano.\n"
+                    "- **Validação:** o último ano é o teste, que o modelo não vê no treino; os 6 meses "
+                    "anteriores servem para escolher o algoritmo; a validação espacial usa blocos de "
+                    "~110 km. Depois da avaliação, o modelo é retreinado com todo o histórico para prever a "
+                    "próxima semana.\n"
+                    "- **Comparação:** a 'regra prática' prioriza onde houve fogo na semana anterior (depois "
+                    "nas 4 semanas e no último ano), que é o que se faria sem modelo.\n"
+                    "- **Limitações:** o ERA5-Land tem alguns dias de atraso; o uso do solo é de um ano só "
+                    f"({ANO_MAPBIOMAS}); focos do INPE incluem falsos positivos e não medem área; células na "
+                    "borda da região contam só os focos de dentro da região."
+                )
 
-                    if "erro" not in resultado:
-                        if not linhas_resultado:
-                            st.error("⚠️ Não foi possível calcular o risco atual para os municípios desta região.")
-                        else:
-                            df_res = pd.DataFrame(linhas_resultado)
-                            df_res["probabilidade_fmt"] = df_res["probabilidade"].apply(lambda p: f"{p:.0%}")
+            st.markdown("")
+            if st.button("🔄 Nova Busca nesta aba", key=f"btn_risco_grade_reset_{val_sel}"):
+                st.session_state[_rk] = None
+                st.rerun(scope="fragment")
 
-                            st.markdown("---")
-                            titulo_horiz = "Amanhã" if horizonte == "Amanhã" else f"Próximo mês (estimativa sazonal)"
-                            st.markdown(f"### Risco por município — {titulo_horiz}")
-
-                            st.markdown("### 🧪 Validação do modelo — antes de confiar no mapa")
-                            st.caption(
-                                "Temporal = o modelo generaliza pro futuro (treina no passado, testa no "
-                                "que vem depois, em vários cortes). Espacial = o modelo generaliza pra um "
-                                "município nunca visto no treino — a métrica mais rígida das duas."
-                            )
-                            tabela_bc("Desempenho dos algoritmos por validação cruzada temporal e espacial", df_cv_comp, hide_index=True, use_container_width=True)
-                            st.caption(f"⭐ = algoritmo escolhido para o mapa ({resultado['criterio_selecao']}).")
-
-                            # Leitura automática em linguagem simples do AUC do vencedor --
-                            # pra quem não quer decifrar a tabela número por número.
-                            auc_vencedor = resultado["auc"]
-                            if auc_vencedor is not None:
-                                if auc_vencedor >= 0.85:
-                                    veredicto_auc = "🟢 **Forte.** O modelo separa bem dias de risco alto e baixo."
-                                elif auc_vencedor >= 0.70:
-                                    veredicto_auc = "🟡 **Razoável.** O modelo ajuda, mas com espaço claro pra melhorar."
-                                elif auc_vencedor >= 0.55:
-                                    veredicto_auc = "🟠 **Fraco.** Pouco melhor que chute — use o mapa com cautela."
-                                else:
-                                    veredicto_auc = "🔴 **Não confiável.** Praticamente igual a jogar moeda (0,50)."
-                                st.caption(
-                                    f"**Em resumo:** AUC de {auc_vencedor:.2f} na validação temporal → {veredicto_auc}"
-                                )
-
-                            if resultado["cv_resultados"][resultado["algoritmo"]]["espacial_auc"] is None:
-                                st.info(
-                                    "ℹ️ A validação espacial precisa de pelo menos 2 municípios no treino "
-                                    "para funcionar — não foi possível calculá-la para esta seleção "
-                                    "(ex: análise 'Por Município')."
-                                )
-
-                            contagem = df_res["nivel"].value_counts()
-                            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-                            col_m1.metric("🟢 Baixo", int(contagem.get("Baixo", 0)))
-                            col_m2.metric("🟡 Moderado", int(contagem.get("Moderado", 0)))
-                            col_m3.metric("🟠 Alto", int(contagem.get("Alto", 0)))
-                            col_m4.metric("🔴 Crítico", int(contagem.get("Crítico", 0)))
-
-                            # ---- Mapa ----
-                            gdf_render = gdf_mapa.merge(
-                                df_res[["name_muni", "probabilidade", "probabilidade_fmt", "nivel", "cor"]],
-                                on="name_muni", how="inner"
-                            )
-                            centro_mapa = geom_unida.centroid
-                            m_risco = folium.Map(
-                                location=[centro_mapa.y, centro_mapa.x],
-                                zoom_start=6 if tipo_analise != "Por Município" else 10,
-                                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
-                                attr="Esri", prefer_canvas=True,
-                            )
-                            folium.TileLayer(
-                                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
-                                attr="Esri Ref", overlay=True, control=False,
-                            ).add_to(m_risco)
-
-                            # --- Limites de referência (para o usuário se localizar) ---
-                            # Contorno da região selecionada (bioma/estado/município) — igual ao mapa principal
-                            folium.GeoJson(
-                                limite_mapa.__geo_interface__,
-                                name=f"Limite — {val_sel}",
-                                style_function=lambda x: {
-                                    'fillColor': '#e67e22', 'fillOpacity': 0.02,
-                                    'color': '#e67e22', 'weight': 3, 'dashArray': '6 3',
-                                },
-                            ).add_to(m_risco)
-
-                            # Limites dos municípios (contorno fino, sem preenchimento)
-                            folium.GeoJson(
-                                gdf_mapa.__geo_interface__,
-                                name="Limites municipais",
-                                style_function=lambda x: {
-                                    'fillOpacity': 0, 'color': '#7f8c8d', 'weight': 0.8, 'dashArray': '2 2',
-                                },
-                                tooltip=folium.GeoJsonTooltip(
-                                    fields=["name_muni"], aliases=["Município:"],
-                                    style="font-size:11px; background:white; color:#2c3e50; border-radius:6px;",
-                                ),
-                            ).add_to(m_risco)
-
-                            # Limites estaduais (útil quando a região é um bioma, que cruza vários estados)
-                            ufs_envolvidas = sorted(gdf_mapa["abbrev_state"].dropna().unique().tolist())
-                            if tipo_analise == "Por Bioma" and 0 < len(ufs_envolvidas) <= 12:
-                                try:
-                                    frames_uf = [read_state(code_state=uf, year=2020) for uf in ufs_envolvidas]
-                                    gdf_estados = pd.concat(frames_uf, ignore_index=True).to_crs("EPSG:4326")
-                                    folium.GeoJson(
-                                        gdf_estados.__geo_interface__,
-                                        name="Limites estaduais",
-                                        style_function=lambda x: {
-                                            'fillOpacity': 0, 'color': '#34495e', 'weight': 1.8,
-                                        },
-                                        tooltip=folium.GeoJsonTooltip(
-                                            fields=["abbrev_state"], aliases=["Estado:"],
-                                            style="font-size:11px; background:white; color:#2c3e50; border-radius:6px;",
-                                        ),
-                                    ).add_to(m_risco)
-                                except Exception:
-                                    pass  # limites estaduais são só um extra visual — não interrompe o mapa se falhar
-
-                            # --- Risco por município, em formato de FOCO (ponto), não polígono preenchido ---
-                            fg_focos_risco = folium.FeatureGroup(name="Risco de queimada (focos)")
-                            for _, row_r in gdf_render.iterrows():
-                                raio = 6 + (row_r["probabilidade"] * 14)  # 6px a 20px conforme a probabilidade
-                                folium.CircleMarker(
-                                    location=[row_r["lat"], row_r["lon"]],
-                                    radius=raio,
-                                    color="#1c1c1c",
-                                    weight=1,
-                                    fill=True,
-                                    fill_color=row_r["cor"],
-                                    fill_opacity=0.85,
-                                    tooltip=folium.Tooltip(
-                                        f"<b>{row_r['name_muni']}</b><br>"
-                                        f"Risco: {row_r['nivel']}<br>"
-                                        f"Probabilidade: {row_r['probabilidade_fmt']}",
-                                        style=(
-                                            "font-size:12px; background:white; color:#2c3e50; "
-                                            "border-radius:6px; box-shadow:2px 2px 6px rgba(0,0,0,0.25);"
-                                        ),
-                                    ),
-                                ).add_to(fg_focos_risco)
-                            fg_focos_risco.add_to(m_risco)
-
-                            legenda_risco = """
-                            <div style="position: fixed; bottom: 30px; left: 30px; z-index:9999;
-                                        background: rgba(255,255,255,0.95); padding: 12px 16px; border-radius: 8px;
-                                        color: #2c3e50; font-size: 13px; border:1px solid rgba(0,0,0,0.08);
-                                        box-shadow: 0 1px 4px rgba(0,0,0,0.18);">
-                                <b>🎯 Nível de Risco (por foco/município)</b><br>
-                                <span style="color:#2ecc71;">●</span> Baixo (&lt;25%)<br>
-                                <span style="color:#f1c40f;">●</span> Moderado (25-50%)<br>
-                                <span style="color:#e67e22;">●</span> Alto (50-75%)<br>
-                                <span style="color:#e74c3c;">●</span> Crítico (≥75%)<br>
-                                <span style="color:#7f8c8d;">- - -</span> Limite municipal<br>
-                                <span style="color:#e67e22;">- - -</span> Região selecionada
-                            </div>
-                            """
-                            m_risco.get_root().html.add_child(folium.Element(legenda_risco))
-                            _ocultar_url_base(m_risco)
-                            folium.LayerControl(collapsed=False).add_to(m_risco)
-                            st_folium(m_risco, width=None, height=650, returned_objects=[], key="mapa_risco_ml")
-
-                            # ---- Ranking dos municípios em maior risco ----
-                            st.markdown("**🔥 Municípios com maior risco na região:**")
-                            tabela_bc("Municípios com maior risco previsto de fogo", 
-                                df_res.sort_values("probabilidade", ascending=False)
-                                      .head(10)[["name_muni", "probabilidade_fmt", "nivel"]]
-                                      .rename(columns={"name_muni": "Município", "probabilidade_fmt": "Probabilidade", "nivel": "Nível"}),
-                                use_container_width=True, hide_index=True
-                            )
-
-                            # ---- Explicabilidade do município mais crítico ----
-                            municipio_top = df_res.sort_values("probabilidade", ascending=False).iloc[0]["name_muni"]
-                            cond_top, X_top = cond_por_municipio[municipio_top]
-                            if hasattr(modelo, "feature_importances_"):
-                                contrib = pd.DataFrame({
-                                    "feature": FEATURES_RISCO,
-                                    "contribuicao": modelo.feature_importances_,
-                                }).sort_values("contribuicao", ascending=False)
-                                nota_contrib = (
-                                    "Importância **global** do modelo (não é mais a contribuição individual "
-                                    "desse município específico — isso volta com SHAP, próximo passo)."
-                                )
-                            else:
-                                contrib = pd.DataFrame({
-                                    "feature": FEATURES_RISCO,
-                                    "contribuicao": (modelo_lr.coef_[0] * X_top[0]),
-                                }).sort_values("contribuicao", key=abs, ascending=False)
-                                nota_contrib = "Contribuição da Regressão Logística para este município específico."
-
-                            st.markdown(f"**🔍 Por que {municipio_top} está com o maior risco:**")
-                            st.caption(nota_contrib)
-                            fig_contrib = px.bar(
-                                contrib, x="contribuicao", y="feature",
-                                orientation="h", color="contribuicao",
-                                color_continuous_scale=["#2ecc71", "#f1c40f", "#e74c3c"],
-                            )
-                            fig_contrib.update_layout(
-                                height=380,
-                                yaxis={'categoryorder': 'total ascending'},
-                                coloraxis_showscale=False,
-                                xaxis_title="Contribuição (+ aumenta risco / - reduz risco)",
-                                yaxis_title=""
-                            )
-                            figura(fig_contrib, "Contribuição das variáveis para o risco previsto do município de maior risco", "Resultados originais do estudo")
-
-                            # ---- Painel de Transparência do Modelo ----
-                            st.markdown("---")
-                            st.markdown("### 🔬 Transparência do Modelo")
-                            st.caption(
-                                "Todas as métricas abaixo são calculadas SÓ no conjunto de teste "
-                                "(período mais recente, nunca visto no treino) — igual seria em produção."
-                            )
-                            aval = resultado.get("avaliacao_teste")
-                            if aval is None:
-                                st.info(
-                                    "Não há dados de teste suficientes (ou só uma classe presente) "
-                                    "para gerar as métricas de avaliação nesta região/período."
-                                )
-                            else:
-                                from sklearn.metrics import (
-                                    confusion_matrix, precision_score, recall_score,
-                                    f1_score, accuracy_score
-                                )
-
-                                y_true = aval["y_true"]
-                                y_prob = aval["y_prob"]
-                                y_pred = (y_prob >= 0.5).astype(int)
-                                y_pred_base = aval["y_pred_baseline"]
-
-                                tab_metricas, tab_matriz, tab_calib, tab_baseline = st.tabs(
-                                    ["📈 Métricas", "🧩 Matriz de Confusão", "🎯 Calibração", "⚖️ Vs. Baseline"]
-                                )
-
-                                # --- Métricas resumo ---
-                                with tab_metricas:
-                                    prec = precision_score(y_true, y_pred, zero_division=0)
-                                    rec = recall_score(y_true, y_pred, zero_division=0)
-                                    f1 = f1_score(y_true, y_pred, zero_division=0)
-                                    acc = accuracy_score(y_true, y_pred)
-                                    cme1, cme2, cme3, cme4, cme5 = st.columns(5)
-                                    cme1.metric("AUC-ROC", f"{resultado['auc']:.2f}" if resultado["auc"] else "—")
-                                    cme2.metric("Acurácia", f"{acc:.0%}")
-                                    cme3.metric("Precisão", f"{prec:.0%}")
-                                    cme4.metric("Recall", f"{rec:.0%}")
-                                    cme5.metric("F1-score", f"{f1:.0%}")
-                                    st.caption(
-                                        "Corte de decisão em 50% de probabilidade. **Precisão** = dos dias que "
-                                        "o modelo marcou como risco, quantos realmente tiveram ocorrência. "
-                                        "**Recall** = das ocorrências reais, quantas o modelo conseguiu antecipar. "
-                                        f"Avaliado em **{len(y_true)}** dias de teste."
-                                    )
-
-                                # --- Matriz de confusão ---
-                                with tab_matriz:
-                                    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-                                    fig_cm = px.imshow(
-                                        cm, text_auto=True,
-                                        x=["Previu: Sem risco", "Previu: Risco"],
-                                        y=["Real: Sem ocorrência", "Real: Com ocorrência"],
-                                        color_continuous_scale="Reds",
-                                    )
-                                    fig_cm.update_layout(height=380, coloraxis_showscale=False)
-                                    figura(fig_cm, "Matriz de confusão do modelo de risco preditivo", "Resultados originais do estudo")
-                                    st.caption(
-                                        "Diagonal principal = acertos. Fora da diagonal = erros do modelo "
-                                        "(falso positivo: alarme sem ocorrência real / falso negativo: "
-                                        "ocorrência que o modelo não previu)."
-                                    )
-
-                                # --- Curva de calibração ---
-                                with tab_calib:
-                                    try:
-                                        from sklearn.calibration import calibration_curve
-                                        n_bins = 5 if len(y_true) < 200 else 10
-                                        frac_pos, prob_media = calibration_curve(y_true, y_prob, n_bins=n_bins, strategy="quantile")
-                                        fig_calib = go.Figure()
-                                        fig_calib.add_trace(go.Scatter(
-                                            x=[0, 1], y=[0, 1], mode="lines", name="Calibração perfeita",
-                                            line=dict(dash="dash", color="#7f8c8d")
-                                        ))
-                                        fig_calib.add_trace(go.Scatter(
-                                            x=prob_media, y=frac_pos, mode="lines+markers", name="Modelo",
-                                            line=dict(color="#e74c3c", width=3), marker=dict(size=9)
-                                        ))
-                                        fig_calib.update_layout(
-                                            height=380,
-                                            xaxis_title="Probabilidade prevista (média por faixa)",
-                                            yaxis_title="Frequência real de ocorrência",
-                                            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                                        )
-                                        figura(fig_calib, "Curva de calibração do modelo de risco preditivo", "Resultados originais do estudo")
-                                        st.caption(
-                                            "Quanto mais perto da linha tracejada, mais confiável é a "
-                                            "probabilidade — ou seja, quando o modelo diz '70% de risco', "
-                                            "isso realmente acontece em ~70% desses dias."
-                                        )
-                                    except Exception:
-                                        st.info("Dados de teste insuficientes para calcular a curva de calibração.")
-
-                                # --- Comparação com baseline ingênuo ---
-                                with tab_baseline:
-                                    prec_b = precision_score(y_true, y_pred_base, zero_division=0)
-                                    rec_b = recall_score(y_true, y_pred_base, zero_division=0)
-                                    f1_b = f1_score(y_true, y_pred_base, zero_division=0)
-                                    acc_b = accuracy_score(y_true, y_pred_base)
-                                    df_comp = pd.DataFrame({
-                                        "Métrica": ["Acurácia", "Precisão", "Recall", "F1-score"],
-                                        "Modelo (clima + ML)": [acc, prec, rec, f1],
-                                        "Baseline ingênuo (focos nos últimos 7 dias)": [acc_b, prec_b, rec_b, f1_b],
-                                    })
-                                    fig_comp = go.Figure()
-                                    fig_comp.add_bar(name="Modelo (clima + ML)", x=df_comp["Métrica"],
-                                                      y=df_comp["Modelo (clima + ML)"], marker_color="#e74c3c")
-                                    fig_comp.add_bar(name="Baseline ingênuo", x=df_comp["Métrica"],
-                                                      y=df_comp["Baseline ingênuo (focos nos últimos 7 dias)"],
-                                                      marker_color="#7f8c8d")
-                                    fig_comp.update_layout(
-                                        barmode="group", height=360,
-                                        yaxis_tickformat=".0%",
-                                        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                                    )
-                                    figura(fig_comp, "Comparação do desempenho entre os algoritmos testados", "Resultados originais do estudo")
-                                    st.caption(
-                                        "**Baseline ingênuo:** marca risco alto se o município teve pelo menos "
-                                        "1 dia com ocorrência nos 7 dias anteriores — sem clima, sem ML, só "
-                                        "persistência recente. É a régua mínima que o modelo precisa superar "
-                                        "pra justificar a complexidade extra."
-                                    )
-                                    ganho_f1 = f1 - f1_b
-                                    if ganho_f1 > 0:
-                                        st.success(
-                                            f"✅ O modelo supera o baseline em F1-score por **+{ganho_f1:.0%}** "
-                                            "— o clima e o histórico por município agregam valor real."
-                                        )
-                                    else:
-                                        st.warning(
-                                            f"⚠️ O modelo não superou o baseline ingênuo nesta região/período "
-                                            f"(F1 {ganho_f1:.0%}). Considere mais dados de treino ou revisar features."
-                                        )
-
-                            with st.expander("📊 Detalhes do treinamento do modelo"):
-                                if resultado["col_grupo"] == "celula":
-                                    st.write(
-                                        f"- Unidades espaciais no treino: **{resultado['n_municipios_treino']} "
-                                        f"células de grade (~25 km)** distribuídas pela região"
-                                    )
-                                else:
-                                    st.write(f"- Municípios usados no treino: **{', '.join(resultado['municipios_treino'])}**")
-                                st.write(
-                                    f"- Dias de treino: **{resultado['n_dias_treino']}** | "
-                                    f"Dias de teste (mais recentes): **{resultado['n_dias_teste']}**"
-                                )
-                                st.write(f"- Taxa histórica média de dias com foco: **{resultado['taxa_base']:.1%}**")
-                                if horizonte == "Próximo mês":
-                                    sinal_desloc = "+" if deslocamento_sazonal >= 0 else ""
-                                    st.write(
-                                        f"- Climatologia do mês atual (mês {mes_atual}): **{clim_atual:.1%}** "
-                                        f"→ do mês-alvo (mês {mes_alvo}): **{clim_alvo:.1%}**"
-                                    )
-                                    st.write(
-                                        f"- Deslocamento sazonal aplicado (em log-odds): "
-                                        f"**{sinal_desloc}{deslocamento_sazonal:.2f}**"
-                                    )
-                                st.caption(
-                                    "Split temporal: o modelo treina no passado e é testado no período mais "
-                                    "recente, simulando o uso real (prever o que ainda não aconteceu)."
-                                )
-
-                            st.info(
-                                "💡 **Nota metodológica:** prova de conceito educacional (MBA). O horizonte "
-                                "'Próximo mês' é uma estimativa sazonal baseada em climatologia histórica, "
-                                "não uma previsão climática real (não há fonte gratuita de previsão de 30 "
-                                "dias). Para uso operacional, recomenda-se incorporar NDVI, uso do solo e "
-                                "comparar com modelos mais robustos adicionais e SHAP para explicabilidade "
-                                "por instância."
-                            )
-                else:
-                    st.info(
-                        "👆 Ajuste os parâmetros acima e clique no botão para treinar o modelo "
-                        "e gerar o mapa de risco da região selecionada."
-                    )
-            except Exception as _err_risco:
-                st.error(f"⚠️ Erro na aba de Risco Preditivo: {_err_risco}")
-                st.code(traceback.format_exc(), language="python")
+        with aba_risco:
+            _aba_risco_grade()
 
 else:
     st.info(
