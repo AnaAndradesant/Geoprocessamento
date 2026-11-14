@@ -4036,12 +4036,12 @@ if st.session_state.gerar_dashboard:
                                         border:1px solid rgba(0,0,0,0.08);
                                         box-shadow:0 1px 4px rgba(0,0,0,0.18);">
                                 <b style="font-size:13px;">Severidade dNBR</b><br>
-                                <span style="color:#1a9850;">■</span> Regeneração (dNBR &lt; -0.1)<br>
-                                <span style="color:#91cf60;">■</span> Não afetado (-0.1 a 0.1)<br>
-                                <span style="color:#fee08b;">■</span> Baixa (0.1 a 0.27)<br>
-                                <span style="color:#fc8d59;">■</span> Moderada (0.27 a 0.44)<br>
-                                <span style="color:#d73027;">■</span> Moderada-Alta (0.44 a 0.66)<br>
-                                <span style="color:#7a0403;">■</span> Alta (&gt; 0.66)
+                                <span style="color:#1a9850;">■</span> Regeneração (dNBR &lt; -100)<br>
+                                <span style="color:#91cf60;">■</span> Não afetado (-100 a 100)<br>
+                                <span style="color:#fee08b;">■</span> Baixa (100 a 270)<br>
+                                <span style="color:#fc8d59;">■</span> Moderada (270 a 440)<br>
+                                <span style="color:#d73027;">■</span> Moderada-Alta (440 a 660)<br>
+                                <span style="color:#7a0403;">■</span> Alta (&gt; 660)
                             </div>"""
                             m_nbr.get_root().html.add_child(folium.Element(legenda_html))
                             
