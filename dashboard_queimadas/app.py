@@ -4077,9 +4077,155 @@ ser gerados por essa floresta perdida.
         # ----------------------------------------------------------
         # ABA — PLANEJAMENTO DE BRIGADAS (calendário do fogo)
         # ----------------------------------------------------------
+        def _plano_semana_brigadas():
+            """Plano da semana: usa o resultado do modelo treinado na aba Risco Preditivo
+            para dizer onde posicionar as equipes com a capacidade disponível, quanto essa
+            escolha teria rendido no ano de teste e se a semana cai na janela crítica."""
+            st.markdown("#### 📍 Onde posicionar as equipes nesta semana")
+            res_oper = st.session_state.get(f"risco_grade_{val_sel}_oper")
+            res_fixo = st.session_state.get(f"risco_grade_{val_sel}_fixo")
+            _rr = res_oper if isinstance(res_oper, dict) else res_fixo
+            if not isinstance(_rr, dict):
+                st.info(
+                    "Para montar o plano da semana, treine primeiro o modelo na aba **🎯 Risco "
+                    "Preditivo** (mesma região). Depois volte aqui e clique em atualizar."
+                )
+                if st.button("🔄 Atualizar com o modelo treinado", key=f"btn_plano_{val_sel}"):
+                    st.rerun(scope="fragment")
+                return
+
+            r, m = _rr["r"], _rr["r"]["metricas"]
+            ini_prev = _data_semana(r["semana_prevista"])
+            fim_prev = ini_prev + pd.Timedelta(days=6)
+            t0 = _data_semana(m["semanas_teste"][0])
+            t1 = _data_semana(m["semanas_teste"][1]) + pd.Timedelta(days=6)
+            origem = "operacional" if _rr is res_oper else "experimento fixo"
+            st.caption(
+                f"Modelo treinado na aba Risco Preditivo ({origem}, {r['escolhido']}). "
+                f"Semana prevista: {ini_prev:%d/%m} a {fim_prev:%d/%m/%Y}."
+            )
+
+            cap_pct = st.radio(
+                "Capacidade das brigadas (parte da região que as equipes conseguem cobrir por semana):",
+                [5, 10, 20], index=1, horizontal=True, format_func=lambda k: f"{k}% das células",
+                key=f"cap_brigadas_{val_sel}",
+            )
+
+            g = _rr["grade"].copy()
+            g["prob"] = g["cid"].map(r["previsao"].set_index("cid")["prob"]).fillna(0.0)
+            n_sel = max(1, int(np.ceil(len(g) * cap_pct / 100)))
+            sel_ids = set(g.nlargest(n_sel, "prob")["cid"])
+            g["prioritaria"] = g["cid"].isin(sel_ids)
+            area_km2 = float(g.loc[g["prioritaria"]].to_crs("EPSG:6933").area.sum() / 1e6)
+
+            # Quanto essa capacidade teria rendido no ano de teste
+            linha = r["curvas"].loc[r["curvas"]["k"] == cap_pct].iloc[0]
+            cap_m, cap_r = float(linha["Modelo"]), float(linha["Regra prática (fogo recente)"])
+            n_m = round(m["pos_teste"] * cap_m / 100)
+            n_r = round(m["pos_teste"] * cap_r / 100)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Células prioritárias", f"{n_sel} de {len(g)}",
+                      f"~{area_km2:,.0f} km²".replace(",", "."), delta_color="off")
+            c2.metric("Ocorrências cobertas no ano de teste", f"{cap_m:.0f}%",
+                      f"regra prática: {cap_r:.0f}%", delta_color="off")
+            c3.metric("Ocorrências a mais com as mesmas equipes", f"{n_m - n_r:+d}",
+                      f"{n_m} contra {n_r} de {m['pos_teste']}", delta_color="off")
+            st.info(
+                f"📌 Com equipes capazes de cobrir **{cap_pct}% da região por semana**, posicioná-las "
+                f"pelas células de maior risco do modelo teria colocado as equipes onde ocorreram "
+                f"**{n_m} das {m['pos_teste']} ocorrências de fogo** de {t0:%m/%Y} a {t1:%m/%Y}, "
+                f"contra {n_r} pela regra prática (onde houve fogo recente): **{n_m - n_r:+d} ocorrências "
+                "cobertas sem aumentar o número de equipes**."
+            )
+
+            # Ligação com o calendário: a semana prevista está na época crítica?
+            _cal = st.session_state.get(f"brig_res_{val_sel}")
+            if isinstance(_cal, dict) and not _cal["df"].empty:
+                n_anos_cal = (_cal["anos"][1] - _cal["anos"][0] + 1) - len(_cal["falhos"])
+                if n_anos_cal > 0:
+                    _, perfil_cal = resumo_calendario(_cal["df"], n_anos_cal)
+                    ini_j, fim_j, frac_j = janela_critica(perfil_cal.sum(axis=0).to_numpy())
+                    if ini_j is not None:
+                        meses_j = {((ini_j - 1 + k) % 12) + 1 for k in range(((fim_j - ini_j) % 12) + 1)}
+                        txt_j = (MESES_PT[ini_j - 1] if ini_j == fim_j
+                                 else f"{MESES_PT[ini_j - 1]}–{MESES_PT[fim_j - 1]}")
+                        if ini_prev.month in meses_j:
+                            st.warning(
+                                f"🔥 A semana prevista está **dentro da janela crítica** da região ({txt_j}, "
+                                f"{frac_j * 100:.0f}% da área queimada histórica): manter a capacidade máxima."
+                            )
+                        else:
+                            st.success(
+                                f"🌧️ A semana prevista está **fora da janela crítica** da região ({txt_j}): "
+                                "dá para operar com capacidade reduzida e usar o período para prevenção "
+                                "(aceiros, queima prescrita, campanhas)."
+                            )
+            else:
+                st.caption("Monte o Calendário do Fogo abaixo para saber se a semana cai na época crítica.")
+
+            # Mapa: células prioritárias em vermelho
+            centro_p = limite.geometry.union_all().centroid
+            m_pl = folium.Map(
+                location=[centro_p.y, centro_p.x], zoom_start=6 if tipo_analise != "Por Município" else 9,
+                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+                attr="Esri", prefer_canvas=True,
+            )
+            g["prob_txt"] = (g["prob"] * 100).round(0).astype(int).astype(str) + "%"
+            g["situacao"] = np.where(g["prioritaria"], "Prioritária", "—")
+            folium.GeoJson(
+                g[["municipio", "prob_txt", "situacao", "prioritaria", "geometry"]].to_json(),
+                style_function=lambda f: (
+                    {"fillColor": "#c0392b", "fillOpacity": 0.75, "color": "#7b241c", "weight": 0.8}
+                    if f["properties"]["prioritaria"] else
+                    {"fillColor": "#bdbdbd", "fillOpacity": 0.15, "color": "#bdbdbd", "weight": 0.2}
+                ),
+                tooltip=folium.GeoJsonTooltip(fields=["municipio", "prob_txt", "situacao"],
+                                              aliases=["Município:", "Chance de foco na semana:", "Célula:"]),
+            ).add_to(m_pl)
+            folium.GeoJson(
+                limite.__geo_interface__,
+                style_function=lambda x: {"fillColor": "transparent", "color": "#333333", "weight": 1.5},
+            ).add_to(m_pl)
+            folium.TileLayer(
+                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
+                attr="Esri Ref", overlay=True, control=False,
+            ).add_to(m_pl)
+            st_folium(m_pl, width=None, height=520, returned_objects=[],
+                      key=f"mapa_plano_{val_sel}_{cap_pct}_{r['semana_prevista']}")
+
+            # Municípios com células prioritárias
+            pares = _rr["pares"].merge(g.loc[g["prioritaria"], ["cid", "prob"]], on="cid")
+            if not pares.empty:
+                tb = pares.groupby(["name_muni", "abbrev_state"]).agg(
+                    n=("cid", "size"), pmax=("prob", "max")
+                ).reset_index().sort_values(["pmax", "n"], ascending=False)
+                tabela_bc(
+                    f"Municípios para posicionar as equipes na semana de {ini_prev:%d/%m} a {fim_prev:%d/%m/%Y}, "
+                    f"com capacidade de {cap_pct}% das células",
+                    pd.DataFrame({
+                        "Município": tb["name_muni"], "UF": tb["abbrev_state"],
+                        "Células prioritárias no município": tb["n"],
+                        "Maior chance de foco (%)": (tb["pmax"] * 100).round(0),
+                    }),
+                    fonte="Resultados originais do estudo", hide_index=True, use_container_width=True,
+                )
+            st.caption(
+                "As células prioritárias são as de maior chance de foco prevista pelo modelo. O ganho no "
+                "ano de teste compara, com a mesma capacidade, as células do modelo com as células "
+                "escolhidas pela regra prática (fogo na semana anterior, depois nas 4 semanas e no último ano)."
+            )
+
         @st.fragment
         def _aba_brigadas():
-            st.subheader("🚒 Planejamento de Brigadas — Calendário do Fogo")
+            st.subheader("🚒 Planejamento de Brigadas")
+            st.caption(
+                "Onde posicionar as equipes nesta semana (pelo modelo da aba Risco Preditivo) e em "
+                "que época do ano reforçar (pelo calendário do fogo)."
+            )
+            _plano_semana_brigadas()
+            st.markdown("---")
+            st.markdown("#### 🗓️ Calendário do fogo: quando reforçar")
             st.caption(
                 "Para cada município da região selecionada: em que meses o fogo se concentra, "
                 "em quantos anos ele aparece e quanto queima em média. Base: série histórica de "
