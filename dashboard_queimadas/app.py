@@ -1089,6 +1089,40 @@ def _resumo_por_area(pts, n_janelas):
 
 
 # =====================================================================
+# VALOR DA ÁREA QUEIMADA (usado nas abas Impacto Econômico e Brigadas)
+# Serviços ecossistêmicos em US$/ha por bioma e cenário (Costanza et al. 2014,
+# IPAM, TNC) e emissão de CO2 por hectare queimado, com preço do carbono no
+# mercado voluntário (Ecosystem Marketplace 2023).
+# =====================================================================
+VALORES_ECOSSIS = {
+    "Amazônia":      {"conservador": 2000,  "moderado": 4000,  "otimista": 6000},
+    "Cerrado":       {"conservador": 800,   "moderado": 1650,  "otimista": 2500},
+    "Mata Atlântica":{"conservador": 3000,  "moderado": 5500,  "otimista": 8000},
+    "Pantanal":      {"conservador": 1500,  "moderado": 2750,  "otimista": 4000},
+    "Caatinga":      {"conservador": 400,   "moderado": 800,   "otimista": 1200},
+    "Pampa":         {"conservador": 600,   "moderado": 1050,  "otimista": 1500},
+}
+EMISSOES_CO2_HA = {
+    "Amazônia": 150, "Cerrado": 60, "Mata Atlântica": 120,
+    "Pantanal": 80, "Caatinga": 30, "Pampa": 25,
+}
+PRECO_CARBONO_USD = 15
+ESTADO_BIOMA = {
+    "AM": "Amazônia", "PA": "Amazônia", "AC": "Amazônia",
+    "RO": "Amazônia", "RR": "Amazônia", "AP": "Amazônia",
+    "MT": "Cerrado",  "GO": "Cerrado",  "TO": "Cerrado",
+    "MA": "Cerrado",  "PI": "Caatinga", "BA": "Caatinga",
+    "CE": "Caatinga", "RN": "Caatinga", "PB": "Caatinga",
+    "PE": "Caatinga", "AL": "Caatinga", "SE": "Caatinga",
+    "MS": "Pantanal", "PR": "Mata Atlântica",
+    "SC": "Mata Atlântica", "RS": "Pampa",
+    "SP": "Mata Atlântica", "RJ": "Mata Atlântica",
+    "ES": "Mata Atlântica", "MG": "Mata Atlântica",
+    "DF": "Cerrado",
+}
+
+
+# =====================================================================
 # CALENDÁRIO DO FOGO POR MUNICÍPIO (aba Planejamento de Brigadas)
 # Série histórica MODIS MCD64A1: área queimada por município e por mês.
 # =====================================================================
@@ -3177,36 +3211,9 @@ if st.session_state.gerar_dashboard:
         # ----------------------------------------------------------
         with aba_impacto:
           try:
-            # --- TABELAS DE REFERÊNCIA ---
-            VALORES_ECOSSIS = {
-                "Amazônia":      {"conservador": 2000,  "moderado": 4000,  "otimista": 6000},
-                "Cerrado":       {"conservador": 800,   "moderado": 1650,  "otimista": 2500},
-                "Mata Atlântica":{"conservador": 3000,  "moderado": 5500,  "otimista": 8000},
-                "Pantanal":      {"conservador": 1500,  "moderado": 2750,  "otimista": 4000},
-                "Caatinga":      {"conservador": 400,   "moderado": 800,   "otimista": 1200},
-                "Pampa":         {"conservador": 600,   "moderado": 1050,  "otimista": 1500},
-            }
-            EMISSOES_CO2_HA = {
-                "Amazônia": 150, "Cerrado": 60, "Mata Atlântica": 120,
-                "Pantanal": 80, "Caatinga": 30, "Pampa": 25,
-            }
-            PRECO_CARBONO_USD = 15
             CAMBIO_FIXO = buscar_cotacao_dolar()
 
             # --- DETECTAR BIOMA ---
-            ESTADO_BIOMA = {
-                "AM": "Amazônia", "PA": "Amazônia", "AC": "Amazônia",
-                "RO": "Amazônia", "RR": "Amazônia", "AP": "Amazônia",
-                "MT": "Cerrado",  "GO": "Cerrado",  "TO": "Cerrado",
-                "MA": "Cerrado",  "PI": "Caatinga", "BA": "Caatinga",
-                "CE": "Caatinga", "RN": "Caatinga", "PB": "Caatinga",
-                "PE": "Caatinga", "AL": "Caatinga", "SE": "Caatinga",
-                "MS": "Pantanal", "PR": "Mata Atlântica",
-                "SC": "Mata Atlântica", "RS": "Pampa",
-                "SP": "Mata Atlântica", "RJ": "Mata Atlântica",
-                "ES": "Mata Atlântica", "MG": "Mata Atlântica",
-                "DF": "Cerrado",
-            }
             bioma_detectado = (
                 bioma_dd if tipo_analise == "Por Bioma"
                 else ESTADO_BIOMA.get(estado_dd, "Cerrado")
@@ -4138,6 +4145,87 @@ ser gerados por essa floresta perdida.
                 f"contra {n_r} pela regra prática (onde houve fogo recente): **{n_m - n_r:+d} ocorrências "
                 "cobertas sem aumentar o número de equipes**."
             )
+
+            # Valor em R$ das ocorrências a mais (premissas explícitas)
+            _cal_v = st.session_state.get(f"brig_res_{val_sel}")
+            with st.expander("💰 Quanto isso vale em R$? (estimativa com premissas)", expanded=True):
+                if not (isinstance(_cal_v, dict) and not _cal_v["df"].empty):
+                    st.info("Monte o **Calendário do Fogo** (abaixo, nesta aba): ele dá a área queimada "
+                            "média da região, necessária para converter ocorrências em hectares.")
+                else:
+                    n_anos_v = (_cal_v["anos"][1] - _cal_v["anos"][0] + 1) - len(_cal_v["falhos"])
+                    _, perfil_v = resumo_calendario(_cal_v["df"], n_anos_v)
+                    area_ano_ha = float(perfil_v.to_numpy().sum()) * 100
+                    ocorr_ano = (m["pos_treino"] + m["pos_teste"]) / _rr["anos"]
+                    ha_por_ocorr = area_ano_ha / ocorr_ano if ocorr_ano else 0.0
+                    bioma_pad = bioma_dd if tipo_analise == "Por Bioma" else ESTADO_BIOMA.get(estado_dd, "Cerrado")
+                    cv1, cv2, cv3 = st.columns(3)
+                    bioma_v = cv1.selectbox("Bioma para o valor por hectare:", list(VALORES_ECOSSIS),
+                                            index=list(VALORES_ECOSSIS).index(bioma_pad),
+                                            key=f"bioma_valor_brig_{val_sel}")
+                    cenario_v = cv2.selectbox("Cenário de valor:", ["conservador", "moderado", "otimista"],
+                                              index=0, key=f"cenario_valor_brig_{val_sel}")
+                    eficacia = cv3.select_slider(
+                        "Área que a resposta antecipada evita queimar:", options=[10, 25, 50], value=25,
+                        format_func=lambda x: f"{x}%", key=f"eficacia_brig_{val_sel}",
+                        help="Não há valor oficial: é um cenário. Representa quanto da área que queimaria "
+                             "deixa de queimar quando a equipe já está posicionada e chega no início do fogo.",
+                    )
+                    cambio_v = buscar_cotacao_dolar()
+                    brl_ha = (VALORES_ECOSSIS[bioma_v][cenario_v]
+                              + EMISSOES_CO2_HA.get(bioma_v, 60) * PRECO_CARBONO_USD) * cambio_v
+
+                    linhas_v = []
+                    for k in (5, 10, 20):
+                        lk = r["curvas"].loc[r["curvas"]["k"] == k].iloc[0]
+                        dk = round(m["pos_teste"] * lk["Modelo"] / 100) - round(
+                            m["pos_teste"] * lk["Regra prática (fogo recente)"] / 100)
+                        ha_evit = dk * ha_por_ocorr * eficacia / 100
+                        linhas_v.append({
+                            "Capacidade (% das células)": f"{k}%",
+                            "Ocorrências a mais no ano": dk,
+                            "Área com equipe a mais (ha)": round(dk * ha_por_ocorr),
+                            "Área evitada (ha)": round(ha_evit),
+                            "Dano evitado (R$ milhões)": round(ha_evit * brl_ha / 1e6, 2),
+                        })
+                    tab_v = pd.DataFrame(linhas_v)
+                    escolhida = tab_v.loc[tab_v["Capacidade (% das células)"] == f"{cap_pct}%"].iloc[0]
+                    def _br(x, casas=0):
+                        """Número no formato brasileiro (1.234,56)."""
+                        return f"{x:,.{casas}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+                    st.success(
+                        f"💰 Com capacidade de **{cap_pct}%**, o modelo põe as equipes em "
+                        f"**{escolhida['Ocorrências a mais no ano']:+d} ocorrências por ano** a mais que a regra "
+                        f"prática. Se a chegada antecipada evitar {eficacia}% da área, são cerca de "
+                        f"**{_br(escolhida['Área evitada (ha)'])} ha** que deixam de queimar, ou "
+                        f"**R$ {_br(escolhida['Dano evitado (R$ milhões)'], 2)} milhões** de dano evitado por ano, "
+                        "sem aumentar o número de equipes."
+                    )
+                    tabela_bc(
+                        f"Ganho estimado do modelo sobre a regra prática por capacidade das brigadas "
+                        f"({bioma_v}, cenário {cenario_v}, eficácia de {eficacia}%)",
+                        tab_v, fonte="Resultados originais do estudo; valores por hectare de Costanza et al. "
+                                     "(2014), IPAM, TNC e Ecosystem Marketplace (2023)",
+                        hide_index=True, use_container_width=True,
+                    )
+                    st.markdown(
+                        "**Premissas do cálculo:**\n"
+                        f"- **Ocorrências a mais:** diferença entre o modelo e a regra prática no ano de teste "
+                        f"({t0:%m/%Y} a {t1:%m/%Y}).\n"
+                        f"- **Área por ocorrência:** {_br(ha_por_ocorr, 1)} ha = área queimada média anual da região "
+                        f"no calendário MODIS ({_cal_v['anos'][0]}–{_cal_v['anos'][1]}: {_br(area_ano_ha)} ha/ano) ÷ "
+                        f"ocorrências por ano no período do modelo ({_br(ocorr_ano)}). São períodos diferentes, "
+                        "por isso é uma média típica, não do ano de teste.\n"
+                        f"- **Valor por hectare:** US$ {_br(VALORES_ECOSSIS[bioma_v][cenario_v])} de serviços "
+                        f"ecossistêmicos + {EMISSOES_CO2_HA.get(bioma_v, 60)} tCO₂ × US$ {PRECO_CARBONO_USD} de "
+                        f"carbono, a R$ {_br(cambio_v, 2)} por dólar = R$ {_br(brl_ha)}/ha (mesmos valores da aba "
+                        "Impacto Econômico).\n"
+                        "- **Eficácia:** cenário escolhido acima; não há estatística oficial de quanto a "
+                        "resposta antecipada reduz a área queimada.\n"
+                        "- O valor é **dano evitado à sociedade** (serviços ambientais e carbono), não economia "
+                        "no orçamento do órgão."
+                    )
 
             # Ligação com o calendário: a semana prevista está na época crítica?
             _cal = st.session_state.get(f"brig_res_{val_sel}")
