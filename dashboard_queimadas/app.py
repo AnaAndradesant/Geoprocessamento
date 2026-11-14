@@ -1216,6 +1216,9 @@ def resumo_calendario(df_longo, n_anos):
 
 EPOCA_SEMANAS = pd.Timestamp("2000-01-03")  # segunda-feira; semana k começa em EPOCA + 7k dias
 BLOCO_SEMANAS = 13  # consultas de clima em blocos de ~3 meses, cada bloco com cache próprio
+# Experimento fixo do Business Case: última semana com alvo termina neste domingo,
+# então o teste vai de 03/11/2025 a 01/11/2026 e os números não mudam até a defesa.
+DATA_CORTE_EXPERIMENTO = pd.Timestamp("2026-11-01")
 
 ASSET_MAPBIOMAS = (
     "projects/mapbiomas-public/assets/brazil/lulc/collection9/mapbiomas_collection90_integration_v1"
@@ -4430,16 +4433,26 @@ ser gerados por essa floresta perdida.
                 help="O último ano fica separado como TESTE (o modelo não o vê no treino). "
                      "Com 3 anos: treina em 2 e testa no mais recente.",
             )
+            modo_r = st.radio(
+                "Período:",
+                ["Operacional (até a semana mais recente)",
+                 f"Experimento fixo do Business Case (corte em {DATA_CORTE_EXPERIMENTO:%d/%m/%Y})"],
+                key="modo_risco_grade", horizontal=True,
+                help="O operacional muda toda semana, com dados novos. O experimento fixo usa sempre "
+                     "o mesmo corte, para os números do documento serem os mesmos na defesa.",
+            )
+            fixo = modo_r.startswith("Experimento")
+            cfg = (anos_r, fixo)
             if tipo_analise == "Por Bioma":
                 st.warning(
                     "⏱️ Bioma inteiro: a primeira execução pode levar vários minutos (focos de "
                     "vários anos e clima de milhares de células). Depois fica guardada em cache."
                 )
 
-            _rk = f"risco_grade_{val_sel}"
+            _rk = f"risco_grade_{val_sel}_{'fixo' if fixo else 'oper'}"
             _res = st.session_state.get(_rk)
             ja = isinstance(_res, dict)
-            mudou = ja and _res.get("anos") != anos_r
+            mudou = ja and _res.get("cfg") != cfg
 
             if (not ja) or mudou:
                 if st.button(
@@ -4452,6 +4465,8 @@ ser gerados por essa floresta perdida.
                         grade, res_g = montar_grade(limite)
                         rets = _retangulos_grade(grade, res_g)
                         ultima = min(_ultima_data_era5(), pd.Timestamp(hoje.date()) - pd.Timedelta(days=1))
+                        if fixo:
+                            ultima = min(ultima, DATA_CORTE_EXPERIMENTO)
                         k_ult = int(((ultima - EPOCA_SEMANAS).days - 6) // 7)
                         k_alvo_ini = k_ult - 52 * anos_r + 1
 
@@ -4532,7 +4547,7 @@ ser gerados por essa floresta perdida.
                         barra.empty()
 
                         st.session_state[_rk] = {
-                            "anos": anos_r, "res": res_g, "ultima": ultima, "avisos": avisos,
+                            "anos": anos_r, "cfg": cfg, "res": res_g, "ultima": ultima, "avisos": avisos,
                             "grade": grade[["cid", "geometry"]].assign(municipio=grade["cid"].map(nome_centro).fillna("—")),
                             "pares": pares.reset_index(drop=True), "r": resultado,
                         }
@@ -4542,7 +4557,7 @@ ser gerados por essa floresta perdida.
                             st.code(traceback.format_exc(), language="python")
                     _res = st.session_state.get(_rk)
 
-            if not isinstance(_res, dict) or _res.get("anos") != anos_r:
+            if not isinstance(_res, dict) or _res.get("cfg") != cfg:
                 return
 
             r, m = _res["r"], _res["r"]["metricas"]
@@ -4559,6 +4574,11 @@ ser gerados por essa floresta perdida.
                 f"(clima ERA5-Land disponível até {_res['ultima']:%d/%m/%Y}). "
                 f"Células de {_res['res']}° (~{_res['res'] * 111:.0f} km)."
             )
+            if fixo:
+                st.caption(
+                    f"🔒 Experimento fixo: dados até {DATA_CORTE_EXPERIMENTO:%d/%m/%Y}. Estes são os "
+                    "números para o documento; refazer a busca dá o mesmo resultado."
+                )
             if ini_prev <= pd.Timestamp(hoje.date()):
                 st.caption(
                     "ℹ️ A semana prevista já começou: o ERA5-Land é publicado com alguns dias de "
@@ -4637,10 +4657,11 @@ ser gerados por essa floresta perdida.
                   <span style="color:#e6d97a;">■</span> Baixo (&lt; 10%)
                 </div>"""))
             st_folium(m_rg, width=None, height=620, returned_objects=[],
-                      key=f"mapa_risco_grade_{val_sel}_{anos_r}")
+                      key=f"mapa_risco_grade_{val_sel}_{anos_r}_{fixo}")
 
             # --- Ranking de municípios -----------------------------------------
             pares = _res["pares"].merge(g[["cid", "prob"]], on="cid")
+            tab_rk = pd.DataFrame()
             if not pares.empty:
                 rk = pares.groupby(["name_muni", "abbrev_state"]).agg(
                     pmax=("prob", "max"), pmed=("prob", "mean"),
@@ -4669,6 +4690,42 @@ ser gerados por essa floresta perdida.
             figura(fig_cap, f"Ocorrências de fogo capturadas conforme a porcentagem de células priorizadas, "
                             f"de {t0:%m/%Y} a {t1:%m/%Y} (período de teste)",
                    "Resultados originais do estudo, com focos do INPE")
+
+            # --- Download de todos os números do experimento -------------------
+            import zipfile
+            resumo_m = pd.DataFrame([
+                ("Região", val_sel), ("Período", "Experimento fixo" if fixo else "Operacional"),
+                ("Treino", f"{tr0:%d/%m/%Y} a {tr1:%d/%m/%Y}"), ("Teste", f"{t0:%d/%m/%Y} a {t1:%d/%m/%Y}"),
+                ("Algoritmo escolhido", r["escolhido"]), ("Tamanho da célula (graus)", _res["res"]),
+                ("AUC-ROC teste", round(m["auc"], 4)), ("PR-AUC teste", round(m["pr_auc"], 4)),
+                ("PR-AUC regra prática", round(m["pr_auc_regra"], 4)),
+                ("AUC espacial", round(m["auc_espacial"], 4) if m["auc_espacial"] else ""),
+                ("Brier teste", round(m["brier"], 4)), ("Taxa de células-semana com fogo (teste)", round(m["taxa_base"], 4)),
+                ("Células-semana treino", m["n_treino"]), ("Com fogo no treino", m["pos_treino"]),
+                ("Células-semana teste", m["n_teste"]), ("Com fogo no teste", m["pos_teste"]),
+                ("Captura 10% modelo (%)", round(cap_m, 1)), ("Captura 10% regra prática (%)", round(cap_r, 1)),
+                ("Captura 10% histórico (%)", round(cap_h, 1)),
+            ], columns=["Indicador", "Valor"])
+            imp_csv = r["importancias"].assign(
+                nome=r["importancias"]["variavel"].map(NOMES_FEATURES_GRADE)).sort_values("queda", ascending=False)
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for nome_arq, tabela_csv in (
+                    ("01_resumo_metricas.csv", resumo_m), ("02_curva_captura.csv", curvas.round(2)),
+                    ("03_comparacao_algoritmos.csv", r["comparacao"].round(4)),
+                    ("04_importancia_variaveis.csv", imp_csv.round(5)),
+                    ("05_calibracao.csv", r["calibracao"].round(4)), ("06_ranking_municipios.csv", tab_rk),
+                    ("07_previsao_celulas.csv", g[["cid", "municipio", "prob", "classe"]].round(4)),
+                ):
+                    z.writestr(nome_arq, tabela_csv.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"))
+            st.download_button(
+                "📦 Baixar todos os números deste experimento (CSV em ZIP)", data=buf.getvalue(),
+                file_name=f"risco_{val_sel}_{'experimento_fixo' if fixo else 'operacional'}_{_res['ultima']:%Y%m%d}.zip",
+                mime="application/zip", use_container_width=True, key=f"dl_risco_{val_sel}_{fixo}",
+                help="Métricas, curva de captura, comparação de algoritmos, importância das variáveis, "
+                     "calibração, ranking e previsão por célula. CSV com ';' e vírgula decimal (abre direto no Excel). "
+                     "Para salvar uma figura, use o ícone de câmera no canto do gráfico.",
+            )
 
             with st.expander("🔬 Detalhes do modelo: algoritmos, variáveis e calibração"):
                 comp = r["comparacao"].copy()
