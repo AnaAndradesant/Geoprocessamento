@@ -4706,6 +4706,8 @@ ser gerados por essa floresta perdida.
                 ("Captura 10% modelo (%)", round(cap_m, 1)), ("Captura 10% regra prática (%)", round(cap_r, 1)),
                 ("Captura 10% histórico (%)", round(cap_h, 1)),
             ], columns=["Indicador", "Valor"])
+            # Coluna mistura texto e número: o decimal="," do to_csv não alcança, então formata aqui
+            resumo_m["Valor"] = [str(v).replace(".", ",") if isinstance(v, float) else v for v in resumo_m["Valor"]]
             imp_csv = r["importancias"].assign(
                 nome=r["importancias"]["variavel"].map(NOMES_FEATURES_GRADE)).sort_values("queda", ascending=False)
             buf = io.BytesIO()
